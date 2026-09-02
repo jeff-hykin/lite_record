@@ -112,15 +112,39 @@
                             PKG_CONFIG_PATH = pkgs.lib.concatMapStringsSep ":"
                                 (library: "${pkgs.lib.getDev library}/lib/pkgconfig") sdkLibraries;
 
-                            # The SDK is a dynamic .so, so the binary has to carry its store
-                            # path. Deploy with `nix copy --to ssh://<host>` to bring it along.
+                            # Two separate jobs here.
+                            #
+                            # `-L native=` is a workaround for an upstream bug:
+                            # librealsense ships a realsense2.pc that hardcodes
+                            # `libdir=''${prefix}/lib/x86_64-linux-gnu` -- there is a
+                            # literal `#TODO` above that line -- no matter which
+                            # architecture it was built for. So pkg-config sends the
+                            # linker to an x86 path inside the aarch64 package and
+                            # `-lrealsense2` is not found. The true directory is passed
+                            # explicitly rather than trusting the .pc.
+                            #
+                            # The rpath is unrelated: the SDK is a dynamic .so, so the
+                            # binary must carry its store path to start on the target.
+                            # Deploy with `nix copy --to ssh://<host>` to bring it along.
                             "CARGO_TARGET_${targetUpper}_RUSTFLAGS" =
                                 pkgs.lib.concatMapStringsSep " "
-                                    (library: "-C link-arg=-Wl,-rpath,${pkgs.lib.getLib library}/lib")
+                                    (library:
+                                        "-L native=${pkgs.lib.getLib library}/lib"
+                                        + " -C link-arg=-Wl,-rpath,${pkgs.lib.getLib library}/lib")
                                     sdkLibraries;
                         });
 
-                    aarch64Gnu = crossPkgsFor "aarch64-unknown-linux-gnu";
+                    # librealsense installs udev helper scripts wrapped with
+                    # v4l-utils on their PATH, and v4l-utils builds `qv4l2` and
+                    # `qvidcap` by default, which drags Qt6 into the closure.
+                    # Cross-compiling Qt6 to aarch64 takes hours and nothing in a
+                    # headless recorder ever opens a window, so the GUI is turned
+                    # off. This is the difference between a cross build that
+                    # finishes in minutes and one that does not finish at all.
+                    aarch64Gnu = (crossPkgsFor "aarch64-unknown-linux-gnu").extend
+                        (final: previous: {
+                            v4l-utils = previous.v4l-utils.override { withGUI = false; };
+                        });
                 in
                 {
                     lite_record = native;
