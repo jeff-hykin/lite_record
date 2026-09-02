@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+DIST="dist"
+mkdir -p "$DIST"
+
+# nix build only sees files git knows about, so a brand new source file would
+# otherwise be silently missing from the binary.
+git add -A
+
+build() {
+    local attribute="$1"
+    local name="$2"
+    echo "Building $name ..."
+    out=$(nix build ".#$attribute" --no-link --print-out-paths | tail -1)
+    # Store outputs are mode 555 and cp preserves the source mode, so a second
+    # run would hit EACCES overwriting the first run's file.
+    install -m 755 "$out/bin/lite_record" "$DIST/$name"
+    echo "  -> $DIST/$name"
+}
+
+# Built with plain cargo rather than nix: a nix-built macOS binary links against
+# /nix/store dylibs and will not run on a Mac without nix.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "Building lite_record-$(uname -m)-apple-darwin (cargo) ..."
+    cargo build --release --quiet
+    install -m 755 target/release/lite_record "$DIST/lite_record-$(uname -m)-apple-darwin"
+    echo "  -> $DIST/lite_record-$(uname -m)-apple-darwin"
+fi
+
+build linux-x86 lite_record-x86_64-linux-musl
+build linux-arm64 lite_record-aarch64-linux-musl
+
+echo ""
+ls -lh "$DIST"

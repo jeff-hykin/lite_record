@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+HOST="${LITE_RECORD_HOST:-dimensional@100.111.62.124}"
+REMOTE_BIN="/home/dimensional/.local/bin/lite_record"
+UNIT="/etc/systemd/system/lite_record.service"
+
+# nix build only sees files git knows about, so a brand new source file would
+# otherwise be silently missing from the binary.
+git add -A
+
+echo "Building aarch64 musl ..."
+out=$(nix build .#linux-arm64 --no-link --print-out-paths | tail -1)
+
+echo "Copying to $HOST ..."
+# Writing onto the running binary fails with ETXTBSY, so land it beside the
+# target and rename: the running process keeps its own unlinked inode.
+scp -q "$out/bin/lite_record" "$HOST:$REMOTE_BIN.new"
+ssh "$HOST" "chmod 755 '$REMOTE_BIN.new' && mv -f '$REMOTE_BIN.new' '$REMOTE_BIN'"
+
+# The unit shipped pointing at the nix profile symlink. Only the binary path is
+# rewritten so every flag stays exactly as whoever ran survive_reboot set it.
+echo "Pointing the unit at $REMOTE_BIN ..."
+ssh "$HOST" "sudo -n sed -i -E 's|^ExecStart=\"[^\"]*\"|ExecStart=\"$REMOTE_BIN\"|' '$UNIT' && sudo -n systemctl daemon-reload"
+
+echo "Restarting ..."
+ssh "$HOST" "sudo -n systemctl restart lite_record"
+
+# An HTTP 200 would not prove this: a stale copy can hold the port while the
+# unit crash-loops, so the listener's pid must be the pid systemd thinks it has.
+echo "Verifying ..."
+ssh "$HOST" '
+    main_pid=$(systemctl show lite_record -p MainPID --value)
+    # systemctl returns once the process is spawned, which is before it has
+    # bound the port, so an immediate check reports a listener of "none".
+    for _ in $(seq 20); do
+        listener_pid=$(sudo -n ss -lptnH "sport = :8099" | grep -o "pid=[0-9]*" | head -1 | cut -d= -f2)
+        [ -n "$listener_pid" ] && break
+        sleep 1
+    done
+    echo "  MainPID=$main_pid listener=${listener_pid:-none}"
+    echo "  exe=$(sudo -n readlink -f /proc/$main_pid/exe)"
+    if [ -z "$listener_pid" ] || [ "$main_pid" != "$listener_pid" ]; then
+        echo "  FAILED: :8099 is not owned by the service" >&2
+        exit 1
+    fi
+    # The lidar socket has to be checked separately: it can fail its multicast
+    # join at boot and leave the process looking perfectly healthy.
+    sudo -n lsof -iUDP:56301 -nP >/dev/null 2>&1 || echo "  WARNING: no lidar socket on :56301"
+    echo "  ok"
+'

@@ -1,0 +1,69 @@
+[package]
+name = "lite_record"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Handheld multi-sensor mcap recorder for RealSense, Orbbec and Livox Mid-360"
+repository = "https://github.com/jeff-hykin/lite_record"
+
+[lib]
+name = "lite_record"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lite_record"
+path = "src/main.rs"
+
+[features]
+default = []
+# Every vendor SDK is opt-in so the crate builds and tests on a laptop with no
+# hardware and no SDK installed.
+realsense = ["dep:realsense-sys"]
+livox = []
+orbbec = []
+h264 = ["dep:openh264"]
+all-sensors = ["realsense", "livox", "orbbec"]
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+image-webp = "0.2.4"
+jpeg-encoder = "0.6"
+libc = "0.2"
+mcap = { version = "0.25.0", default-features = false, features = ["lz4", "zstd"] }
+png = "0.18.1"
+quick-xml = "0.37"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+socket2 = { version = "0.5", features = ["all"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "sync",
+    "time",
+    "signal",
+    "process",
+    "io-util",
+] }
+zune-core = "0.5.3"
+zune-jpeg = "0.5"
+zune-jpegxl = "0.5.2"
+
+openh264 = { version = "0.9.8", features = ["source"], optional = true }
+# Deliberately not `buildtime-bindgen`: the crate ships generated bindings, and
+# using them means a cross build needs only the .so and a pkg-config file rather
+# than a clang that can parse the SDK's headers for the target.
+realsense-sys = { version = "2.56", optional = true }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[dev-dependencies]
+jxl-oxide = { version = "0.12.6", default-features = false }
