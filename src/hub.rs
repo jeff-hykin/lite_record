@@ -33,6 +33,26 @@ const ENCODE_QUEUE_DEPTH: usize = 128;
 /// number in the UI does not flicker.
 const RATE_WINDOW: Duration = Duration::from_secs(2);
 
+/// Nice value for the encode workers. Compression is the only work in this
+/// process that holds a core for milliseconds at a stretch, and a frame the
+/// capture thread is late to collect is gone for good, so the encoders sit
+/// below everything else. Lowering a thread's own priority never needs
+/// privileges, which is why the gap is opened downwards rather than by raising
+/// the capture threads.
+#[cfg(target_os = "linux")]
+const ENCODE_NICE: libc::c_int = 5;
+
+#[cfg(target_os = "linux")]
+fn yield_to_capture_threads() {
+    // Linux nice is per-task and `who = 0` means the calling task, so this
+    // moves one worker rather than the whole process. Elsewhere the same call
+    // would renice everything, which is why this is Linux-only.
+    unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, ENCODE_NICE) };
+}
+
+#[cfg(not(target_os = "linux"))]
+fn yield_to_capture_threads() {}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     pub record_dir: PathBuf,
@@ -224,6 +244,7 @@ impl Hub {
             let handle = std::thread::Builder::new()
                 .name(format!("encode-{index}"))
                 .spawn(move || {
+                    yield_to_capture_threads();
                     for produced in receiver {
                         hub.encode_and_store(produced);
                     }
@@ -546,17 +567,22 @@ impl Hub {
             .map(|parsed| parsed.static_transforms(stamp_nanos))
             .unwrap_or_default();
 
+        let backends = self.backends.lock().unwrap();
+        // A sensor counts if it is configured on *or* currently engaged. `--engage`
+        // opens a device without touching the settings file, so gating on the flag
+        // alone left a running camera out and shipped recordings with no
+        // `/tf_static` at all.
         let mut sensors: Vec<(SensorKind, &crate::sensors::Naming, Vec<crate::sensors::StreamId>)> =
             Vec::new();
         for (kind, config) in [
             (SensorKind::Realsense, &settings.realsense),
             (SensorKind::Orbbec, &settings.orbbec),
         ] {
-            if config.enabled {
+            if config.enabled || backends.contains_key(&kind) {
                 sensors.push((kind, &config.naming, config.streams()));
             }
         }
-        if settings.livox.enabled {
+        if settings.livox.enabled || backends.contains_key(&SensorKind::Livox) {
             sensors.push((
                 SensorKind::Livox,
                 &settings.livox.naming,
@@ -564,7 +590,6 @@ impl Hub {
             ));
         }
 
-        let backends = self.backends.lock().unwrap();
         for (kind, naming, streams) in sensors {
             let measured = backends
                 .get(&kind)
@@ -986,6 +1011,30 @@ mod tests {
         let parents: std::collections::BTreeSet<&str> =
             transforms.iter().map(|t| t.header.frame_id.as_str()).collect();
         assert!(parents.contains("base_link"));
+        std::fs::remove_file(hub.settings_file()).ok();
+    }
+
+    /// `--engage` opens a device without writing the settings file, so a sensor
+    /// can be streaming while its `enabled` flag is still false. Gating on that
+    /// flag shipped recordings from a live camera with no `/tf_static` at all.
+    #[test]
+    fn an_engaged_sensor_gets_transforms_even_with_its_setting_off() {
+        let hub = scratch_hub();
+        assert!(!hub.settings().livox.enabled);
+
+        assert!(hub.static_transforms(1).is_empty());
+        hub.engage(SensorKind::Livox).unwrap();
+        let children: Vec<String> = hub
+            .static_transforms(1)
+            .into_iter()
+            .map(|transform| transform.child_frame_id)
+            .collect();
+        hub.disengage(SensorKind::Livox);
+
+        assert!(
+            children.iter().any(|child| child.contains("livox")),
+            "an engaged lidar contributed no frames: {children:?}"
+        );
         std::fs::remove_file(hub.settings_file()).ok();
     }
 
