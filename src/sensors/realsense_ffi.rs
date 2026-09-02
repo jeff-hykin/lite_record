@@ -56,11 +56,11 @@ fn stream_enum(value: i32) -> sys::rs2_stream {
     value as sys::rs2_stream
 }
 
-/// The IMU's two streams arrive at different rates — 200 Hz gyro against 63 Hz
-/// accel on a D435i — so a `sensor_msgs/Imu` has to pair each gyro sample with
-/// the most recent acceleration rather than waiting for a matching one.
-const GYRO_HZ: i32 = 200;
-const ACCEL_HZ: i32 = 63;
+/// The fastest IMU rate worth recording. Gyro and accel are asked for
+/// separately and the device rarely offers the same set for both, so a
+/// `sensor_msgs/Imu` still has to pair each gyro sample with the most recent
+/// acceleration rather than waiting for a matching one.
+const MOTION_HZ_CAP: i32 = 250;
 
 // -- error and handle plumbing ------------------------------------------------
 
@@ -254,6 +254,67 @@ unsafe fn depth_sensor_of(device: *mut sys::rs2_device) -> Result<Owned<sys::rs2
     anyhow::bail!("this device has no sensor carrying the emitter option")
 }
 
+/// The rate to ask for on a motion stream: the fastest the device actually
+/// offers, up to `MOTION_HZ_CAP`.
+///
+/// Asking for a rate the device does not list makes `pipeline_start` fail with
+/// "Couldn't resolve requests", which takes the image streams down with it. The
+/// sets differ by IMU part — a D435i's BMI055 offers accel at 63 and 250, a
+/// D435IF's BMI085 offers 100, 200 and 400 — so the numbers cannot be constants.
+unsafe fn motion_rate(device: *mut sys::rs2_device, kind: i32) -> Option<i32> {
+    let sensors = Owned::new(
+        rs_ignoring_errors!(rs2_query_sensors(device)),
+        sys::rs2_delete_sensor_list,
+    )
+    .ok()?;
+    let count = rs_ignoring_errors!(rs2_get_sensors_count(sensors.pointer()));
+    let mut best = None;
+    for index in 0..count {
+        let Ok(sensor) = Owned::new(
+            rs_ignoring_errors!(rs2_create_sensor(sensors.pointer(), index)),
+            sys::rs2_delete_sensor,
+        ) else {
+            continue;
+        };
+        let Ok(profiles) = Owned::new(
+            rs_ignoring_errors!(rs2_get_stream_profiles(sensor.pointer())),
+            sys::rs2_delete_stream_profiles_list,
+        ) else {
+            continue;
+        };
+        let total = rs_ignoring_errors!(rs2_get_stream_profiles_count(profiles.pointer()));
+        for slot in 0..total {
+            let profile = rs_ignoring_errors!(rs2_get_stream_profile(profiles.pointer(), slot));
+            if profile.is_null() {
+                continue;
+            }
+            let mut stream = 0;
+            let mut format = 0;
+            let mut stream_index = 0;
+            let mut unique_id = 0;
+            let mut rate = 0;
+            let mut error: *mut sys::rs2_error = ptr::null_mut();
+            sys::rs2_get_stream_profile_data(
+                profile,
+                &mut stream,
+                &mut format,
+                &mut stream_index,
+                &mut unique_id,
+                &mut rate,
+                &mut error,
+            );
+            if !error.is_null() {
+                sys::rs2_free_error(error);
+                continue;
+            }
+            if stream as i32 == kind && rate <= MOTION_HZ_CAP && Some(rate) > best {
+                best = Some(rate);
+            }
+        }
+    }
+    best
+}
+
 unsafe fn set_emitter(sensor: *mut sys::rs2_sensor, on: bool) -> Result<()> {
     let value = if on { 1.0 } else { 0.0 };
     rs!(
@@ -373,7 +434,7 @@ impl RealsenseBackend {
         &self,
         context: *mut sys::rs2_context,
         serial: &str,
-        with_motion: bool,
+        motion: Option<(i32, i32)>,
     ) -> Result<StartedPipeline> {
         let config = Owned::new(
             rs!("creating a config", rs2_create_config()),
@@ -401,10 +462,10 @@ impl RealsenseBackend {
                 );
             }
         }
-        if with_motion {
+        if let Some((gyro_hz, accel_hz)) = motion {
             // Motion streams carry no resolution; the zeros are how the C API
             // spells "not applicable" for width and height.
-            for (kind, rate) in [(RS2_STREAM_GYRO, GYRO_HZ), (RS2_STREAM_ACCEL, ACCEL_HZ)] {
+            for (kind, rate) in [(RS2_STREAM_GYRO, gyro_hz), (RS2_STREAM_ACCEL, accel_hz)] {
                 rs!(
                     "enabling a motion stream",
                     rs2_config_enable_stream(
@@ -453,22 +514,31 @@ impl RealsenseBackend {
         let depth_sensor = depth_sensor_of(device.pointer())?;
         set_emitter(depth_sensor.pointer(), self.config.emitter)?;
 
+        let motion = self.config.imu.then(|| {
+            motion_rate(device.pointer(), RS2_STREAM_GYRO)
+                .zip(motion_rate(device.pointer(), RS2_STREAM_ACCEL))
+        });
+
         // Losing every image stream because the host cannot reach the IMU is a
-        // worse outcome than recording without one — on a kernel with no HID
-        // sensor support librealsense reports no motion module at all, and the
-        // whole request then fails to resolve. So the motion streams are dropped
+        // worse outcome than recording without one — a device whose motion
+        // module is invisible offers no motion profiles at all, and any request
+        // naming one then fails to resolve. So the motion streams are dropped
         // and the pipeline retried, with the UI told what it lost.
         let mut publish_imu = self.config.imu;
         let (config, pipeline, profile) =
-            match self.start_pipeline(context.pointer(), &serial, publish_imu) {
+            match self.start_pipeline(context.pointer(), &serial, motion.flatten()) {
                 Ok(started) => started,
                 Err(with_imu) if publish_imu => {
                     publish_imu = false;
                     self.error = Some(format!("IMU unavailable, streaming video only: {with_imu:#}"));
-                    self.start_pipeline(context.pointer(), &serial, false)?
+                    self.start_pipeline(context.pointer(), &serial, None)?
                 }
                 Err(error) => return Err(error),
             };
+        if publish_imu && motion.flatten().is_none() {
+            publish_imu = false;
+            self.error = Some("IMU unavailable: this device lists no motion profiles".into());
+        }
 
         let aligner = if self.config.align_depth_to_color {
             let block = Owned::new(

@@ -144,6 +144,19 @@
                     aarch64Gnu = (crossPkgsFor "aarch64-unknown-linux-gnu").extend
                         (final: previous: {
                             v4l-utils = previous.v4l-utils.override { withGUI = false; };
+
+                            # By default librealsense reaches the D4xx IMU through the
+                            # kernel's HID-to-IIO bridge, which needs hid-sensor-hub,
+                            # hid-sensor-accel-3d and hid-sensor-gyro-3d. Raspberry Pi
+                            # OS ships none of them, so the motion module is invisible
+                            # and every request naming it fails to resolve. The RSUSB
+                            # backend talks to the same hardware over libusb instead
+                            # and needs no kernel support at all.
+                            librealsense = previous.librealsense.overrideAttrs
+                                (old: {
+                                    cmakeFlags = (old.cmakeFlags or [ ])
+                                        ++ [ "-DFORCE_RSUSB_BACKEND=ON" ];
+                                });
                         });
                 in
                 {

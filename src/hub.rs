@@ -91,13 +91,15 @@ impl Settings {
         frames
     }
 
-    /// The image format a given stream is stored in. A colour codec would
-    /// silently truncate 16-bit depth, so depth and infrared get their own
-    /// setting and fall back rather than losing precision.
+    /// The image format a given stream is stored in. The split is by bit depth,
+    /// not by role: only depth is 16-bit, and a colour codec would silently
+    /// truncate it. Infrared is plain 8-bit grey, so forcing it down the depth
+    /// path made a Pi spend two cores deflating frames a jpeg would have
+    /// handled in a tenth of the time.
     pub fn format_for(&self, stream: StreamId) -> ImageFormat {
         match stream {
-            StreamId::Color => self.color_format,
-            _ => self.depth_format,
+            StreamId::Depth => self.depth_format,
+            _ => self.color_format,
         }
     }
 }
@@ -147,6 +149,9 @@ pub struct Hub {
     settings_file: PathBuf,
     backends: Mutex<BTreeMap<SensorKind, Box<dyn Backend>>>,
     recorder: Mutex<Option<Recorder>>,
+    /// Mirrors `recorder.is_some()` so the capture thread can ask "does anyone
+    /// want this frame?" without contending for the recorder lock.
+    recording_active: AtomicBool,
     last_status: Mutex<RecordingStatus>,
     rates: Mutex<BTreeMap<String, RateCounter>>,
     /// Frames the pipeline shed before they reached the encoder.
@@ -164,6 +169,10 @@ pub struct Hub {
     /// Counts preview encodes so switching the preview off can be shown to
     /// actually stop the work rather than just hide the result.
     preview_encodes: AtomicU64,
+    /// Counts frames that reached an encode worker, for the same reason
+    /// `preview_encodes` exists: idling has to be demonstrably free, not just
+    /// look free from the outside.
+    record_encodes: AtomicU64,
     preview_wanted: AtomicBool,
     health: Mutex<sysmon::Sampler>,
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
@@ -186,6 +195,7 @@ impl Hub {
             settings_file,
             backends: Mutex::new(BTreeMap::new()),
             recorder: Mutex::new(None),
+            recording_active: AtomicBool::new(false),
             last_status: Mutex::new(record::idle_status()),
             rates: Mutex::new(BTreeMap::new()),
             pipeline_dropped: Mutex::new(BTreeMap::new()),
@@ -193,6 +203,7 @@ impl Hub {
             encode_sender,
             preview: Mutex::new(None),
             preview_encodes: AtomicU64::new(0),
+            record_encodes: AtomicU64::new(0),
             health: Mutex::new(sysmon::Sampler::default()),
             workers: Mutex::new(Vec::new()),
         });
@@ -266,6 +277,18 @@ impl Hub {
                 .entry(produced.topic().to_string())
                 .or_default()
                 .tick();
+            // Compressing a frame costs a core, and with no recorder and no
+            // preview the result is thrown away by `offer`. Shedding it here
+            // is not a drop: nothing was going to keep it. Intrinsics are the
+            // exception — the hub remembers those to replay into a recording
+            // that has not started yet, so they are never shed.
+            let announcement = matches!(produced, Produced::CameraInfo { .. });
+            if !announcement
+                && !hub.recording_active.load(Ordering::Relaxed)
+                && !hub.preview_matches(produced.topic())
+            {
+                return true;
+            }
             match hub.encode_sender.try_send(produced) {
                 Ok(()) => true,
                 Err(TrySendError::Full(produced)) => {
@@ -282,6 +305,7 @@ impl Hub {
     }
 
     fn encode_and_store(&self, produced: Produced) {
+        self.record_encodes.fetch_add(1, Ordering::Relaxed);
         let settings = self.settings();
         match produced {
             Produced::Image {
@@ -347,6 +371,10 @@ impl Hub {
 
     pub fn preview_encode_count(&self) -> u64 {
         self.preview_encodes.load(Ordering::Relaxed)
+    }
+
+    pub fn record_encode_count(&self) -> u64 {
+        self.record_encodes.load(Ordering::Relaxed)
     }
 
     pub fn take_preview(&self) -> Option<PreviewFrame> {
@@ -593,6 +621,7 @@ impl Hub {
         }
         let status = recorder.status();
         *slot = Some(recorder);
+        self.recording_active.store(true, Ordering::Relaxed);
         Ok(status)
     }
 
@@ -600,6 +629,7 @@ impl Hub {
         let Some(recorder) = self.recorder.lock().unwrap().take() else {
             anyhow::bail!("not recording");
         };
+        self.recording_active.store(false, Ordering::Relaxed);
         let status = recorder.finish()?;
         *self.last_status.lock().unwrap() = status.clone();
         Ok(status)
@@ -777,6 +807,40 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(hub.preview_encode_count(), 0);
+        std::fs::remove_file(hub.settings_file()).ok();
+    }
+
+    #[test]
+    fn frames_are_not_compressed_while_nothing_is_recording_or_previewing() {
+        let hub = scratch_hub();
+        let sink = hub.sink();
+        for _ in 0..20 {
+            sink(Produced::Image {
+                stream: StreamId::Depth,
+                topic: "/cam/depth/image_raw".into(),
+                image: an_image(64, 48),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            hub.record_encode_count(),
+            0,
+            "an idle recorder still paid to compress frames it then discarded"
+        );
+
+        let directory = hub.settings().record_dir;
+        std::fs::create_dir_all(&directory).ok();
+        hub.start_recording(Some("shed")).unwrap();
+        for _ in 0..20 {
+            sink(Produced::Image {
+                stream: StreamId::Depth,
+                topic: "/cam/depth/image_raw".into(),
+                image: an_image(64, 48),
+            });
+        }
+        assert!(wait_for(|| hub.record_encode_count() == 20));
+        hub.stop_recording().unwrap();
+        std::fs::remove_dir_all(&directory).ok();
         std::fs::remove_file(hub.settings_file()).ok();
     }
 

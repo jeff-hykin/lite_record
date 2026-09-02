@@ -150,6 +150,10 @@ fn to_png(surface: &Surface, width: u32, height: u32) -> Option<Vec<u8>> {
     let mut encoder = png::Encoder::new(&mut out, width, height);
     encoder.set_color(color);
     encoder.set_depth(depth);
+    // Depth is the one stream that must stay lossless, and full zlib over
+    // 600 KB per frame at 30 Hz does not fit in a Pi's budget. The mcap chunk
+    // is lz4'd on top of this anyway, so the slower levels buy very little.
+    encoder.set_compression(png::Compression::Fast);
     let mut writer = encoder.write_header().ok()?;
     writer.write_image_data(&bytes).ok()?;
     writer.finish().ok()?;
