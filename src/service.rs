@@ -112,6 +112,13 @@ fn systemd_unit(binary: &Path, arguments: &[String], working_directory: &Path, u
     }
     // `network-online` rather than `network`, because the lidar socket joins a
     // multicast group and that needs an interface that is actually up.
+    //
+    // The scheduling directives matter on a four-core Pi: a frame arrives every
+    // 33 ms per stream and is unrecoverable if the reader is not there to take
+    // it, so the recorder outranks anything else that happens to wake up.
+    // `AmbientCapabilities` grants CAP_SYS_NICE so the negative nice survives
+    // even when the service runs as an ordinary user. The IO priority is for the
+    // writer thread, which competes with journald and apt for the SD card.
     format!(
         "[Unit]\n\
          Description=lite_record sensor recorder\n\
@@ -125,6 +132,11 @@ fn systemd_unit(binary: &Path, arguments: &[String], working_directory: &Path, u
          User={user}\n\
          Restart=always\n\
          RestartSec=2\n\
+         Nice=-10\n\
+         AmbientCapabilities=CAP_SYS_NICE\n\
+         IOSchedulingClass=best-effort\n\
+         IOSchedulingPriority=0\n\
+         OOMScoreAdjust=-500\n\
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n",
@@ -233,6 +245,21 @@ mod tests {
         assert!(unit.contains("WorkingDirectory=/home/dimensional\n"));
         assert!(unit.contains("Restart=always\n"));
         assert!(unit.contains("WantedBy=multi-user.target\n"));
+    }
+
+    #[test]
+    fn the_unit_outranks_the_rest_of_the_system() {
+        let unit = systemd_unit(
+            Path::new("/usr/bin/lite_record"),
+            &arguments(),
+            Path::new("/home/dimensional"),
+            "dimensional",
+        );
+        assert!(unit.contains("Nice=-10\n"));
+        // Without the capability a non-root service silently keeps nice 0.
+        assert!(unit.contains("AmbientCapabilities=CAP_SYS_NICE\n"));
+        assert!(unit.contains("IOSchedulingPriority=0\n"));
+        assert!(unit.contains("OOMScoreAdjust=-500\n"));
     }
 
     #[test]
