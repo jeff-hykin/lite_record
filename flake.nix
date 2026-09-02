@@ -48,6 +48,7 @@
                             ./src
                             ./tests
                             ./web
+                            ./examples
                         ];
                     };
 
@@ -170,6 +171,27 @@
                         rustTarget = "aarch64-unknown-linux-musl";
                         crossPkgs = crossPkgsFor "aarch64-unknown-linux-musl";
                     };
+                    # The encode-cost bench as its own aarch64 binary, so the codec
+                    # decision can be measured on the Pi without putting a rust
+                    # toolchain there. It only touches `image` and `msgs`, so it does
+                    # not need the realsense feature or its SDK.
+                    linux-arm64-bench = (buildCross {
+                        rustTarget = "aarch64-unknown-linux-musl";
+                        crossPkgs = crossPkgsFor "aarch64-unknown-linux-musl";
+                    }).overrideAttrs (old: {
+                        pname = "lite_record-bench-aarch64-unknown-linux-musl";
+                        buildPhase = ''
+                            runHook preBuild
+                            cargo build --release --target aarch64-unknown-linux-musl --example encode_cost
+                            runHook postBuild
+                        '';
+                        installPhase = ''
+                            runHook preInstall
+                            mkdir -p $out/bin
+                            install -m755 target/aarch64-unknown-linux-musl/release/examples/encode_cost $out/bin/encode_cost
+                            runHook postInstall
+                        '';
+                    });
                     linux-arm64-realsense = buildCross {
                         rustTarget = "aarch64-unknown-linux-gnu";
                         crossPkgs = aarch64Gnu;
