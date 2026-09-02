@@ -19,6 +19,19 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use realsense_sys as sys;
+// Taken from the bindings rather than written out as numbers. Transcribing them
+// by hand once put MJPEG's 22 on `MOTION_XYZ32F` and 12 on the emitter switch,
+// and asking a gyro for MJPEG fails the whole resolve with nothing but
+// "Couldn't resolve requests" to say why.
+use sys::{
+    rs2_camera_info_RS2_CAMERA_INFO_SERIAL_NUMBER as RS2_CAMERA_INFO_SERIAL_NUMBER,
+    rs2_format_RS2_FORMAT_BGR8 as RS2_FORMAT_BGR8,
+    rs2_format_RS2_FORMAT_MOTION_XYZ32F as RS2_FORMAT_MOTION_XYZ32F,
+    rs2_format_RS2_FORMAT_Y8 as RS2_FORMAT_Y8,
+    rs2_format_RS2_FORMAT_Z16 as RS2_FORMAT_Z16,
+    rs2_option_RS2_OPTION_EMITTER_ENABLED as RS2_OPTION_EMITTER_ENABLED,
+    rs2_option_RS2_OPTION_GLOBAL_TIME_ENABLED as RS2_OPTION_GLOBAL_TIME_ENABLED,
+};
 
 use super::{
     body_transforms, camera_info, ros_encoding, rs2_stream_for, BodyExtrinsic, RsDistortion,
@@ -37,30 +50,12 @@ const FRAME_TIMEOUT_MS: u32 = 2_000;
 /// its dispatch thread.
 const ALIGN_TIMEOUT_MS: u32 = 200;
 
-/// `rs2_option` values this backend touches, from `rs_option.h`.
-const RS2_OPTION_EMITTER_ENABLED: sys::rs2_option = 12;
-
-/// `rs2_format` values requested when enabling a stream, from `rs_sensor.h`.
-const RS2_FORMAT_Z16: sys::rs2_format = 1;
-const RS2_FORMAT_Y8: sys::rs2_format = 9;
-const RS2_FORMAT_BGR8: sys::rs2_format = 6;
-const RS2_FORMAT_MOTION_XYZ32F: sys::rs2_format = 22;
-
-/// `rs2_camera_info::RS2_CAMERA_INFO_SERIAL_NUMBER`.
-const RS2_CAMERA_INFO_SERIAL_NUMBER: sys::rs2_camera_info = 1;
-
 /// The generated bindings give `rs2_stream` an unsigned repr. The stream
 /// constants live in the SDK-free half as plain `i32` so they stay testable
 /// without the bindings present, so they are widened at this boundary only.
 fn stream_enum(value: i32) -> sys::rs2_stream {
     value as sys::rs2_stream
 }
-
-/// The fastest IMU rate worth recording. Gyro and accel are asked for
-/// separately and the device rarely offers the same set for both, so a
-/// `sensor_msgs/Imu` still has to pair each gyro sample with the most recent
-/// acceleration rather than waiting for a matching one.
-const MOTION_HZ_CAP: i32 = 250;
 
 // -- error and handle plumbing ------------------------------------------------
 
@@ -157,6 +152,8 @@ struct Aligner {
 struct Session {
     running: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// Absent when the device has no motion module or the user turned it off.
+    motion_worker: Option<std::thread::JoinHandle<()>>,
     /// Held so the emitter can be toggled while streaming.
     depth_sensor: Arc<Mutex<Owned<sys::rs2_sensor>>>,
     /// The factory extrinsics, read once at start because they cannot change
@@ -254,65 +251,190 @@ unsafe fn depth_sensor_of(device: *mut sys::rs2_device) -> Result<Owned<sys::rs2
     anyhow::bail!("this device has no sensor carrying the emitter option")
 }
 
-/// The rate to ask for on a motion stream: the fastest the device actually
-/// offers, up to `MOTION_HZ_CAP`.
+/// The motion module, opened directly rather than through the pipeline.
 ///
-/// Asking for a rate the device does not list makes `pipeline_start` fail with
-/// "Couldn't resolve requests", which takes the image streams down with it. The
-/// sets differ by IMU part — a D435i's BMI055 offers accel at 63 and 250, a
-/// D435IF's BMI085 offers 100, 200 and 400 — so the numbers cannot be constants.
-unsafe fn motion_rate(device: *mut sys::rs2_device, kind: i32) -> Option<i32> {
+/// The pipeline's frame syncer emits one frameset per *video* frame and folds
+/// whatever motion samples have arrived into it, so a 200 Hz gyro read that way
+/// arrives at 30 Hz with six of every seven samples thrown away. A frame queue
+/// hung straight off the sensor has no syncer and hands back every sample once.
+struct MotionStream {
+    sensor: Owned<sys::rs2_sensor>,
+    queue: Owned<sys::rs2_frame_queue>,
+    gyro_hz: i32,
+    /// Read here rather than in `body_extrinsics`, because librealsense's
+    /// extrinsics graph is per device *instance*: the pipeline opens its own
+    /// copy of the device, and asking it about a profile from this copy answers
+    /// "requested extrinsics are not available". The two instances read the same
+    /// factory calibration, so taking the edge on this side is not a shortcut.
+    depth_to_imu: Option<BodyExtrinsic>,
+}
+
+/// Opens the gyro and accel at whichever offered rate sits closest to
+/// `requested_hz`, each chosen independently.
+///
+/// The rate sets differ by IMU part — a D435i's BMI055 offers accel at 63 and
+/// 250, a D435IF's BMI085 offers 100, 200 and 400 — so a requested rate cannot
+/// be passed through, and gyro and accel routinely land on different numbers.
+/// That is why a `sensor_msgs/Imu` pairs each gyro sample with the most recent
+/// acceleration instead of waiting for a matching one.
+unsafe fn open_motion(
+    device: *mut sys::rs2_device,
+    requested_hz: u32,
+) -> Result<MotionStream> {
+    let requested_hz = requested_hz as i32;
     let sensors = Owned::new(
-        rs_ignoring_errors!(rs2_query_sensors(device)),
+        rs!("listing sensors", rs2_query_sensors(device)),
         sys::rs2_delete_sensor_list,
-    )
-    .ok()?;
-    let count = rs_ignoring_errors!(rs2_get_sensors_count(sensors.pointer()));
-    let mut best = None;
+    )?;
+    let count = rs!("counting sensors", rs2_get_sensors_count(sensors.pointer()));
+
+    let mut depth_profile: *const sys::rs2_stream_profile = ptr::null();
+    let mut motion = None;
     for index in 0..count {
-        let Ok(sensor) = Owned::new(
-            rs_ignoring_errors!(rs2_create_sensor(sensors.pointer(), index)),
+        let sensor = Owned::new(
+            rs!("opening a sensor", rs2_create_sensor(sensors.pointer(), index)),
             sys::rs2_delete_sensor,
-        ) else {
-            continue;
-        };
-        let Ok(profiles) = Owned::new(
-            rs_ignoring_errors!(rs2_get_stream_profiles(sensor.pointer())),
+        )?;
+        let profiles = Owned::new(
+            rs!("listing stream profiles", rs2_get_stream_profiles(sensor.pointer())),
             sys::rs2_delete_stream_profiles_list,
-        ) else {
-            continue;
-        };
-        let total = rs_ignoring_errors!(rs2_get_stream_profiles_count(profiles.pointer()));
+        )?;
+        let total = rs!(
+            "counting stream profiles",
+            rs2_get_stream_profiles_count(profiles.pointer())
+        );
+
+        let mut best: [Option<(i32, *const sys::rs2_stream_profile)>; 2] = [None, None];
         for slot in 0..total {
             let profile = rs_ignoring_errors!(rs2_get_stream_profile(profiles.pointer(), slot));
             if profile.is_null() {
                 continue;
             }
-            let mut stream = 0;
-            let mut format = 0;
-            let mut stream_index = 0;
-            let mut unique_id = 0;
-            let mut rate = 0;
-            let mut error: *mut sys::rs2_error = ptr::null_mut();
-            sys::rs2_get_stream_profile_data(
-                profile,
-                &mut stream,
-                &mut format,
-                &mut stream_index,
-                &mut unique_id,
-                &mut rate,
-                &mut error,
-            );
-            if !error.is_null() {
-                sys::rs2_free_error(error);
+            let Some((kind, _, format, rate)) = stream_profile_data(profile) else {
+                continue;
+            };
+            if kind == RS2_STREAM_DEPTH && depth_profile.is_null() {
+                depth_profile = profile;
+            }
+            let wanted = match kind {
+                _ if kind == RS2_STREAM_GYRO => 0,
+                _ if kind == RS2_STREAM_ACCEL => 1,
+                _ => continue,
+            };
+            if format != RS2_FORMAT_MOTION_XYZ32F {
                 continue;
             }
-            if stream as i32 == kind && rate <= MOTION_HZ_CAP && Some(rate) > best {
-                best = Some(rate);
+            // Ties go to the faster rate, so a request halfway between two
+            // offered rates errs towards more data rather than less.
+            let closer = |candidate: i32, chosen: i32| {
+                let (candidate_gap, chosen_gap) = (
+                    (candidate - requested_hz).abs(),
+                    (chosen - requested_hz).abs(),
+                );
+                candidate_gap < chosen_gap
+                    || (candidate_gap == chosen_gap && candidate > chosen)
+            };
+            if best[wanted].is_none_or(|(chosen, _)| closer(rate, chosen)) {
+                best[wanted] = Some((rate, profile));
             }
         }
+
+        let (Some((gyro_hz, gyro_profile)), Some((_, accel_profile))) = (best[0], best[1]) else {
+            continue;
+        };
+        // The profiles list has to outlive the open call, so the sensor is kept
+        // rather than the loop moving on to the next one.
+        motion = Some((sensor, profiles, gyro_hz, gyro_profile, accel_profile));
+        break;
     }
-    best
+    let Some((sensor, _profiles, gyro_hz, gyro_profile, accel_profile)) = motion else {
+        anyhow::bail!("this device has no motion module")
+    };
+
+    let depth_to_imu = (!depth_profile.is_null())
+        .then(|| extrinsic_between(depth_profile, gyro_profile, StreamId::Imu))
+        .flatten();
+
+    // librealsense's own device-to-host clock fit goes wrong once the camera bus
+    // is busy (IntelRealSense/librealsense#9131): it stamped this 200 Hz gyro as
+    // if it ran at 191 Hz, a rate error that compounds to over a second across a
+    // half-minute recording. The raw hardware clock keeps near-perfect spacing,
+    // so it is taken instead and shifted onto the host epoch by `HostClock`.
+    rs_ignoring_errors!(rs2_set_option(
+        sensor.pointer() as *const sys::rs2_options,
+        RS2_OPTION_GLOBAL_TIME_ENABLED,
+        0.0,
+    ));
+
+    let mut chosen = [gyro_profile, accel_profile];
+    rs!(
+        "opening the motion module",
+        rs2_open_multiple(sensor.pointer(), chosen.as_mut_ptr(), 2)
+    );
+    // Deep enough to ride out a scheduling hiccup at 400 Hz without the SDK
+    // silently dropping the oldest sample.
+    let queue = Owned::new(
+        rs!("creating the motion queue", rs2_create_frame_queue(64)),
+        sys::rs2_delete_frame_queue,
+    )?;
+    rs!(
+        "starting the motion module",
+        rs2_start_queue(sensor.pointer(), queue.pointer())
+    );
+    Ok(MotionStream { sensor, queue, gyro_hz, depth_to_imu })
+}
+
+/// One edge of the factory calibration, or `None` when the SDK has no such edge.
+///
+/// A missing edge means one fewer transform in `/tf_static`, which is worth far
+/// less than the frames that would be lost by treating it as fatal.
+unsafe fn extrinsic_between(
+    from: *const sys::rs2_stream_profile,
+    to: *const sys::rs2_stream_profile,
+    child: StreamId,
+) -> Option<BodyExtrinsic> {
+    let mut raw = std::mem::zeroed::<sys::rs2_extrinsics>();
+    let mut error: *mut sys::rs2_error = ptr::null_mut();
+    sys::rs2_get_extrinsics(from, to, &mut raw, &mut error);
+    if !error.is_null() {
+        eprintln!(
+            "realsense: no {child:?} extrinsic: {}",
+            CStr::from_ptr(sys::rs2_get_error_message(error)).to_string_lossy()
+        );
+        sys::rs2_free_error(error);
+        return None;
+    }
+    Some(BodyExtrinsic {
+        child,
+        rotation: std::array::from_fn(|slot| raw.rotation[slot] as f64),
+        translation: std::array::from_fn(|slot| raw.translation[slot] as f64),
+    })
+}
+
+/// A stream profile's kind, index, format and rate.
+unsafe fn stream_profile_data(
+    profile: *const sys::rs2_stream_profile,
+) -> Option<(i32, i32, sys::rs2_format, i32)> {
+    let mut kind: sys::rs2_stream = 0;
+    let mut format: sys::rs2_format = 0;
+    let mut index: i32 = 0;
+    let mut unique_id: i32 = 0;
+    let mut rate: i32 = 0;
+    let mut error: *mut sys::rs2_error = ptr::null_mut();
+    sys::rs2_get_stream_profile_data(
+        profile,
+        &mut kind,
+        &mut format,
+        &mut index,
+        &mut unique_id,
+        &mut rate,
+        &mut error,
+    );
+    if !error.is_null() {
+        sys::rs2_free_error(error);
+        return None;
+    }
+    Some((kind as i32, index, format, rate))
 }
 
 unsafe fn set_emitter(sensor: *mut sys::rs2_sensor, on: bool) -> Result<()> {
@@ -367,6 +489,9 @@ impl Backend for RealsenseBackend {
         if let Some(worker) = session.worker {
             let _ = worker.join();
         }
+        if let Some(worker) = session.motion_worker {
+            let _ = worker.join();
+        }
         self.detail = "released".into();
     }
 
@@ -393,6 +518,7 @@ impl Backend for RealsenseBackend {
         let restart_needed = config.width != self.config.width
             || config.height != self.config.height
             || config.frame_rate != self.config.frame_rate
+            || config.imu_rate != self.config.imu_rate
             || config.streams() != self.config.streams()
             || config.align_depth_to_color != self.config.align_depth_to_color
             || config.serial != self.config.serial;
@@ -434,7 +560,6 @@ impl RealsenseBackend {
         &self,
         context: *mut sys::rs2_context,
         serial: &str,
-        motion: Option<(i32, i32)>,
     ) -> Result<StartedPipeline> {
         let config = Owned::new(
             rs!("creating a config", rs2_create_config()),
@@ -462,25 +587,6 @@ impl RealsenseBackend {
                 );
             }
         }
-        if let Some((gyro_hz, accel_hz)) = motion {
-            // Motion streams carry no resolution; the zeros are how the C API
-            // spells "not applicable" for width and height.
-            for (kind, rate) in [(RS2_STREAM_GYRO, gyro_hz), (RS2_STREAM_ACCEL, accel_hz)] {
-                rs!(
-                    "enabling a motion stream",
-                    rs2_config_enable_stream(
-                        config.pointer(),
-                        stream_enum(kind),
-                        0,
-                        0,
-                        0,
-                        RS2_FORMAT_MOTION_XYZ32F,
-                        rate,
-                    )
-                );
-            }
-        }
-
         let pipeline = Owned::new(
             rs!("creating the pipeline", rs2_create_pipeline(context)),
             sys::rs2_delete_pipeline,
@@ -514,31 +620,25 @@ impl RealsenseBackend {
         let depth_sensor = depth_sensor_of(device.pointer())?;
         set_emitter(depth_sensor.pointer(), self.config.emitter)?;
 
-        let motion = self.config.imu.then(|| {
-            motion_rate(device.pointer(), RS2_STREAM_GYRO)
-                .zip(motion_rate(device.pointer(), RS2_STREAM_ACCEL))
-        });
+        // Before the pipeline, not after: librealsense will not hand out the
+        // motion module once the video pipeline holds the device. Losing every
+        // image stream because the host cannot reach the IMU would be a worse
+        // outcome than recording without one, so a failure here is reported
+        // rather than fatal.
+        let mut motion = match self
+            .config
+            .imu
+            .then(|| open_motion(device.pointer(), self.config.imu_rate))
+        {
+            Some(Ok(stream)) => Some(stream),
+            Some(Err(error)) => {
+                self.error = Some(format!("IMU unavailable, streaming video only: {error:#}"));
+                None
+            }
+            None => None,
+        };
 
-        // Losing every image stream because the host cannot reach the IMU is a
-        // worse outcome than recording without one — a device whose motion
-        // module is invisible offers no motion profiles at all, and any request
-        // naming one then fails to resolve. So the motion streams are dropped
-        // and the pipeline retried, with the UI told what it lost.
-        let mut publish_imu = self.config.imu;
-        let (config, pipeline, profile) =
-            match self.start_pipeline(context.pointer(), &serial, motion.flatten()) {
-                Ok(started) => started,
-                Err(with_imu) if publish_imu => {
-                    publish_imu = false;
-                    self.error = Some(format!("IMU unavailable, streaming video only: {with_imu:#}"));
-                    self.start_pipeline(context.pointer(), &serial, None)?
-                }
-                Err(error) => return Err(error),
-            };
-        if publish_imu && motion.flatten().is_none() {
-            publish_imu = false;
-            self.error = Some("IMU unavailable: this device lists no motion profiles".into());
-        }
+        let (config, pipeline, profile) = self.start_pipeline(context.pointer(), &serial)?;
 
         let aligner = if self.config.align_depth_to_color {
             let block = Owned::new(
@@ -563,14 +663,46 @@ impl RealsenseBackend {
 
         let running = Arc::new(AtomicBool::new(true));
         let depth_sensor = Arc::new(Mutex::new(depth_sensor));
-        self.detail = format!("{serial} @ {}x{}", self.config.width, self.config.height);
+        self.detail = match &motion {
+            Some(motion) => format!(
+                "{serial} @ {}x{}, imu {} Hz",
+                self.config.width, self.config.height, motion.gyro_hz
+            ),
+            None => format!("{serial} @ {}x{}", self.config.width, self.config.height),
+        };
         // Read before the worker takes the profile: these are what let a reader
         // place colour pixels against depth without the calibration file.
         let transforms = body_extrinsics(
             profile.pointer(),
+            motion.as_mut().and_then(|motion| motion.depth_to_imu.take()),
             &self.config.naming,
             crate::record::now_nanos(),
         )?;
+
+        let motion_worker = motion
+            .map(|motion| {
+                let running = Arc::clone(&running);
+                let naming = self.config.naming.clone();
+                let sink = Arc::clone(&sink);
+                // Only the two owned handles cross the thread boundary; the
+                // borrowed profile pointer stays behind with the extrinsics.
+                let MotionStream { sensor, queue, .. } = motion;
+                std::thread::Builder::new().name("realsense-imu".into()).spawn(move || {
+                    let mut pump = Pump::new(naming, sink, true);
+                    while running.load(Ordering::SeqCst) {
+                        unsafe {
+                            if let Err(error) = pump.step_motion(queue.pointer()) {
+                                eprintln!("realsense imu: {error:#}");
+                            }
+                        }
+                    }
+                    unsafe {
+                        rs_ignoring_errors!(rs2_stop(sensor.pointer()));
+                        rs_ignoring_errors!(rs2_close(sensor.pointer()));
+                    }
+                })
+            })
+            .transpose()?;
 
         let worker = {
             let running = Arc::clone(&running);
@@ -581,7 +713,9 @@ impl RealsenseBackend {
                 .name("realsense".into())
                 .spawn(move || {
                     let _held = held;
-                    let mut pump = Pump::new(naming, sink, publish_imu);
+                    // The IMU has its own thread now, so no motion frame ever
+                    // reaches this one.
+                    let mut pump = Pump::new(naming, sink, false);
                     while running.load(Ordering::SeqCst) {
                         unsafe {
                             if let Err(error) = pump.step(pipeline.pointer(), aligner.as_ref()) {
@@ -598,10 +732,123 @@ impl RealsenseBackend {
         self.session = Some(Session {
             running,
             worker: Some(worker),
+            motion_worker,
             depth_sensor,
             body_transforms: transforms,
         });
         Ok(())
+    }
+}
+
+/// How far back to look for the smallest device-to-host offset seen.
+const CLOCK_WINDOW_SECONDS: u64 = 30;
+
+/// Puts a motion-module hardware stamp onto the host clock.
+///
+/// Delivery latency can only ever make a sample arrive later than it was taken,
+/// so the smallest offset seen recently is the closest estimate of the true one.
+/// Keeping one minimum per second lets the estimate follow the device's slow
+/// drift without rescanning every sample.
+#[derive(Default)]
+struct HostClock {
+    per_second: std::collections::VecDeque<(u64, i128)>,
+    offset: i128,
+}
+
+impl HostClock {
+    fn host_nanos(&mut self, device_nanos: u64) -> u64 {
+        self.map(device_nanos, crate::record::now_nanos())
+    }
+
+    /// Split out from `host_nanos` so a test can drive the host clock instead of
+    /// racing the real one across a second boundary.
+    fn map(&mut self, device_nanos: u64, now: u64) -> u64 {
+        let offset = now as i128 - device_nanos as i128;
+        let second = now / 1_000_000_000;
+        match self.per_second.back_mut() {
+            // A better estimate is taken immediately rather than at the next
+            // rollover, so a slow first sample cannot hold every stamp late for
+            // a whole second. The window minimum can only fall when a bucket's
+            // does, so this stays a comparison rather than a rescan.
+            Some(newest) if newest.0 == second => {
+                if offset < newest.1 {
+                    newest.1 = offset;
+                    self.offset = self.offset.min(offset);
+                }
+            }
+            _ => {
+                self.per_second.push_back((second, offset));
+                while self
+                    .per_second
+                    .front()
+                    .is_some_and(|(stamp, _)| stamp + CLOCK_WINDOW_SECONDS < second)
+                {
+                    self.per_second.pop_front();
+                }
+                self.offset = self
+                    .per_second
+                    .iter()
+                    .map(|(_, offset)| *offset)
+                    .min()
+                    .unwrap_or(offset);
+            }
+        }
+        (device_nanos as i128 + self.offset).max(0) as u64
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::HostClock;
+
+    const EPOCH: u64 = 1_788_000_000_000_000_000;
+    const STEP: u64 = 5_000_000;
+
+    /// The whole reason for keeping the hardware clock is that its spacing is
+    /// exact. Ten seconds of a perfectly even 200 Hz has to come back out as a
+    /// perfectly even 200 Hz however jittery the arrivals were — this is what
+    /// librealsense's own fit got wrong, reporting the gyro as 191 Hz.
+    #[test]
+    fn even_device_spacing_survives_jittery_arrival() {
+        let mut clock = HostClock::default();
+        let stamps: Vec<u64> = (0..2000)
+            .map(|index| {
+                // A burst of four arriving together, then a 20 ms stall, which
+                // is roughly what a busy USB bus does.
+                let jitter = if index % 4 == 0 { 20_000_000 } else { 0 };
+                clock.map(index * STEP, EPOCH + index * STEP + jitter)
+            })
+            .collect();
+
+        // The first sample is the jittered one, so it is the offset estimate's
+        // warm-up; from the second onwards the estimate has the true minimum and
+        // never moves again, including across the ten second boundaries here.
+        let gaps: Vec<u64> = stamps[1..].windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert_eq!(gaps.len(), 1998);
+        assert!(
+            gaps.iter().all(|gap| *gap == STEP),
+            "spacing was not preserved: {:?}",
+            &gaps[..8]
+        );
+    }
+
+    /// A device stamp counts from the camera powering on, so without
+    /// re-anchoring every message would claim to be from 1970.
+    #[test]
+    fn device_uptime_lands_on_the_host_epoch() {
+        let mut clock = HostClock::default();
+        let stamp = clock.map(90_000_000_000, EPOCH);
+        assert_eq!(stamp, EPOCH);
+    }
+
+    /// Arrival latency only ever pushes a sample later, so one sample that took
+    /// an unusually long time to arrive must not drag every later stamp with it.
+    #[test]
+    fn a_single_late_arrival_does_not_shift_the_series() {
+        let mut clock = HostClock::default();
+        clock.map(0, EPOCH + 500_000_000);
+        let after_a_stall = clock.map(STEP, EPOCH + STEP);
+        assert_eq!(after_a_stall, EPOCH + STEP);
     }
 }
 
@@ -618,6 +865,7 @@ struct Pump {
     publish_imu: bool,
     announced: std::collections::BTreeSet<StreamId>,
     latest_acceleration: [f64; 3],
+    motion_clock: HostClock,
 }
 
 impl Pump {
@@ -628,6 +876,7 @@ impl Pump {
             publish_imu,
             announced: Default::default(),
             latest_acceleration: [0.0; 3],
+            motion_clock: HostClock::default(),
         }
     }
 
@@ -705,29 +954,31 @@ impl Pump {
         Ok(())
     }
 
+    /// Waits for one motion sample and publishes it.
+    ///
+    /// # Safety
+    /// `queue` must be the queue a started motion sensor is writing into.
+    unsafe fn step_motion(&mut self, queue: *mut sys::rs2_frame_queue) -> Result<()> {
+        let mut error: *mut sys::rs2_error = ptr::null_mut();
+        let frame = sys::rs2_wait_for_frame(queue, FRAME_TIMEOUT_MS, &mut error);
+        if !error.is_null() {
+            sys::rs2_free_error(error);
+            return Ok(());
+        }
+        let frame = Owned::new(frame, sys::rs2_release_frame)?;
+        let (kind, _, _, device_nanos) = self.describe(frame.pointer())?;
+        let stamp_nanos = self.motion_clock.host_nanos(device_nanos);
+        self.publish_motion(frame.pointer(), kind, stamp_nanos)
+    }
+
     /// The frame's stream kind, index, format and timestamp.
     unsafe fn describe(&self, frame: *mut sys::rs2_frame) -> Result<(i32, i32, u32, u64)> {
         let profile = rs!("reading a frame's profile", rs2_get_frame_stream_profile(frame));
-        let mut kind: sys::rs2_stream = 0;
-        let mut format: sys::rs2_format = 0;
-        let mut index: i32 = 0;
-        let mut unique_id: i32 = 0;
-        let mut frame_rate: i32 = 0;
-        rs!(
-            "reading a stream profile",
-            rs2_get_stream_profile_data(
-                profile,
-                &mut kind,
-                &mut format,
-                &mut index,
-                &mut unique_id,
-                &mut frame_rate,
-            )
-        );
+        let (kind, index, format, _) = stream_profile_data(profile)
+            .ok_or_else(|| anyhow!("librealsense could not describe a frame's stream"))?;
         // librealsense reports milliseconds as a double; ROS wants nanoseconds.
         let milliseconds = rs!("reading a frame timestamp", rs2_get_frame_timestamp(frame));
-        let stamp_nanos = (milliseconds * 1.0e6) as u64;
-        Ok((kind as i32, index, format, stamp_nanos))
+        Ok((kind, index, format, (milliseconds * 1.0e6) as u64))
     }
 
     unsafe fn publish_frame(&mut self, frame: *mut sys::rs2_frame) -> Result<()> {
@@ -901,6 +1152,7 @@ impl Pump {
 /// `profile` must be a live pipeline profile.
 pub unsafe fn body_extrinsics(
     profile: *mut sys::rs2_pipeline_profile,
+    depth_to_imu: Option<BodyExtrinsic>,
     naming: &super::super::Naming,
     stamp_nanos: u64,
 ) -> Result<Vec<crate::msgs::TransformStamped>> {
@@ -944,7 +1196,6 @@ pub unsafe fn body_extrinsics(
             (k, _) if k == RS2_STREAM_COLOR => StreamId::Color,
             (k, 1) if k == super::RS2_STREAM_INFRARED => StreamId::InfraLeft,
             (k, 2) if k == super::RS2_STREAM_INFRARED => StreamId::InfraRight,
-            (k, _) if k == RS2_STREAM_GYRO => StreamId::Imu,
             _ => continue,
         };
         others.push((stream, profile));
@@ -955,18 +1206,11 @@ pub unsafe fn body_extrinsics(
         return Ok(Vec::new());
     }
 
-    let mut extrinsics = Vec::new();
+    // The IMU is opened outside the pipeline, so its edge is read there and
+    // handed in rather than found among these profiles.
+    let mut extrinsics: Vec<_> = depth_to_imu.into_iter().collect();
     for (stream, profile) in others {
-        let mut raw = std::mem::zeroed::<sys::rs2_extrinsics>();
-        rs!(
-            "reading an extrinsic",
-            rs2_get_extrinsics(depth_profile, profile, &mut raw)
-        );
-        extrinsics.push(BodyExtrinsic {
-            child: stream,
-            rotation: std::array::from_fn(|slot| raw.rotation[slot] as f64),
-            translation: std::array::from_fn(|slot| raw.translation[slot] as f64),
-        });
+        extrinsics.extend(extrinsic_between(depth_profile, profile, stream));
     }
     Ok(body_transforms(naming, stamp_nanos, &extrinsics))
 }

@@ -164,6 +164,7 @@ const cameraNumbers = [
     { key: "width", label: "Width" },
     { key: "height", label: "Height" },
     { key: "frame_rate", label: "Frame rate" },
+    { key: "imu_rate", label: "IMU rate (Hz)" },
 ]
 
 /**

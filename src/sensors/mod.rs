@@ -165,6 +165,11 @@ impl Naming {
     }
 }
 
+/// The gyro rate every D4xx offers, and the one both IMU parts share.
+fn default_imu_rate() -> u32 {
+    200
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CameraConfig {
     pub enabled: bool,
@@ -179,6 +184,13 @@ pub struct CameraConfig {
     pub width: u32,
     pub height: u32,
     pub frame_rate: u32,
+    /// Requested IMU rate in Hz. Every IMU part offers its own fixed set of
+    /// rates — a BMI055 accelerometer does 63 and 250, a BMI085 does 100, 200
+    /// and 400 — so this is matched to the nearest rate the device actually has
+    /// rather than passed through. Defaulted on read so a settings file written
+    /// before this field existed still loads.
+    #[serde(default = "default_imu_rate")]
+    pub imu_rate: u32,
     /// The IR projector. It has to be off for stereo feature tracking and on
     /// for dense depth, and switching it is the single most common runtime
     /// change, so it is exposed as its own control.
@@ -202,6 +214,7 @@ impl CameraConfig {
             width: 640,
             height: 480,
             frame_rate: 30,
+            imu_rate: default_imu_rate(),
             emitter: true,
             align_depth_to_color: false,
         }
