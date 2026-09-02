@@ -411,11 +411,16 @@ mod tests {
         let path = directory.join("out.mcap");
         let recorder = Recorder::start(&path, Compression::Lz4).unwrap();
         for index in 0..2000 {
-            assert!(recorder.offer("/livox/imu", an_imu(index)));
+            // 2000 messages into a queue of QUEUE_DEPTH, so on a machine busy
+            // enough that the writer falls behind this legitimately sheds. That
+            // is the subject of its own test; here the point is that everything
+            // handed over comes back, so a shed sample is re-offered instead.
+            while !recorder.offer("/livox/imu", an_imu(index)) {
+                std::thread::yield_now();
+            }
         }
         let status = recorder.finish().unwrap();
         assert_eq!(status.messages, 2000);
-        assert_eq!(status.dropped, 0);
         assert_eq!(status.topics["/livox/imu"].written, 2000);
 
         let bytes = std::fs::read(&path).unwrap();
