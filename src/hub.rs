@@ -651,10 +651,17 @@ impl Hub {
     }
 
     pub fn stop_recording(&self) -> Result<RecordingStatus> {
+        // Cleared before the lock is asked for, not after. `sink` sheds frames
+        // on this flag, so lowering it first drains the capture and encode
+        // threads that are otherwise taking the recorder lock hundreds of times
+        // a second. Doing it in the other order let those threads starve this
+        // one on a Pi saturated by encoding -- std's mutex is not fair, so
+        // `stop` could wait indefinitely, and every `/api/status` piled up
+        // behind it until the whole HTTP runtime stopped accepting.
+        self.recording_active.store(false, Ordering::Relaxed);
         let Some(recorder) = self.recorder.lock().unwrap().take() else {
             anyhow::bail!("not recording");
         };
-        self.recording_active.store(false, Ordering::Relaxed);
         let status = recorder.finish()?;
         *self.last_status.lock().unwrap() = status.clone();
         Ok(status)
