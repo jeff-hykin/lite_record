@@ -85,8 +85,11 @@ fn sensor_named(name: &str) -> Result<SensorKind> {
     match name.trim().to_ascii_lowercase().as_str() {
         "realsense" => Ok(SensorKind::Realsense),
         "orbbec" => Ok(SensorKind::Orbbec),
+        "oakd" | "oak-d" | "oak" => Ok(SensorKind::OakD),
         "livox" | "mid360" => Ok(SensorKind::Livox),
-        other => anyhow::bail!("{other:?} is not a sensor; expected realsense, orbbec or livox"),
+        other => anyhow::bail!(
+            "{other:?} is not a sensor; expected realsense, orbbec, oakd or livox"
+        ),
     }
 }
 
@@ -161,6 +164,7 @@ mod tests {
         assert_eq!(sensor_named("realsense").unwrap(), SensorKind::Realsense);
         assert_eq!(sensor_named(" Livox ").unwrap(), SensorKind::Livox);
         assert_eq!(sensor_named("mid360").unwrap(), SensorKind::Livox);
+        assert_eq!(sensor_named("OAK-D").unwrap(), SensorKind::OakD);
         assert!(sensor_named("velodyne").is_err());
     }
 

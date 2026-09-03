@@ -20,6 +20,23 @@
 
 <main>
 
+<section class="card">
+    <h2>Preview</h2>
+    <div class="row">
+        <label for="preview-topic">Stream</label>
+        <select id="preview-topic"></select>
+        <label class="check">
+            <input id="preview-enabled" type="checkbox" checked>
+            <span>On</span>
+        </label>
+    </div>
+    <p class="hint">Turning this off stops the encode entirely rather than just hiding it, which is the point on a Pi.</p>
+    <div class="preview-frame">
+        <img id="preview-image" alt="camera preview" hidden>
+        <p id="preview-idle" class="preview-idle">No frames yet.</p>
+    </div>
+</section>
+
 <section class="card" id="recording-card">
     <div class="row">
         <label for="recording-name">File name</label>
@@ -40,23 +57,6 @@
     <!-- Engage/disengage exists so another process can borrow a camera or the
          lidar without restarting the recorder. -->
     <div id="sensor-list" class="sensor-list"></div>
-</section>
-
-<section class="card">
-    <h2>Preview</h2>
-    <div class="row">
-        <label for="preview-topic">Stream</label>
-        <select id="preview-topic"></select>
-        <label class="check">
-            <input id="preview-enabled" type="checkbox" checked>
-            <span>On</span>
-        </label>
-    </div>
-    <p class="hint">Turning this off stops the encode entirely rather than just hiding it, which is the point on a Pi.</p>
-    <div class="preview-frame">
-        <img id="preview-image" alt="camera preview" hidden>
-        <p id="preview-idle" class="preview-idle">No frames yet.</p>
-    </div>
 </section>
 
 <details class="card" id="monitor" open>
@@ -144,7 +144,11 @@
             <input type="number" step="0.01" min="0" data-setting="livox.voxel_leaf_size">
         </div>
         <p class="hint">A leaf size of 0 keeps every point. Downsampling happens before encoding, so it saves both CPU and disk.</p>
-        <button id="configure-network" class="secondary">Auto-configure Mid-360 network</button>
+        <div class="row">
+            <label for="lidar-interface">Lidar NIC</label>
+            <input id="lidar-interface" type="text" placeholder="eth0" autocomplete="off">
+            <button id="configure-network" class="secondary">Auto-configure Mid-360 network</button>
+        </div>
     </div>
 
     <div class="settings-group">

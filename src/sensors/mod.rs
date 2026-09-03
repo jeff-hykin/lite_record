@@ -7,6 +7,7 @@
 //! modules, so they are covered on every build.
 
 pub mod livox;
+pub mod oakd;
 pub mod orbbec;
 pub mod realsense;
 
@@ -19,6 +20,7 @@ use crate::msgs::{CameraInfo, Imu, PointCloud2, RawImage};
 pub enum SensorKind {
     Realsense,
     Orbbec,
+    OakD,
     Livox,
 }
 
@@ -27,6 +29,7 @@ impl SensorKind {
         match self {
             SensorKind::Realsense => "realsense",
             SensorKind::Orbbec => "orbbec",
+            SensorKind::OakD => "oakd",
             SensorKind::Livox => "livox",
         }
     }
@@ -35,6 +38,7 @@ impl SensorKind {
         match self {
             SensorKind::Realsense => "/realsense",
             SensorKind::Orbbec => "/orbbec",
+            SensorKind::OakD => "/oakd",
             SensorKind::Livox => "/livox",
         }
     }
@@ -43,6 +47,7 @@ impl SensorKind {
         match self {
             SensorKind::Realsense => "realsense",
             SensorKind::Orbbec => "orbbec",
+            SensorKind::OakD => "oakd",
             SensorKind::Livox => "livox",
         }
     }
@@ -52,6 +57,7 @@ impl SensorKind {
         match self {
             SensorKind::Realsense => cfg!(feature = "realsense"),
             SensorKind::Orbbec => cfg!(feature = "orbbec"),
+            SensorKind::OakD => cfg!(feature = "oakd"),
             // The lidar speaks plain UDP, so its receive path needs no SDK at
             // all; the feature only adds the SDK's configuration handshake.
             SensorKind::Livox => true,

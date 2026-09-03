@@ -177,7 +177,7 @@ const buildCameraSettings = () => {
         return
     }
     host.dataset.built = "yes"
-    for (const [kind, title] of [["realsense", "RealSense"], ["orbbec", "Orbbec"]]) {
+    for (const [kind, title] of [["realsense", "RealSense"], ["orbbec", "Orbbec"], ["oakd", "OAK-D"]]) {
         const group = document.createElement("div")
         group.innerHTML = `<h3>${title}</h3>`
 
@@ -237,22 +237,31 @@ const renderSensors = (sensors) => {
         pill.textContent = status.running ? "engaged" : "disengaged"
         pill.dataset.role = "state"
 
-        const button = document.createElement("button")
-        button.className = "secondary"
-        button.textContent = status.running ? "Disengage" : "Engage"
-        button.dataset.role = "toggle"
-        button.addEventListener("click", async () => {
-            const action = status.running ? "disengage" : "engage"
-            button.disabled = true
-            try {
-                renderSensors(await postJson(`/api/sensors/${kind}/${action}`))
-            } catch (error) {
-                toast(error.message, true)
-                button.disabled = false
-            }
-        })
+        const actions = document.createElement("span")
+        actions.className = "sensor-actions"
+        // Restart is offered on top of the settings being applied automatically,
+        // because a camera that has wedged needs a cycle with nothing changed.
+        const buttons = status.running
+            ? [["Restart", "restart"], ["Disengage", "disengage"]]
+            : [["Engage", "engage"]]
+        for (const [label, action] of buttons) {
+            const button = document.createElement("button")
+            button.className = "secondary"
+            button.textContent = label
+            button.dataset.role = action
+            button.addEventListener("click", async () => {
+                button.disabled = true
+                try {
+                    renderSensors(await postJson(`/api/sensors/${kind}/${action}`))
+                } catch (error) {
+                    toast(error.message, true)
+                    button.disabled = false
+                }
+            })
+            actions.append(button)
+        }
 
-        row.append(name, pill, detail, button)
+        row.append(name, pill, detail, actions)
         host.append(row)
     }
 }
@@ -374,7 +383,7 @@ const applyStatus = (payload) => {
     renderSensors(payload.sensors)
     renderRecording(payload.recording)
     renderStreams(payload.streams)
-    renderPreviewTopics(payload.preview_topics, payload.settings.preview_topic)
+    renderPreviewTopics(payload.preview_topics, payload.preview_topic)
     renderUrdf(payload.urdf)
     element("preview-enabled").checked = payload.settings.preview_enabled
     element("password-state").textContent = payload.has_password ? "held" : "not set"
@@ -583,6 +592,9 @@ const refreshRecordings = async () => {
         remove.className = "secondary"
         remove.textContent = "Delete"
         remove.addEventListener("click", async () => {
+            if (!confirm(`Delete ${file.name}? This cannot be undone.`)) {
+                return
+            }
             try {
                 await request(`/api/recordings/${encodeURIComponent(file.name)}`, { method: "DELETE" })
                 refreshRecordings()
@@ -689,8 +701,16 @@ const wire = () => {
     })
 
     element("configure-network").addEventListener("click", async () => {
+        const interfaceName = element("lidar-interface").value.trim()
+        if (!interfaceName) {
+            toast("name the interface the lidar is plugged into, such as eth0", true)
+            return
+        }
         try {
-            showPlan(await postJson("/api/network/mid360", {}))
+            showPlan(await postJson("/api/network/mid360", {
+                interface: interfaceName,
+                host_address: state.settings.livox.host_address,
+            }))
         } catch (error) {
             toast(error.message, true)
         }

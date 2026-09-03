@@ -54,7 +54,11 @@ fn yield_to_capture_threads() {
 #[cfg(not(target_os = "linux"))]
 fn yield_to_capture_threads() {}
 
+/// Defaulted as a whole: a settings file written before a field existed is
+/// still worth loading, and dropping every other setting because one key is
+/// missing is far worse than filling that one key in.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub record_dir: PathBuf,
     pub compression: Compression,
@@ -64,6 +68,7 @@ pub struct Settings {
     pub depth_format: ImageFormat,
     pub realsense: CameraConfig,
     pub orbbec: CameraConfig,
+    pub oakd: CameraConfig,
     pub livox: LivoxConfig,
     /// Whether the browser preview is running at all.
     pub preview_enabled: bool,
@@ -86,6 +91,7 @@ impl Default for Settings {
             depth_format: ImageFormat::Png,
             realsense: CameraConfig::for_kind(SensorKind::Realsense),
             orbbec: CameraConfig::for_kind(SensorKind::Orbbec),
+            oakd: CameraConfig::for_kind(SensorKind::OakD),
             livox: LivoxConfig::default(),
             preview_enabled: true,
             preview_topic: None,
@@ -101,7 +107,7 @@ impl Settings {
     /// has to cover for the tree to be complete.
     pub fn sensor_frames(&self) -> Vec<String> {
         let mut frames = Vec::new();
-        for config in [&self.realsense, &self.orbbec] {
+        for config in [&self.realsense, &self.orbbec, &self.oakd] {
             if config.enabled {
                 frames.push(config.naming.root_frame_id());
             }
@@ -123,6 +129,59 @@ impl Settings {
             _ => self.color_format,
         }
     }
+}
+
+/// Every image topic the settings could preview, whether or not the camera is
+/// engaged yet. Cameras that are switched on come first, so both the dropdown
+/// and the automatic choice start at a stream that can actually produce a frame.
+fn image_topics(settings: &Settings) -> Vec<String> {
+    let cameras = [&settings.realsense, &settings.orbbec, &settings.oakd];
+    let mut topics = Vec::new();
+    for listing_enabled in [true, false] {
+        for config in cameras {
+            if config.enabled != listing_enabled {
+                continue;
+            }
+            for stream in config.streams() {
+                if stream.is_image() {
+                    topics.push(config.naming.image_topic(stream));
+                }
+            }
+        }
+    }
+    topics
+}
+
+/// Which engaged sensors have to be cycled for a settings change to reach the
+/// device. A backend that can absorb the change in place is asked to do so here,
+/// because cycling a pipeline costs about a second of frames.
+fn sensors_needing_restart(
+    backends: &mut BTreeMap<SensorKind, Box<dyn Backend>>,
+    previous: &Settings,
+    settings: &Settings,
+) -> Vec<SensorKind> {
+    let cameras = [
+        (SensorKind::Realsense, &previous.realsense, &settings.realsense),
+        (SensorKind::Orbbec, &previous.orbbec, &settings.orbbec),
+        (SensorKind::OakD, &previous.oakd, &settings.oakd),
+    ];
+    let mut restart = Vec::new();
+    for (kind, was, now) in cameras {
+        if was == now {
+            continue;
+        }
+        if let Some(backend) = backends.get_mut(&kind) {
+            if !backend.apply_live(now) {
+                restart.push(kind);
+            }
+        }
+    }
+    // The lidar has no live knobs at all: its config is read once when the
+    // sockets are opened and the work-mode handshake is sent.
+    if previous.livox != settings.livox && backends.contains_key(&SensorKind::Livox) {
+        restart.push(SensorKind::Livox);
+    }
+    restart
 }
 
 /// A rolling count, used for the per-stream Hz readout.
@@ -281,11 +340,27 @@ impl Hub {
         &self.settings_file
     }
 
-    pub fn update_settings(&self, settings: Settings) -> Result<()> {
+    /// Saves the new settings and makes an engaged sensor obey them. Without
+    /// this last part a knob like the IR emitter moves in the browser and
+    /// nothing happens on the device, because a backend keeps the config it was
+    /// started with.
+    pub fn update_settings(self: &Arc<Self>, settings: Settings) -> Result<()> {
+        let previous = self.settings();
         self.preview_wanted
             .store(settings.preview_enabled, Ordering::Relaxed);
-        *self.settings.write().unwrap() = settings;
-        self.save_settings()
+        *self.settings.write().unwrap() = settings.clone();
+        self.save_settings()?;
+
+        let restart = sensors_needing_restart(
+            &mut self.backends.lock().unwrap(),
+            &previous,
+            &settings,
+        );
+        for kind in restart {
+            self.engage(kind)
+                .with_context(|| format!("reopening the {} after a settings change", kind.as_str()))?;
+        }
+        Ok(())
     }
 
     pub fn save_settings(&self) -> Result<()> {
@@ -300,10 +375,16 @@ impl Hub {
     }
 
     pub fn load_settings(path: &std::path::Path) -> Settings {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Settings::default();
+        };
+        match serde_json::from_str(&text) {
+            Ok(settings) => settings,
+            Err(error) => {
+                eprintln!("ignoring {}: {error}", path.display());
+                Settings::default()
+            }
+        }
     }
 
     /// The callback handed to every backend. Runs on the capture thread, so it
@@ -388,9 +469,17 @@ impl Hub {
         if !self.preview_wanted.load(Ordering::Relaxed) {
             return false;
         }
-        match &self.settings.read().unwrap().preview_topic {
-            Some(wanted) => wanted == topic,
-            None => false,
+        self.preview_topic().is_some_and(|wanted| wanted == topic)
+    }
+
+    /// The topic the preview actually shows. Nothing chosen means the first
+    /// image stream, so a box that has never been configured shows a picture
+    /// instead of sitting on "no frames yet" with no hint a choice is needed.
+    pub fn preview_topic(&self) -> Option<String> {
+        let settings = self.settings.read().unwrap();
+        match &settings.preview_topic {
+            Some(chosen) => Some(chosen.clone()),
+            None => image_topics(&settings).into_iter().next(),
         }
     }
 
@@ -460,16 +549,7 @@ impl Hub {
     /// camera is engaged yet. The browser needs this to fill the preview
     /// dropdown, and deriving it here keeps topic naming in one place.
     pub fn preview_topics(&self) -> Vec<String> {
-        let settings = self.settings();
-        let mut topics = Vec::new();
-        for config in [&settings.realsense, &settings.orbbec] {
-            for stream in config.streams() {
-                if stream.is_image() {
-                    topics.push(config.naming.image_topic(stream));
-                }
-            }
-        }
-        topics
+        image_topics(&self.settings())
     }
 
     pub fn health(&self) -> sysmon::Health {
@@ -491,6 +571,9 @@ impl Hub {
             SensorKind::Orbbec => Box::new(crate::sensors::orbbec::OrbbecBackend::new(
                 settings.orbbec.clone(),
             )),
+            SensorKind::OakD => Box::new(crate::sensors::oakd::OakdBackend::new(
+                settings.oakd.clone(),
+            )),
             SensorKind::Livox => Box::new(crate::sensors::livox::LivoxBackend::new(
                 settings.livox.clone(),
             )),
@@ -511,7 +594,12 @@ impl Hub {
 
     pub fn sensor_status(&self) -> BTreeMap<String, crate::sensors::BackendStatus> {
         let backends = self.backends.lock().unwrap();
-        [SensorKind::Realsense, SensorKind::Orbbec, SensorKind::Livox]
+        [
+            SensorKind::Realsense,
+            SensorKind::Orbbec,
+            SensorKind::OakD,
+            SensorKind::Livox,
+        ]
             .into_iter()
             .map(|kind| {
                 let status = backends.get(&kind).map(|backend| backend.status()).unwrap_or(
@@ -598,6 +686,7 @@ impl Hub {
         for (kind, config) in [
             (SensorKind::Realsense, &settings.realsense),
             (SensorKind::Orbbec, &settings.orbbec),
+            (SensorKind::OakD, &settings.oakd),
         ] {
             if config.enabled || backends.contains_key(&kind) {
                 sensors.push((kind, &config.naming, config.streams()));
@@ -696,7 +785,12 @@ impl Hub {
     }
 
     pub fn shutdown(&self) {
-        for kind in [SensorKind::Realsense, SensorKind::Orbbec, SensorKind::Livox] {
+        for kind in [
+            SensorKind::Realsense,
+            SensorKind::Orbbec,
+            SensorKind::OakD,
+            SensorKind::Livox,
+        ] {
             self.disengage(kind);
         }
         let _ = self.stop_recording();
@@ -768,6 +862,162 @@ mod tests {
             step: width * 3,
             data: (0..(width * height * 3)).map(|index| index as u8).collect(),
         }
+    }
+
+    /// Stands in for a camera so the settings-to-device path can be exercised
+    /// with no hardware. `absorbs_changes` is what a real backend answers when
+    /// the knob that moved is one it can set on a live pipeline.
+    struct SpyCamera {
+        absorbs_changes: bool,
+        applied: Arc<Mutex<Vec<CameraConfig>>>,
+    }
+
+    impl Backend for SpyCamera {
+        fn start(&mut self, _sink: Sink) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) {}
+
+        fn status(&self) -> crate::sensors::BackendStatus {
+            crate::sensors::BackendStatus {
+                running: true,
+                detail: "spy".into(),
+                error: None,
+            }
+        }
+
+        fn apply_live(&mut self, config: &CameraConfig) -> bool {
+            self.applied.lock().unwrap().push(config.clone());
+            self.absorbs_changes
+        }
+    }
+
+    fn spy(absorbs_changes: bool) -> (Box<dyn Backend>, Arc<Mutex<Vec<CameraConfig>>>) {
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let camera = SpyCamera {
+            absorbs_changes,
+            applied: Arc::clone(&applied),
+        };
+        (Box::new(camera), applied)
+    }
+
+    #[test]
+    fn a_changed_setting_reaches_a_camera_that_is_already_streaming() {
+        let mut backends: BTreeMap<SensorKind, Box<dyn Backend>> = BTreeMap::new();
+        let (camera, applied) = spy(true);
+        backends.insert(SensorKind::Realsense, camera);
+
+        let previous = Settings::default();
+        let mut settings = previous.clone();
+        settings.realsense.emitter = !previous.realsense.emitter;
+
+        let restart = sensors_needing_restart(&mut backends, &previous, &settings);
+        assert!(restart.is_empty(), "an emitter flip must not cycle the device");
+        assert_eq!(applied.lock().unwrap().len(), 1);
+        assert_eq!(applied.lock().unwrap()[0], settings.realsense);
+    }
+
+    #[test]
+    fn a_setting_the_camera_cannot_absorb_cycles_it_instead() {
+        let mut backends: BTreeMap<SensorKind, Box<dyn Backend>> = BTreeMap::new();
+        backends.insert(SensorKind::Realsense, spy(false).0);
+        backends.insert(SensorKind::OakD, spy(true).0);
+
+        let previous = Settings::default();
+        let mut settings = previous.clone();
+        settings.realsense.width = previous.realsense.width * 2;
+        settings.oakd.emitter = !previous.oakd.emitter;
+
+        assert_eq!(
+            sensors_needing_restart(&mut backends, &previous, &settings),
+            vec![SensorKind::Realsense],
+        );
+    }
+
+    #[test]
+    fn a_sensor_that_is_not_engaged_is_never_restarted_for_a_settings_change() {
+        let mut backends: BTreeMap<SensorKind, Box<dyn Backend>> = BTreeMap::new();
+        let previous = Settings::default();
+        let mut settings = previous.clone();
+        settings.realsense.width = 9999;
+        settings.livox.frame_hz = 20.0;
+        assert!(sensors_needing_restart(&mut backends, &previous, &settings).is_empty());
+    }
+
+    #[test]
+    fn changing_the_lidar_cycles_it_because_it_has_no_live_knobs() {
+        let mut backends: BTreeMap<SensorKind, Box<dyn Backend>> = BTreeMap::new();
+        backends.insert(SensorKind::Livox, spy(true).0);
+        let previous = Settings::default();
+        let mut settings = previous.clone();
+        settings.livox.frame_hz = previous.livox.frame_hz + 5.0;
+        assert_eq!(
+            sensors_needing_restart(&mut backends, &previous, &settings),
+            vec![SensorKind::Livox],
+        );
+    }
+
+    #[test]
+    fn a_settings_write_that_touches_no_sensor_leaves_every_backend_alone() {
+        let mut backends: BTreeMap<SensorKind, Box<dyn Backend>> = BTreeMap::new();
+        let (camera, applied) = spy(false);
+        backends.insert(SensorKind::Realsense, camera);
+        let previous = Settings::default();
+        let mut settings = previous.clone();
+        settings.compression = Compression::Zstd;
+        settings.preview_quality = 90;
+        assert!(sensors_needing_restart(&mut backends, &previous, &settings).is_empty());
+        assert!(applied.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn with_no_preview_chosen_the_first_stream_of_an_enabled_camera_is_previewed() {
+        let hub = scratch_hub();
+        let mut settings = hub.settings();
+        settings.preview_topic = None;
+        settings.realsense.enabled = false;
+        settings.oakd.enabled = true;
+        settings.oakd.color = true;
+        hub.update_settings(settings.clone()).unwrap();
+
+        let chosen = hub.preview_topic().expect("something has to be previewed");
+        assert!(
+            chosen.starts_with(&settings.oakd.naming.topic_prefix),
+            "picked {chosen}, which is not on the camera that is switched on",
+        );
+        // The dropdown still offers every stream, so the operator can pick one
+        // on a camera they are about to switch on.
+        assert!(hub.preview_topics().len() > 1);
+        std::fs::remove_file(hub.settings_file()).ok();
+    }
+
+    #[test]
+    fn an_explicit_preview_choice_is_never_overridden_by_the_automatic_one() {
+        let hub = scratch_hub();
+        let mut settings = hub.settings();
+        settings.preview_topic = Some("/whatever/image_raw".into());
+        hub.update_settings(settings).unwrap();
+        assert_eq!(hub.preview_topic().as_deref(), Some("/whatever/image_raw"));
+        std::fs::remove_file(hub.settings_file()).ok();
+    }
+
+    #[test]
+    fn a_settings_file_missing_a_whole_camera_block_keeps_its_other_settings() {
+        let mut written = serde_json::to_value(Settings::default()).unwrap();
+        written["record_dir"] = serde_json::json!("/somewhere/else");
+        written.as_object_mut().unwrap().remove("oakd");
+
+        let file = std::env::temp_dir().join(format!(
+            "lite_record_partial_{}.json",
+            record::now_nanos()
+        ));
+        std::fs::write(&file, written.to_string()).unwrap();
+        let loaded = Hub::load_settings(&file);
+        std::fs::remove_file(&file).ok();
+
+        assert_eq!(loaded.record_dir, PathBuf::from("/somewhere/else"));
+        assert_eq!(loaded.oakd, CameraConfig::for_kind(SensorKind::OakD));
     }
 
     #[test]
@@ -950,7 +1200,8 @@ mod tests {
             }
         }
         assert!(wait_for(|| hub.record_encode_count() == samples));
-        let path = hub.stop_recording().unwrap().path.unwrap();
+        let status = hub.stop_recording().unwrap();
+        let path = status.path.clone().unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
         let stamps: Vec<u64> = mcap::MessageStream::new(&bytes)
@@ -965,10 +1216,110 @@ mod tests {
                 seconds * 1_000_000_000 + nanos
             })
             .collect();
-        assert_eq!(stamps.len(), samples as usize);
+        // The loop above only backpressures the encode pool. Past it the writer
+        // queue sheds by design, and on a loaded machine it does, so a bare
+        // count would be asserting the machine was idle. Every sample must be
+        // written or counted, and the ones written must be in order.
+        let tally = &status.topics["/cam/imu"];
+        assert_eq!(stamps.len() as u64, tally.written);
+        assert_eq!(tally.written + tally.dropped, samples);
         let mut sorted = stamps.clone();
         sorted.sort_unstable();
         assert_eq!(stamps, sorted, "the pool reordered a stream");
+
+        std::fs::remove_dir_all(&directory).ok();
+        std::fs::remove_file(hub.settings_file()).ok();
+    }
+
+    /// The ordering guarantee above only holds for a topic the hash pins to one
+    /// worker. Both newer backends were added after that hash existed, so this
+    /// names their real topics rather than trusting that they inherited it.
+    #[test]
+    fn the_oakd_and_livox_topics_each_belong_to_exactly_one_encode_worker() {
+        let oakd = Naming::for_kind(SensorKind::OakD);
+        let livox = Naming::for_kind(SensorKind::Livox);
+        let topics = [
+            oakd.imu_topic(),
+            oakd.image_topic(StreamId::Color),
+            oakd.image_topic(StreamId::Depth),
+            oakd.image_topic(StreamId::InfraLeft),
+            oakd.image_topic(StreamId::InfraRight),
+            livox.imu_topic(),
+            livox.points_topic(),
+        ];
+        for workers in 1..=16 {
+            for topic in &topics {
+                let owner = worker_for(topic, workers);
+                assert!(owner < workers, "{topic} hashed outside the pool");
+                assert_eq!(
+                    owner,
+                    worker_for(topic, workers),
+                    "{topic} did not land on a stable worker"
+                );
+            }
+        }
+    }
+
+    /// Criterion 12: the OAK-D and Livox backends hand everything to `Hub::sink`,
+    /// so their samples take the same hashed queue every other sensor does. Run
+    /// together because interleaving is what would expose a stream being split.
+    #[test]
+    fn oakd_and_livox_streams_both_reach_the_file_in_the_order_produced() {
+        let hub = scratch_hub();
+        let directory =
+            std::env::temp_dir().join(format!("lite_record_pool_{}", record::now_nanos()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut settings = hub.settings();
+        settings.record_dir = directory.clone();
+        hub.update_settings(settings).unwrap();
+
+        let oakd_imu = Naming::for_kind(SensorKind::OakD).imu_topic();
+        let livox_imu = Naming::for_kind(SensorKind::Livox).imu_topic();
+        let sink = hub.sink();
+        hub.start_recording(Some("pool")).unwrap();
+        let per_topic = 2000;
+        for index in 1..=per_topic {
+            for topic in [&oakd_imu, &livox_imu] {
+                while !sink(Produced::Imu {
+                    topic: topic.clone(),
+                    imu: Box::new(crate::msgs::Imu::unoriented(
+                        crate::msgs::Header::new(index * 5_000_000, "rig"),
+                        [0.0; 3],
+                        [0.0, 0.0, 9.81],
+                    )),
+                }) {
+                    std::thread::yield_now();
+                }
+            }
+        }
+        assert!(wait_for(|| hub.record_encode_count() == per_topic * 2));
+        let status = hub.stop_recording().unwrap();
+        let path = status.path.clone().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        for topic in [&oakd_imu, &livox_imu] {
+            let stamps: Vec<u64> = mcap::MessageStream::new(&bytes)
+                .unwrap()
+                .map(|message| message.unwrap())
+                .filter(|message| &message.channel.topic == topic)
+                .map(|message| {
+                    let (seconds, nanos) = (
+                        i32::from_le_bytes(message.data[4..8].try_into().unwrap()) as u64,
+                        u32::from_le_bytes(message.data[8..12].try_into().unwrap()) as u64,
+                    );
+                    seconds * 1_000_000_000 + nanos
+                })
+                .collect();
+            // The writer queue sheds by design past the encode pool, so this
+            // asserts every sample was written or counted rather than that the
+            // machine happened to be idle enough to keep up.
+            let tally = &status.topics[topic];
+            assert_eq!(stamps.len() as u64, tally.written, "{topic} lost samples");
+            assert_eq!(tally.written + tally.dropped, per_topic, "{topic}");
+            let mut sorted = stamps.clone();
+            sorted.sort_unstable();
+            assert_eq!(stamps, sorted, "the pool reordered {topic}");
+        }
 
         std::fs::remove_dir_all(&directory).ok();
         std::fs::remove_file(hub.settings_file()).ok();
@@ -1190,11 +1541,15 @@ mod tests {
     fn a_backend_with_no_sdk_reports_its_absence_rather_than_appearing_idle() {
         let hub = scratch_hub();
         let status = hub.sensor_status();
-        assert_eq!(status.len(), 3);
+        assert_eq!(status.len(), 4);
         assert!(!status["livox"].running);
         if !cfg!(feature = "realsense") {
             assert_eq!(status["realsense"].detail, "not compiled in");
             assert!(hub.engage(SensorKind::Realsense).is_err());
+        }
+        if !cfg!(feature = "oakd") {
+            assert_eq!(status["oakd"].detail, "not compiled in");
+            assert!(hub.engage(SensorKind::OakD).is_err());
         }
         std::fs::remove_file(hub.settings_file()).ok();
     }

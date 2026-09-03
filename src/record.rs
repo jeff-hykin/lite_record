@@ -464,18 +464,24 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
-    /// A wedged disk must cost frames, not stall the sensor thread. The writer
-    /// is blocked here by holding the queue full, and `offer` still returns.
+    /// A wedged disk must cost frames, not stall the sensor thread: `offer`
+    /// still returns, and every shed message is still accounted for.
     #[test]
     fn a_full_queue_sheds_frames_and_accounts_for_every_one() {
         let directory = scratch("shedding");
         let path = directory.join("out.mcap");
-        let recorder = Recorder::start(&path, Compression::None).unwrap();
+        let mut recorder = Recorder::start(&path, Compression::None).unwrap();
+
+        // Simply flooding cannot fill the queue: the writer drains small
+        // messages faster than one thread produces them, so on a quick machine
+        // the flood ends with nothing ever shed and the test proves nothing.
+        // Swapping in a queue nobody is reading is what a wedged disk looks
+        // like from `offer`, and it fills at a known depth.
+        let (stalled_sender, stalled_receiver) = sync_channel(QUEUE_DEPTH);
+        let writer_sender = recorder.sender.replace(stalled_sender).unwrap();
 
         let mut accepted = 0u64;
         let mut refused = 0u64;
-        // Far more than the queue can hold before the writer has had any
-        // chance to drain it.
         for index in 0..(QUEUE_DEPTH as u64 * 8) {
             if recorder.offer("/flood", an_imu(index)) {
                 accepted += 1;
@@ -483,7 +489,15 @@ mod tests {
                 refused += 1;
             }
         }
-        assert!(refused > 0, "the queue never filled, test proves nothing");
+        assert_eq!(accepted, QUEUE_DEPTH as u64);
+        assert_eq!(refused, QUEUE_DEPTH as u64 * 7);
+
+        // Unwedged: hand the backlog to the real writer so the accounting can be
+        // checked against the file it produces.
+        recorder.sender = Some(writer_sender);
+        for sample in stalled_receiver.try_iter() {
+            recorder.sender.as_ref().unwrap().send(sample).unwrap();
+        }
 
         let status = recorder.finish().unwrap();
         assert_eq!(status.dropped, refused);

@@ -30,7 +30,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 fi
 
 build linux-x86 lite_record-x86_64-linux-musl
-build linux-arm64 lite_record-aarch64-linux-musl
+build linux-arm64 lite_record-aarch64-linux-gnu
 
 echo ""
 ls -lh "$DIST"

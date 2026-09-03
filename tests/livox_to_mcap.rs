@@ -67,6 +67,10 @@ fn recorded_settings(directory: &std::path::Path) -> Settings {
     };
     settings.livox.enabled = true;
     settings.livox.imu = true;
+    // The replay comes from loopback. Naming it as the lidar keeps a real
+    // Mid-360 on the same network — which is unicasting to these very ports —
+    // from adding its packets to the count this test asserts on.
+    settings.livox.lidar_address = Some(Ipv4Addr::LOCALHOST.to_string());
     settings.realsense.enabled = false;
     settings.orbbec.enabled = false;
     settings.preview_enabled = false;

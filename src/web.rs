@@ -134,6 +134,9 @@ fn status_payload(state: &AppState) -> serde_json::Value {
         "recording": state.hub.recording_status(),
         "streams": state.hub.stream_stats(),
         "preview_topics": state.hub.preview_topics(),
+        // Not the same as settings.preview_topic: with nothing chosen the hub
+        // picks one, and the dropdown has to show what is really being encoded.
+        "preview_topic": state.hub.preview_topic(),
         "urdf": urdf_payload(&urdf),
         "removable_mounts": privileged::likely_removable_mounts(),
         "is_root": privileged::is_root(),
@@ -145,12 +148,19 @@ async fn status(State(state): State<AppState>) -> Response {
     axum::Json(status_payload(&state)).into_response()
 }
 
+/// A change to resolution or frame rate reopens the camera, and opening a USB3
+/// pipeline takes seconds of blocking work, so this cannot run on a runtime
+/// worker or the monitor socket stops ticking exactly when the operator is
+/// watching to see whether the change took.
 async fn put_settings(
     State(state): State<AppState>,
     axum::Json(settings): axum::Json<Settings>,
 ) -> Response {
-    match state.hub.update_settings(settings) {
-        Ok(()) => axum::Json(status_payload(&state)).into_response(),
+    let hub = Arc::clone(&state.hub);
+    let applied = tokio::task::spawn_blocking(move || hub.update_settings(settings)).await;
+    match applied {
+        Ok(Ok(())) => axum::Json(status_payload(&state)).into_response(),
+        Ok(Err(error)) => bad_request(format!("{error:#}")),
         Err(error) => bad_request(error),
     }
 }
@@ -217,19 +227,29 @@ async fn sensor_action(
     let kind = match kind.as_str() {
         "realsense" => SensorKind::Realsense,
         "orbbec" => SensorKind::Orbbec,
+        "oakd" => SensorKind::OakD,
         "livox" => SensorKind::Livox,
         other => return bad_request(format!("{other:?} is not a sensor")),
     };
-    match action.as_str() {
-        "engage" => {
-            if let Err(error) = state.hub.engage(kind) {
-                return bad_request(format!("{error:#}"));
-            }
+    // Opening or releasing a device blocks for as long as the driver takes, so
+    // it is kept off the runtime workers that serve the monitor socket.
+    let hub = Arc::clone(&state.hub);
+    let outcome = tokio::task::spawn_blocking(move || match action.as_str() {
+        // `engage` already cycles the device, so restart is the same call under
+        // the name an operator reaches for when a camera has wedged.
+        "engage" | "restart" => hub.engage(kind).map_err(|error| format!("{error:#}")),
+        "disengage" => {
+            hub.disengage(kind);
+            Ok(())
         }
-        "disengage" => state.hub.disengage(kind),
-        other => return bad_request(format!("{other:?} is not engage or disengage")),
+        other => Err(format!("{other:?} is not engage, restart or disengage")),
+    })
+    .await;
+    match outcome {
+        Ok(Ok(())) => axum::Json(state.hub.sensor_status()).into_response(),
+        Ok(Err(error)) => bad_request(error),
+        Err(error) => bad_request(error),
     }
-    axum::Json(state.hub.sensor_status()).into_response()
 }
 
 async fn get_urdf(State(state): State<AppState>) -> Response {

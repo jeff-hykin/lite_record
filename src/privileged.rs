@@ -262,6 +262,12 @@ pub const LIDAR_MULTICAST_GROUP: &str = "224.1.1.5";
 ///   with "address already in use", or worse, two processes cross-feed each
 ///   other garbage. The check is listed so the operator sees the collision
 ///   rather than a mystery timeout.
+///
+/// Where NetworkManager is in charge the whole thing is written as a saved
+/// profile instead. `ip addr add` is forgotten on the next reboot and on every
+/// unplug, which would mean asking the operator for a root password again each
+/// time the lidar is moved; a profile is applied by NetworkManager itself, so
+/// after one setup the link comes back on its own with nothing to press.
 pub fn mid360_network_plan(interface: &str, host_address: &str) -> Result<Vec<Planned>> {
     validate_interface(interface)?;
     let host_cidr = format!("{host_address}/24");
@@ -273,14 +279,21 @@ pub fn mid360_network_plan(interface: &str, host_address: &str) -> Result<Vec<Pl
     validate_ipv4(host_address)?;
     let multicast_route = format!("{LIDAR_MULTICAST_GROUP}/32");
 
-    Ok(vec![
+    if network_manager_runs_here() {
+        return Ok(network_manager_plan(interface, &host_cidr, &multicast_route));
+    }
+    Ok(ip_command_plan(interface, &host_cidr, &multicast_route))
+}
+
+fn ip_command_plan(interface: &str, host_cidr: &str, multicast_route: &str) -> Vec<Planned> {
+    vec![
         Planned::root(
             "bring the interface up; a link added but left down looks identical to a dead lidar",
             &["ip", "link", "set", interface, "up"],
         ),
         Planned::root(
             "the mid360 is not a dhcp server, so the host needs a static address on its /24 or no packet is ever delivered",
-            &["ip", "addr", "add", &host_cidr, "dev", interface],
+            &["ip", "addr", "add", host_cidr, "dev", interface],
         )
         .optional(),
         Planned::root(
@@ -289,7 +302,7 @@ pub fn mid360_network_plan(interface: &str, host_address: &str) -> Result<Vec<Pl
         ),
         Planned::root(
             "without an explicit route the kernel picks a different nic for 224.1.1.5 and the point stream never arrives",
-            &["ip", "route", "add", &multicast_route, "dev", interface],
+            &["ip", "route", "add", multicast_route, "dev", interface],
         )
         .optional(),
         Planned::root(
@@ -302,7 +315,57 @@ pub fn mid360_network_plan(interface: &str, host_address: &str) -> Result<Vec<Pl
             &["ss", "-ulnp"],
         )
         .optional(),
-    ])
+    ]
+}
+
+/// The saved profile is named so that re-running replaces it rather than piling
+/// up a second profile that fights the first for the interface.
+const MID360_PROFILE: &str = "mid360";
+
+fn network_manager_runs_here() -> bool {
+    std::process::Command::new("nmcli")
+        .args(["-t", "-f", "RUNNING", "general"])
+        .output()
+        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "running")
+}
+
+fn network_manager_plan(interface: &str, host_cidr: &str, multicast_route: &str) -> Vec<Planned> {
+    // A link-local next hop of 0.0.0.0 is how nmcli spells "out of this
+    // interface", matching the `ip route add ... dev` form used without it.
+    let routes = format!("{multicast_route} 0.0.0.0, 255.255.255.255/32 0.0.0.0");
+    vec![
+        Planned::root(
+            "an older profile for the same name would keep its old address and fight this one for the interface",
+            &["nmcli", "connection", "delete", MID360_PROFILE],
+        )
+        .optional(),
+        Planned::root(
+            "a saved profile is what makes the address come back by itself after a reboot or a replug, with no password to type",
+            &[
+                "nmcli", "connection", "add",
+                "type", "ethernet",
+                "ifname", interface,
+                "con-name", MID360_PROFILE,
+                "ipv4.method", "manual",
+                "ipv4.addresses", host_cidr,
+                "ipv4.routes", &routes,
+                // The lidar link is a dead end. Without this it would win the
+                // default route from wifi and cut the box off the network.
+                "ipv4.never-default", "yes",
+                "ipv6.method", "disabled",
+                "connection.autoconnect", "yes",
+            ],
+        ),
+        Planned::root(
+            "bringing it up now means the lidar works in this session rather than only after the next boot",
+            &["nmcli", "connection", "up", MID360_PROFILE],
+        ),
+        Planned::user(
+            "a leftover process still holding the 561xx ports makes the next start fail with address-already-in-use, or cross-feeds two readers garbage",
+            &["ss", "-ulnp"],
+        )
+        .optional(),
+    ]
 }
 
 fn validate_interface(interface: &str) -> Result<()> {
@@ -467,9 +530,12 @@ mod tests {
         );
     }
 
+    // The two plan builders are tested directly rather than through
+    // `mid360_network_plan`, whose answer depends on whether the machine running
+    // the tests happens to have NetworkManager.
     #[test]
     fn the_mid360_plan_covers_address_multicast_and_routing() {
-        let plan = mid360_network_plan("eth1", "192.168.1.50").unwrap();
+        let plan = ip_command_plan("eth1", "192.168.1.50/24", "224.1.1.5/32");
         let commands: Vec<String> = plan.iter().map(Planned::display).collect();
         assert!(commands.contains(&"sudo ip addr add 192.168.1.50/24 dev eth1".to_string()));
         assert!(commands.contains(&"sudo ip link set eth1 multicast on".to_string()));
@@ -481,8 +547,50 @@ mod tests {
     }
 
     #[test]
+    fn the_network_manager_plan_saves_a_profile_that_outlives_a_replug() {
+        let plan = network_manager_plan("eth1", "192.168.1.50/24", "224.1.1.5/32");
+        let add = plan
+            .iter()
+            .find(|planned| planned.argv.get(2).is_some_and(|word| word == "add"))
+            .expect("the profile is created");
+        // Anything less than autoconnect means the operator has to press a
+        // button, with a root password, every time the lidar is plugged back in.
+        for (key, value) in [
+            ("connection.autoconnect", "yes"),
+            ("ipv4.method", "manual"),
+            ("ipv4.addresses", "192.168.1.50/24"),
+            // The lidar link is a dead end; letting it win the default route
+            // would take the box off the network it is reached over.
+            ("ipv4.never-default", "yes"),
+        ] {
+            let at = add
+                .argv
+                .iter()
+                .position(|word| word == key)
+                .unwrap_or_else(|| panic!("{key} is set, in {:?}", add.argv));
+            assert_eq!(add.argv[at + 1], value, "{key}");
+        }
+        let routes = &add.argv[add.argv.iter().position(|w| w == "ipv4.routes").unwrap() + 1];
+        assert!(routes.contains("224.1.1.5/32"), "{routes}");
+        assert!(routes.contains("255.255.255.255/32"), "{routes}");
+        assert!(plan
+            .iter()
+            .any(|planned| planned.argv.contains(&"up".to_string())));
+    }
+
+    #[test]
+    fn a_stale_profile_is_removed_before_a_new_one_replaces_it() {
+        let plan = network_manager_plan("eth1", "192.168.1.50/24", "224.1.1.5/32");
+        let delete = plan.iter().position(|planned| planned.argv[2] == "delete");
+        let add = plan.iter().position(|planned| planned.argv[2] == "add");
+        assert!(delete < add, "a leftover profile would fight the new one");
+        // Nothing to delete on a first run, which must not stop the setup.
+        assert!(plan[delete.unwrap()].optional);
+    }
+
+    #[test]
     fn the_steps_that_fail_when_already_applied_are_marked_optional() {
-        let plan = mid360_network_plan("eth1", "192.168.1.50").unwrap();
+        let plan = ip_command_plan("eth1", "192.168.1.50/24", "224.1.1.5/32");
         for planned in &plan {
             let repeated = planned.argv.contains(&"add".to_string());
             if repeated {

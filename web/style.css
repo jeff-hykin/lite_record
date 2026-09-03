@@ -309,6 +309,11 @@ button.record.recording {
     border-radius: 8px;
 }
 
+.sensor-actions {
+    display: flex;
+    gap: 0.4rem;
+}
+
 .sensor .detail {
     color: var(--faint);
     font-size: 0.8rem;

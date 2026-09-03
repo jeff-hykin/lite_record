@@ -21,8 +21,9 @@ default = []
 realsense = ["dep:realsense-sys"]
 livox = []
 orbbec = []
+oakd = ["dep:cc"]
 h264 = ["dep:openh264"]
-all-sensors = ["realsense", "livox", "orbbec"]
+all-sensors = ["realsense", "livox", "orbbec", "oakd"]
 
 [dependencies]
 anyhow = "1"
@@ -59,6 +60,11 @@ openh264 = { version = "0.9.8", features = ["source"], optional = true }
 # using them means a cross build needs only the .so and a pkg-config file rather
 # than a clang that can parse the SDK's headers for the target.
 realsense-sys = { version = "2.56", optional = true }
+
+[build-dependencies]
+# Compiles the depthai shim. Optional so a build without the `oakd` feature does
+# not pull a C++ toolchain in.
+cc = { version = "1", optional = true }
 
 [profile.release]
 opt-level = 3
