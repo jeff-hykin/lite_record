@@ -27,6 +27,7 @@ use crate::sysmon;
 use crate::urdf::{self, TreeProblem};
 
 /// Bounded so a stalled encoder sheds frames instead of eating the Pi's memory.
+/// One queue per worker, so this is the depth of each.
 const ENCODE_QUEUE_DEPTH: usize = 128;
 
 /// Rates are averaged over this window rather than instantaneously, so the
@@ -183,7 +184,12 @@ pub struct Hub {
     /// reader can project. They are replayed into each new file the same way
     /// `/tf_static` is.
     latest_intrinsics: Mutex<BTreeMap<String, CameraInfo>>,
-    encode_sender: Sender<Produced>,
+    /// One queue per encode worker rather than one queue shared by all of them.
+    /// A topic always goes to the same worker, so two messages from one stream
+    /// cannot be encoded concurrently and reach the recorder in the wrong order.
+    /// Sharing a queue let a 200 Hz IMU overtake itself roughly once every nine
+    /// thousand samples, which put a backwards header stamp in the file.
+    encode_senders: Vec<Sender<Produced>>,
     /// Latest preview frame, as jpeg bytes ready to push down the websocket.
     preview: Mutex<Option<PreviewFrame>>,
     /// Counts preview encodes so switching the preview off can be shown to
@@ -198,6 +204,24 @@ pub struct Hub {
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
+/// One worker per core beyond the first, so the capture threads and the writer
+/// still get a core to themselves on a four-core Pi.
+fn encode_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get().saturating_sub(1).max(1))
+        .unwrap_or(1)
+}
+
+/// Which encode worker owns a topic. Any stable mapping will do; what matters is
+/// that a topic always lands on the same one.
+fn worker_for(topic: &str, workers: usize) -> usize {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in topic.as_bytes() {
+        hash = (hash ^ *byte as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash % workers as u64) as usize
+}
+
 #[derive(Clone)]
 pub struct PreviewFrame {
     pub topic: String,
@@ -208,7 +232,8 @@ pub struct PreviewFrame {
 
 impl Hub {
     pub fn new(settings: Settings, settings_file: PathBuf) -> Arc<Self> {
-        let (encode_sender, encode_receiver) = bounded(ENCODE_QUEUE_DEPTH);
+        let (encode_senders, encode_receivers): (Vec<_>, Vec<_>) =
+            (0..encode_worker_count()).map(|_| bounded(ENCODE_QUEUE_DEPTH)).unzip();
         let hub = Arc::new(Hub {
             preview_wanted: AtomicBool::new(settings.preview_enabled),
             settings: RwLock::new(settings),
@@ -220,27 +245,21 @@ impl Hub {
             rates: Mutex::new(BTreeMap::new()),
             pipeline_dropped: Mutex::new(BTreeMap::new()),
             latest_intrinsics: Mutex::new(BTreeMap::new()),
-            encode_sender,
+            encode_senders,
             preview: Mutex::new(None),
             preview_encodes: AtomicU64::new(0),
             record_encodes: AtomicU64::new(0),
             health: Mutex::new(sysmon::Sampler::default()),
             workers: Mutex::new(Vec::new()),
         });
-        hub.spawn_encoders(encode_receiver);
+        hub.spawn_encoders(encode_receivers);
         hub
     }
 
-    /// One worker per core beyond the first, so the capture threads and the
-    /// writer still get a core to themselves on a four-core Pi.
-    fn spawn_encoders(self: &Arc<Self>, receiver: Receiver<Produced>) {
-        let workers = std::thread::available_parallelism()
-            .map(|count| count.get().saturating_sub(1).max(1))
-            .unwrap_or(1);
+    fn spawn_encoders(self: &Arc<Self>, receivers: Vec<Receiver<Produced>>) {
         let mut handles = self.workers.lock().unwrap();
-        for index in 0..workers {
+        for (index, receiver) in receivers.into_iter().enumerate() {
             let hub = Arc::clone(self);
-            let receiver = receiver.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("encode-{index}"))
                 .spawn(move || {
@@ -310,7 +329,9 @@ impl Hub {
             {
                 return true;
             }
-            match hub.encode_sender.try_send(produced) {
+            match hub.encode_senders[worker_for(produced.topic(), hub.encode_senders.len())]
+                .try_send(produced)
+            {
                 Ok(()) => true,
                 Err(TrySendError::Full(produced)) => {
                     *hub.pipeline_dropped
@@ -893,6 +914,63 @@ mod tests {
         let stats = hub.stream_stats();
         let imu = stats.iter().find(|s| s.topic == "/livox/imu").unwrap();
         assert_eq!(imu.total, 40);
+        std::fs::remove_file(hub.settings_file()).ok();
+    }
+
+    /// The encode pool has several workers, and a stream that could be split
+    /// across them arrives in the file in whatever order they happened to
+    /// finish. At 200 Hz that showed up on the Pi as a header stamp landing
+    /// behind the one before it, about once every nine thousand samples.
+    #[test]
+    fn a_stream_reaches_the_file_in_the_order_it_was_produced() {
+        let hub = scratch_hub();
+        let directory = std::env::temp_dir()
+            .join(format!("lite_record_order_{}", record::now_nanos()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut settings = hub.settings();
+        settings.record_dir = directory.clone();
+        hub.update_settings(settings).unwrap();
+
+        let sink = hub.sink();
+        hub.start_recording(Some("order")).unwrap();
+        let samples = 4000;
+        for index in 1..=samples {
+            // Re-offered rather than shed, so the file has to hold every one of
+            // them and a gap would be this test failing rather than the queue
+            // being short.
+            while !sink(Produced::Imu {
+                topic: "/cam/imu".into(),
+                imu: Box::new(crate::msgs::Imu::unoriented(
+                    crate::msgs::Header::new(index * 5_000_000, "cam"),
+                    [0.0; 3],
+                    [0.0, 0.0, 9.81],
+                )),
+            }) {
+                std::thread::yield_now();
+            }
+        }
+        assert!(wait_for(|| hub.record_encode_count() == samples));
+        let path = hub.stop_recording().unwrap().path.unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let stamps: Vec<u64> = mcap::MessageStream::new(&bytes)
+            .unwrap()
+            .map(|message| message.unwrap())
+            .filter(|message| message.channel.topic == "/cam/imu")
+            .map(|message| {
+                let (seconds, nanos) = (
+                    i32::from_le_bytes(message.data[4..8].try_into().unwrap()) as u64,
+                    u32::from_le_bytes(message.data[8..12].try_into().unwrap()) as u64,
+                );
+                seconds * 1_000_000_000 + nanos
+            })
+            .collect();
+        assert_eq!(stamps.len(), samples as usize);
+        let mut sorted = stamps.clone();
+        sorted.sort_unstable();
+        assert_eq!(stamps, sorted, "the pool reordered a stream");
+
+        std::fs::remove_dir_all(&directory).ok();
         std::fs::remove_file(hub.settings_file()).ok();
     }
 

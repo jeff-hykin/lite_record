@@ -30,6 +30,7 @@ use sys::{
     rs2_format_RS2_FORMAT_Y8 as RS2_FORMAT_Y8,
     rs2_format_RS2_FORMAT_Z16 as RS2_FORMAT_Z16,
     rs2_option_RS2_OPTION_EMITTER_ENABLED as RS2_OPTION_EMITTER_ENABLED,
+    rs2_option_RS2_OPTION_ERROR_POLLING_ENABLED as RS2_OPTION_ERROR_POLLING_ENABLED,
     rs2_option_RS2_OPTION_GLOBAL_TIME_ENABLED as RS2_OPTION_GLOBAL_TIME_ENABLED,
 };
 
@@ -251,6 +252,42 @@ unsafe fn depth_sensor_of(device: *mut sys::rs2_device) -> Result<Owned<sys::rs2
     anyhow::bail!("this device has no sensor carrying the emitter option")
 }
 
+/// Turns off the two device options this program is better off without.
+///
+/// `GLOBAL_TIME_ENABLED` is librealsense's device-to-host clock fit, and it goes
+/// wrong once the camera bus is busy (IntelRealSense/librealsense#9131): it
+/// stamped a 200 Hz gyro as if it ran at 191 Hz, a rate error that compounds to
+/// over a second across a half-minute recording. Off, every stream arrives on the
+/// raw hardware clock and `HostClock` puts it on wall time instead.
+///
+/// `ERROR_POLLING_ENABLED` reads a status control ten times a second that nothing
+/// here looks at. On a bus already carrying four video streams that is worth
+/// removing on its own.
+///
+/// Note that turning global time off does *not* stop the `time_diff_keeper`
+/// thread behind it -- `uvc_sensor::start` calls `enable_time_diff_keeper(true)`
+/// without consulting the option, so the keeper polls regardless. That thread is
+/// why every librealsense handle for this camera has to come from one device
+/// instance; see `open`.
+unsafe fn quiet_device(device: *mut sys::rs2_device) -> Result<()> {
+    let sensors = Owned::new(
+        rs!("listing sensors", rs2_query_sensors(device)),
+        sys::rs2_delete_sensor_list,
+    )?;
+    let count = rs!("counting sensors", rs2_get_sensors_count(sensors.pointer()));
+    for index in 0..count {
+        let sensor = Owned::new(
+            rs!("opening a sensor", rs2_create_sensor(sensors.pointer(), index)),
+            sys::rs2_delete_sensor,
+        )?;
+        let options = sensor.pointer() as *const sys::rs2_options;
+        for option in [RS2_OPTION_ERROR_POLLING_ENABLED, RS2_OPTION_GLOBAL_TIME_ENABLED] {
+            rs_ignoring_errors!(rs2_set_option(options, option, 0.0));
+        }
+    }
+    Ok(())
+}
+
 /// The motion module, opened directly rather than through the pipeline.
 ///
 /// The pipeline's frame syncer emits one frameset per *video* frame and folds
@@ -262,10 +299,8 @@ struct MotionStream {
     queue: Owned<sys::rs2_frame_queue>,
     gyro_hz: i32,
     /// Read here rather than in `body_extrinsics`, because librealsense's
-    /// extrinsics graph is per device *instance*: the pipeline opens its own
-    /// copy of the device, and asking it about a profile from this copy answers
-    /// "requested extrinsics are not available". The two instances read the same
-    /// factory calibration, so taking the edge on this side is not a shortcut.
+    /// extrinsics graph is per device instance and this is where both the depth
+    /// and the gyro profile are in hand.
     depth_to_imu: Option<BodyExtrinsic>,
 }
 
@@ -354,17 +389,6 @@ unsafe fn open_motion(
     let depth_to_imu = (!depth_profile.is_null())
         .then(|| extrinsic_between(depth_profile, gyro_profile, StreamId::Imu))
         .flatten();
-
-    // librealsense's own device-to-host clock fit goes wrong once the camera bus
-    // is busy (IntelRealSense/librealsense#9131): it stamped this 200 Hz gyro as
-    // if it ran at 191 Hz, a rate error that compounds to over a second across a
-    // half-minute recording. The raw hardware clock keeps near-perfect spacing,
-    // so it is taken instead and shifted onto the host epoch by `HostClock`.
-    rs_ignoring_errors!(rs2_set_option(
-        sensor.pointer() as *const sys::rs2_options,
-        RS2_OPTION_GLOBAL_TIME_ENABLED,
-        0.0,
-    ));
 
     let mut chosen = [gyro_profile, accel_profile];
     rs!(
@@ -545,6 +569,7 @@ type StartedPipeline = (
     Owned<sys::rs2_config>,
     Owned<sys::rs2_pipeline>,
     Owned<sys::rs2_pipeline_profile>,
+    Owned<sys::rs2_device>,
 );
 
 impl RealsenseBackend {
@@ -598,7 +623,18 @@ impl RealsenseBackend {
             ),
             sys::rs2_delete_pipeline_profile,
         )?;
-        Ok((config, pipeline, profile))
+        // The pipeline holds its own copy of the device. Everything else that
+        // touches this camera has to go through *this* copy, because librealsense
+        // gives each copy its own power refcount and its own background pollers.
+        let device = Owned::new(
+            rs!(
+                "reading the pipeline's device",
+                rs2_pipeline_profile_get_device(profile.pointer())
+            ),
+            sys::rs2_delete_device,
+        )?;
+        quiet_device(device.pointer())?;
+        Ok((config, pipeline, profile, device))
     }
 
     /// # Safety
@@ -617,14 +653,26 @@ impl RealsenseBackend {
             find_device(context.pointer(), self.config.serial.as_deref())
                 .context("selecting a RealSense")?;
 
+        drop(device);
+        let (config, pipeline, profile, device) =
+            self.start_pipeline(context.pointer(), &serial)?;
+
         let depth_sensor = depth_sensor_of(device.pointer())?;
         set_emitter(depth_sensor.pointer(), self.config.emitter)?;
 
-        // Before the pipeline, not after: librealsense will not hand out the
-        // motion module once the video pipeline holds the device. Losing every
-        // image stream because the host cannot reach the IMU would be a worse
-        // outcome than recording without one, so a failure here is reported
-        // rather than fatal.
+        // From the pipeline's copy of the device, not a second one. Two copies
+        // means two `time_diff_keeper` threads, and each one's ten-times-a-second
+        // hardware-monitor read has to power the USB interface up through
+        // `usb_device_libusb::open`. Whichever loses the `claim_interface` race
+        // throws out of the handle constructor without closing the descriptor
+        // `libusb_open` just took -- eight leaked `/dev/bus/usb` fds a second,
+        // and a process that can no longer `accept()` two minutes later. Sharing
+        // one copy means sharing one power refcount, so the poll is a refcount
+        // bump on an interface the video streams already hold open.
+        //
+        // Losing every image stream because the host cannot reach the IMU would
+        // be a worse outcome than recording without one, so a failure here is
+        // reported rather than fatal.
         let mut motion = match self
             .config
             .imu
@@ -637,8 +685,6 @@ impl RealsenseBackend {
             }
             None => None,
         };
-
-        let (config, pipeline, profile) = self.start_pipeline(context.pointer(), &serial)?;
 
         let aligner = if self.config.align_depth_to_color {
             let block = Owned::new(
@@ -684,21 +730,21 @@ impl RealsenseBackend {
                 let running = Arc::clone(&running);
                 let naming = self.config.naming.clone();
                 let sink = Arc::clone(&sink);
-                // Only the two owned handles cross the thread boundary; the
-                // borrowed profile pointer stays behind with the extrinsics.
-                let MotionStream { sensor, queue, .. } = motion;
                 std::thread::Builder::new().name("realsense-imu".into()).spawn(move || {
+                    // The whole struct crosses the boundary so the sensor
+                    // outlives the loop reading the queue it feeds.
+                    let motion = motion;
                     let mut pump = Pump::new(naming, sink, true);
                     while running.load(Ordering::SeqCst) {
                         unsafe {
-                            if let Err(error) = pump.step_motion(queue.pointer()) {
+                            if let Err(error) = pump.step_motion(motion.queue.pointer()) {
                                 eprintln!("realsense imu: {error:#}");
                             }
                         }
                     }
                     unsafe {
-                        rs_ignoring_errors!(rs2_stop(sensor.pointer()));
-                        rs_ignoring_errors!(rs2_close(sensor.pointer()));
+                        rs_ignoring_errors!(rs2_stop(motion.sensor.pointer()));
+                        rs_ignoring_errors!(rs2_close(motion.sensor.pointer()));
                     }
                 })
             })
@@ -865,7 +911,22 @@ struct Pump {
     publish_imu: bool,
     announced: std::collections::BTreeSet<StreamId>,
     latest_acceleration: [f64; 3],
-    motion_clock: HostClock,
+    /// Maps the camera's hardware clock onto the host epoch. Both the video and
+    /// the motion pipeline run with `GLOBAL_TIME_ENABLED` off, so every frame
+    /// arrives stamped on the same raw device clock and this is what puts it on
+    /// wall time.
+    clock: HostClock,
+    /// The last stamp published on each stream, keyed by stream and by whether
+    /// it was the reprojected copy.
+    ///
+    /// `HostClock` estimates the device-to-host offset as the smallest one it
+    /// has seen, so the estimate keeps improving while a faster sample can still
+    /// turn up, and each improvement lands the next stamp behind its
+    /// predecessor. On the Pi that was one 5 ms step, 0.7 s into a minute-long
+    /// recording, while the first window was still converging. Small, but a
+    /// header stamp that goes backwards is a fault to a ROS reader, so stamps
+    /// are kept strictly increasing per stream.
+    last_stamp: std::collections::BTreeMap<(StreamId, bool), u64>,
 }
 
 impl Pump {
@@ -876,8 +937,17 @@ impl Pump {
             publish_imu,
             announced: Default::default(),
             latest_acceleration: [0.0; 3],
-            motion_clock: HostClock::default(),
+            clock: HostClock::default(),
+            last_stamp: Default::default(),
         }
+    }
+
+    /// The stamp to publish for a stream: the mapped one, unless that would not
+    /// be an advance on the stamp before it.
+    fn increasing(&mut self, key: (StreamId, bool), stamp_nanos: u64) -> u64 {
+        let previous = self.last_stamp.entry(key).or_default();
+        *previous = stamp_nanos.max(previous.saturating_add(1));
+        *previous
     }
 
     /// Waits for one composite frame and publishes everything inside it.
@@ -967,11 +1037,11 @@ impl Pump {
         }
         let frame = Owned::new(frame, sys::rs2_release_frame)?;
         let (kind, _, _, device_nanos) = self.describe(frame.pointer())?;
-        let stamp_nanos = self.motion_clock.host_nanos(device_nanos);
+        let stamp_nanos = self.clock.host_nanos(device_nanos);
         self.publish_motion(frame.pointer(), kind, stamp_nanos)
     }
 
-    /// The frame's stream kind, index, format and timestamp.
+    /// The frame's stream kind, index, format and raw device timestamp.
     unsafe fn describe(&self, frame: *mut sys::rs2_frame) -> Result<(i32, i32, u32, u64)> {
         let profile = rs!("reading a frame's profile", rs2_get_frame_stream_profile(frame));
         let (kind, index, format, _) = stream_profile_data(profile)
@@ -982,7 +1052,8 @@ impl Pump {
     }
 
     unsafe fn publish_frame(&mut self, frame: *mut sys::rs2_frame) -> Result<()> {
-        let (kind, index, format, stamp_nanos) = self.describe(frame)?;
+        let (kind, index, format, device_nanos) = self.describe(frame)?;
+        let stamp_nanos = self.clock.host_nanos(device_nanos);
         let stream = match (kind, index) {
             (k, _) if k == RS2_STREAM_DEPTH => StreamId::Depth,
             (k, _) if k == RS2_STREAM_COLOR => StreamId::Color,
@@ -997,7 +1068,8 @@ impl Pump {
     }
 
     unsafe fn publish_aligned(&mut self, frame: *mut sys::rs2_frame) -> Result<()> {
-        let (_, _, format, stamp_nanos) = self.describe(frame)?;
+        let (_, _, format, device_nanos) = self.describe(frame)?;
+        let stamp_nanos = self.clock.host_nanos(device_nanos);
         // Aligned depth lives in the colour optical frame, because that is the
         // camera it was reprojected into.
         let frame_id = self.naming.frame_id(StreamId::Color);
@@ -1024,6 +1096,7 @@ impl Pump {
         stamp_nanos: u64,
         override_naming: Option<(String, String)>,
     ) -> Result<()> {
+        let stamp_nanos = self.increasing((stream, override_naming.is_some()), stamp_nanos);
         let Some((encoding, bytes_per_pixel)) = ros_encoding(format) else {
             // Publishing under a guessed encoding string silently corrupts every
             // reader, so an unmapped format is dropped and said out loud.
@@ -1132,6 +1205,7 @@ impl Pump {
             self.latest_acceleration = values;
             return Ok(());
         }
+        let stamp_nanos = self.increasing((StreamId::Imu, false), stamp_nanos);
         let imu = Imu::unoriented(
             Header::new(stamp_nanos, self.naming.frame_id(StreamId::Imu)),
             values,
@@ -1142,6 +1216,43 @@ impl Pump {
             imu: Box::new(imu),
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod stamp_order_tests {
+    use super::{Pump, StreamId};
+
+    fn pump() -> Pump {
+        Pump::new(
+            super::super::super::Naming::for_kind(super::super::super::SensorKind::Realsense),
+            std::sync::Arc::new(|_| true),
+            true,
+        )
+    }
+
+    /// The offset estimate improving mid-recording must not walk a stream's
+    /// stamps backwards, and must not repeat one either -- a duplicate stamp is
+    /// as unusable to a reader as an inverted one.
+    #[test]
+    fn a_better_offset_estimate_cannot_move_a_stream_backwards() {
+        let mut pump = pump();
+        let key = (StreamId::Imu, false);
+        assert_eq!(pump.increasing(key, 1_000), 1_000);
+        assert_eq!(pump.increasing(key, 995), 1_001);
+        assert_eq!(pump.increasing(key, 1_000), 1_002);
+        assert_eq!(pump.increasing(key, 5_000), 5_000);
+    }
+
+    /// Every stream carries its own history, so a slow one cannot drag another's
+    /// stamps forward.
+    #[test]
+    fn streams_do_not_share_a_stamp_history() {
+        let mut pump = pump();
+        assert_eq!(pump.increasing((StreamId::Color, false), 9_000), 9_000);
+        assert_eq!(pump.increasing((StreamId::Depth, false), 1_000), 1_000);
+        // Native depth and the reprojected copy are separate series.
+        assert_eq!(pump.increasing((StreamId::Depth, true), 1_000), 1_000);
     }
 }
 
