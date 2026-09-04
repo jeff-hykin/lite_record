@@ -78,6 +78,21 @@
                             # pre-generated bindings -- so only the .so and its .pc matter.
                             allowCross = pkgs.lib.optionalString (sdkLibraries != [ ])
                                 "export PKG_CONFIG_ALLOW_CROSS=1";
+
+                            # Works around an upstream bug: jpegxl-src 0.12.0 picks the
+                            # C++ runtime to link with `cfg!(target_vendor = "apple")`,
+                            # which a build script evaluates against the machine doing
+                            # the building, not the machine being built for. Building on
+                            # a Mac therefore asks every cross target for clang's
+                            # `libc++`, which a gcc toolchain does not ship. `ld` reads
+                            # any file it finds as a linker script, so this hands it the
+                            # runtime the toolchain actually has. Both names are needed:
+                            # the musl targets link `-Bstatic` and so look for the `.a`.
+                            cxxRuntimeShim = pkgs.runCommand "libcxx-shim" { } ''
+                                mkdir -p $out/lib
+                                echo 'INPUT(-lstdc++)' > $out/lib/libc++.so
+                                echo 'INPUT(-lstdc++)' > $out/lib/libc++.a
+                            '';
                         in
                         rustPlatform.buildRustPackage (commonArgs // {
                             pname = "lite_record-${rustTarget}";
@@ -99,6 +114,12 @@
                                 runHook postInstall
                             '';
 
+                            # gamut-jxl-sys cmake-builds a vendored libjxl. `dontUseCmakeConfigure`
+                            # keeps cmake's setup hook from replacing the configure phase that
+                            # buildRustPackage needs to vendor the registry.
+                            nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config ];
+                            dontUseCmakeConfigure = true;
+
                             "CARGO_TARGET_${targetUpper}_LINKER" = "${binDirectory}/${prefix}cc";
 
                             # zstd-sys, lz4-sys and ring compile C from build scripts. Without
@@ -107,13 +128,11 @@
                             "CC_${targetSnake}" = "${binDirectory}/${prefix}cc";
                             "CXX_${targetSnake}" = "${binDirectory}/${prefix}c++";
                             "AR_${targetSnake}" = "${binDirectory}/${prefix}ar";
-                        } // pkgs.lib.optionalAttrs (sdkLibraries != [ ]) {
-                            nativeBuildInputs = [ pkgs.pkg-config ];
 
                             PKG_CONFIG_PATH = pkgs.lib.concatMapStringsSep ":"
                                 (library: "${pkgs.lib.getDev library}/lib/pkgconfig") sdkLibraries;
 
-                            # Two separate jobs here.
+                            # Two separate jobs for the sdk libraries here.
                             #
                             # `-L native=` is a workaround for an upstream bug:
                             # librealsense ships a realsense2.pc that hardcodes
@@ -128,11 +147,13 @@
                             # binary must carry its store path to start on the target.
                             # Deploy with `nix copy --to ssh://<host>` to bring it along.
                             "CARGO_TARGET_${targetUpper}_RUSTFLAGS" =
-                                pkgs.lib.concatMapStringsSep " "
-                                    (library:
-                                        "-L native=${pkgs.lib.getLib library}/lib"
-                                        + " -C link-arg=-Wl,-rpath,${pkgs.lib.getLib library}/lib")
-                                    sdkLibraries;
+                                pkgs.lib.concatStringsSep " "
+                                    ([ "-L native=${cxxRuntimeShim}/lib" ]
+                                        ++ map
+                                        (library:
+                                            "-L native=${pkgs.lib.getLib library}/lib"
+                                            + " -C link-arg=-Wl,-rpath,${pkgs.lib.getLib library}/lib")
+                                        sdkLibraries);
                         });
 
                     # The OAK-D's SDK. Not in nixpkgs, and its own build system

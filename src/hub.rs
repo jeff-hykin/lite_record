@@ -88,7 +88,7 @@ impl Default for Settings {
             record_dir: PathBuf::from("recordings"),
             compression: Compression::default(),
             color_format: ImageFormat::Jpeg,
-            depth_format: ImageFormat::Rvl,
+            depth_format: ImageFormat::Jpegxl,
             realsense: CameraConfig::for_kind(SensorKind::Realsense),
             orbbec: CameraConfig::for_kind(SensorKind::Orbbec),
             oakd: CameraConfig::for_kind(SensorKind::OakD),

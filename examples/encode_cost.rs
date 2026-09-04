@@ -96,7 +96,7 @@ fn main() {
             "mono8",
             ImageFormat::Jpeg,
         ),
-        ("depth (mono16)", "depth.bin", 2, "mono16", ImageFormat::Png),
+        ("depth (mono16)", "depth.bin", 2, "mono16", ImageFormat::Jpegxl),
     ] {
         let image = frame(&directory.join(file), channels, encoding, width, height);
         measure(name, &mut || compress(&image, format).unwrap().data.len());

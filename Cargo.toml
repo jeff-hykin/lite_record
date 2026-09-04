@@ -57,13 +57,14 @@ tokio = { version = "1", features = [
 tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 zune-core = "0.5.3"
 zune-jpeg = "0.5"
-zune-jpegxl = "0.5.2"
 
 openh264 = { version = "0.9.8", features = ["source"], optional = true }
 # Deliberately not `buildtime-bindgen`: the crate ships generated bindings, and
 # using them means a cross build needs only the .so and a pkg-config file rather
 # than a clang that can parse the SDK's headers for the target.
 realsense-sys = { version = "2.56", optional = true }
+gamut-jxl-sys = "0.1"
+lerc-rs = "0.5"
 
 [build-dependencies]
 # Compiles the depthai shim. Optional so a build without the `oakd` feature does

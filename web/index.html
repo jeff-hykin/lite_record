@@ -108,14 +108,15 @@
         <div class="row">
             <label for="depth-format">Depth format</label>
             <select id="depth-format" data-setting="depth_format">
+                <option value="jpegxl">jpegxl</option>
                 <option value="rvl">rvl</option>
                 <option value="raw">raw</option>
                 <option value="png">png</option>
                 <option value="webp">webp</option>
-                <option value="jpegxl">jpegxl</option>
+                <option value="lerc">lerc (lossy, 5 mm)</option>
             </select>
         </div>
-        <p class="hint">Infrared is 8-bit grey and follows the colour format. Depth is 16-bit, so a codec that cannot hold it falls back to raw rather than truncating.</p>
+        <p class="hint">Infrared is 8-bit grey and follows the colour format. Depth is 16-bit, so a codec that cannot hold it falls back to raw rather than truncating. Every depth codec here is exact except <code>lerc</code>, which moves depths by up to 5 mm to get about a third off the size.</p>
     </div>
 
     <div class="settings-group" id="camera-settings"></div>

@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 HOST="${LITE_RECORD_HOST:-dimensional@100.111.62.124}"
-REMOTE_BIN="/home/dimensional/.local/bin/lite_record"
+REMOTE_BIN="/home/${HOST%@*}/.local/bin/lite_record"
 UNIT="/etc/systemd/system/lite_record.service"
 
 # nix build only sees files git knows about, so a brand new source file would

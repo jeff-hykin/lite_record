@@ -1,7 +1,15 @@
 use crate::msgs::{CompressedImage, Header, RawImage};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
-use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
+use gamut_jxl_sys::encode::{
+    JxlColorEncodingSetToSRGB, JxlEncoder, JxlEncoderAddImageFrame, JxlEncoderCloseInput,
+    JxlEncoderCreate, JxlEncoderDestroy, JxlEncoderFrameSettingId, JxlEncoderFrameSettingsCreate,
+    JxlEncoderFrameSettingsSetOption, JxlEncoderInitBasicInfo, JxlEncoderProcessOutput,
+    JxlEncoderSetBasicInfo, JxlEncoderSetColorEncoding, JxlEncoderSetFrameLossless,
+    JxlEncoderStatus,
+};
+use gamut_jxl_sys::types::{JxlBool, JxlDataType, JxlEndianness, JxlPixelFormat};
+use jpeg_encoder::{ColorType, Encoder as JpegEncoder, SamplingFactor};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::io::Cursor;
@@ -29,6 +37,9 @@ pub enum ImageFormat {
     Webp,
     Jpegxl,
     Rvl,
+    /// The one lossy depth codec here. Off by default and never a fallback —
+    /// see [`LERC_MAX_ERROR_MM`].
+    Lerc,
 }
 
 impl ImageFormat {
@@ -43,6 +54,7 @@ impl ImageFormat {
             // The exact string ROS 2's compressed_depth_image_transport writes,
             // which is what the Foxglove RVL extension matches on.
             ImageFormat::Rvl => "16UC1; compressedDepth rvl",
+            ImageFormat::Lerc => "16UC1; compressedDepth lerc",
         }
     }
 }
@@ -87,6 +99,7 @@ pub fn compress(image: &RawImage, format: ImageFormat) -> Option<CompressedImage
         ImageFormat::Webp => to_webp(&surface, width, height)?,
         ImageFormat::Jpegxl => to_jpegxl(&surface, width, height)?,
         ImageFormat::Rvl => to_rvl(&surface, width, height)?,
+        ImageFormat::Lerc => to_lerc(&surface, width, height)?,
     };
     Some(CompressedImage {
         header: image.header.clone(),
@@ -155,7 +168,7 @@ fn to_jpeg(surface: &Surface, width: u32, height: u32) -> Option<Vec<u8>> {
         Surface::Gray16(_) => return None,
     };
     let mut out = Vec::new();
-    let mut encoder = Encoder::new(&mut out, RECORD_JPEG_QUALITY);
+    let mut encoder = JpegEncoder::new(&mut out, RECORD_JPEG_QUALITY);
     // Above quality 90 the crate switches itself to 4:4:4, which triples the
     // chroma work for a difference no camera-noise-limited frame shows.
     encoder.set_sampling_factor(SamplingFactor::F_2_2);
@@ -219,31 +232,130 @@ fn to_rvl(surface: &Surface, width: u32, height: u32) -> Option<Vec<u8>> {
     }
 }
 
-fn to_jpegxl(surface: &Surface, width: u32, height: u32) -> Option<Vec<u8>> {
-    use zune_core::colorspace::ColorSpace;
-    use zune_core::bit_depth::BitDepth;
+/// libjxl's effort dial. Measured on the Pi 5 over real 720p depth: effort 1
+/// costs 7 ms a frame and compresses 6.1x, effort 2 compresses 13.1x but costs
+/// 52 ms — 1.5 cores at 30 Hz, which this board cannot spend. It has no fan,
+/// idles at 82 C already soft-throttled, and hard-throttles at 88 C under that
+/// load. Raise this to 2 once there is active cooling on it.
+const JXL_EFFORT: i64 = 1;
 
-    let (bytes, colorspace, depth) = match surface {
-        Surface::Gray8(b) => (Cow::from(&b[..]), ColorSpace::Luma, BitDepth::Eight),
-        Surface::Color { bytes, channels, bgr } => (
-            Surface::rgb_ordered(bytes, *channels, *bgr),
-            if *channels == 3 { ColorSpace::RGB } else { ColorSpace::RGBA },
-            BitDepth::Eight,
-        ),
-        // zune reads 16-bit samples as native-endian byte pairs.
-        Surface::Gray16(values) => (
-            Cow::from(values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<u8>>()),
-            ColorSpace::Luma,
-            BitDepth::Sixteen,
-        ),
+/// 16UC1 depth is in millimetres, so this is a 5 mm tolerance — the same bound
+/// dimos PR #3637 `cc/feat/better-depth-encoding` chose for its own lerc codec,
+/// kept identical so recordings from the two stacks stay comparable.
+const LERC_MAX_ERROR_MM: u16 = 5;
+
+/// Bounded-error depth. Selectable but never a default and never a fallback:
+/// every other depth codec here is exact, and a recording that quietly moved
+/// depths by millimetres would be indistinguishable from a good one.
+fn to_lerc(surface: &Surface, width: u32, height: u32) -> Option<Vec<u8>> {
+    match surface {
+        Surface::Gray16(values) => {
+            lerc::encode_slice(width, height, values, lerc::Precision::Tolerance(LERC_MAX_ERROR_MM))
+                .ok()
+        }
+        _ => None,
+    }
+}
+
+/// Lossless JPEG XL through libjxl. Beats [`crate::rvl`] on dense depth (6.1x
+/// against 5.4x) for half the CPU, and is the only encoder here whose ratio
+/// keeps climbing if CPU ever becomes available — see [`JXL_EFFORT`].
+fn to_jpegxl(surface: &Surface, width: u32, height: u32) -> Option<Vec<u8>> {
+    let (bytes, channels, gray, data_type, bits) = match surface {
+        Surface::Gray8(values) => (Cow::from(&values[..]), 1, true, JxlDataType::UINT8, 8),
+        Surface::Color { bytes, channels, bgr } => {
+            (Surface::rgb_ordered(bytes, *channels, *bgr), *channels as u32, false, JxlDataType::UINT8, 8)
+        }
+        Surface::Gray16(values) => {
+            let bytes: Vec<u8> = values.iter().flat_map(|value| value.to_ne_bytes()).collect();
+            (Cow::from(bytes), 1, true, JxlDataType::UINT16, 16)
+        }
     };
-    let options =
-        zune_core::options::EncoderOptions::new(width as usize, height as usize, colorspace, depth);
-    let mut out = Vec::new();
-    zune_jpegxl::JxlSimpleEncoder::new(&bytes, options)
-        .encode(&mut out)
-        .ok()?;
-    Some(out)
+
+    let encoder = Encoder(unsafe { JxlEncoderCreate(std::ptr::null()) });
+    if encoder.0.is_null() {
+        return None;
+    }
+    let ok = |status: JxlEncoderStatus| status == JxlEncoderStatus::SUCCESS;
+
+    unsafe {
+        let mut info = std::mem::zeroed();
+        JxlEncoderInitBasicInfo(&mut info);
+        info.xsize = width;
+        info.ysize = height;
+        info.bits_per_sample = bits;
+        info.exponent_bits_per_sample = 0;
+        info.num_color_channels = channels;
+        // Lossless is only honoured against the frame's own profile; left off,
+        // libjxl converts to XYB first and the round trip stops being exact.
+        info.uses_original_profile = JxlBool::TRUE;
+        if !ok(JxlEncoderSetBasicInfo(encoder.0, &info)) {
+            return None;
+        }
+
+        let mut color = std::mem::zeroed();
+        JxlColorEncodingSetToSRGB(&mut color, if gray { JxlBool::TRUE } else { JxlBool::FALSE });
+        if !ok(JxlEncoderSetColorEncoding(encoder.0, &color)) {
+            return None;
+        }
+
+        let settings = JxlEncoderFrameSettingsCreate(encoder.0, std::ptr::null());
+        if settings.is_null()
+            || !ok(JxlEncoderSetFrameLossless(settings, JxlBool::TRUE))
+            || !ok(JxlEncoderFrameSettingsSetOption(
+                settings,
+                JxlEncoderFrameSettingId::EFFORT,
+                JXL_EFFORT,
+            ))
+        {
+            return None;
+        }
+
+        let format = JxlPixelFormat {
+            num_channels: channels,
+            data_type,
+            endianness: JxlEndianness::NATIVE,
+            align: 0,
+        };
+        let added = JxlEncoderAddImageFrame(
+            settings,
+            &format,
+            bytes.as_ptr().cast(),
+            bytes.len(),
+        );
+        if !ok(added) {
+            return None;
+        }
+        JxlEncoderCloseInput(encoder.0);
+
+        let mut out = vec![0u8; bytes.len() / 2 + 4096];
+        let mut written = 0;
+        loop {
+            let mut cursor = out[written..].as_mut_ptr();
+            let mut remaining = out.len() - written;
+            let status = JxlEncoderProcessOutput(encoder.0, &mut cursor, &mut remaining);
+            written = out.len() - remaining;
+            match status {
+                JxlEncoderStatus::SUCCESS => {
+                    out.truncate(written);
+                    return Some(out);
+                }
+                // The only other non-error status: the encoder filled the buffer
+                // and has more to give, so grow and hand it the rest.
+                JxlEncoderStatus::NEED_MORE_OUTPUT => out.resize(out.len() * 2, 0),
+                _ => return None,
+            }
+        }
+    }
+}
+
+/// Owns the encoder so every early return above frees it.
+struct Encoder(*mut JxlEncoder);
+
+impl Drop for Encoder {
+    fn drop(&mut self) {
+        unsafe { JxlEncoderDestroy(self.0) };
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -508,7 +620,7 @@ fn encode_raw(image: &RawImage, quality: u8, max_width: usize) -> Result<Encoded
         ColorType::Rgb
     };
     let mut jpeg = Vec::with_capacity(width * height / 4);
-    Encoder::new(&mut jpeg, quality).encode(&out, width as u16, height as u16, color_type)?;
+    JpegEncoder::new(&mut jpeg, quality).encode(&out, width as u16, height as u16, color_type)?;
 
     Ok(EncodedFrame {
         jpeg: Bytes::from(jpeg),
@@ -863,6 +975,20 @@ mod tests {
             .map(|value| (value * scale).round() as u16)
             .collect();
         assert_eq!(decoded, depths(&image));
+    }
+
+    #[test]
+    fn lerc_stays_within_its_stated_error_bound() {
+        let image = depth_image(9, 5);
+        let encoded = compress(&image, ImageFormat::Lerc).unwrap();
+        assert_eq!(encoded.format, "16UC1; compressedDepth lerc");
+
+        let expected = depths(&image);
+        let mut decoded = vec![0u16; expected.len()];
+        lerc::decode_into(&encoded.data, &mut decoded).unwrap();
+        for (decoded, expected) in decoded.iter().zip(&expected) {
+            assert!(decoded.abs_diff(*expected) <= LERC_MAX_ERROR_MM);
+        }
     }
 
     #[test]
