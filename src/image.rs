@@ -28,6 +28,7 @@ pub enum ImageFormat {
     Png,
     Webp,
     Jpegxl,
+    Rvl,
 }
 
 impl ImageFormat {
@@ -39,6 +40,9 @@ impl ImageFormat {
             ImageFormat::Png => "png",
             ImageFormat::Webp => "webp",
             ImageFormat::Jpegxl => "jxl",
+            // The exact string ROS 2's compressed_depth_image_transport writes,
+            // which is what the Foxglove RVL extension matches on.
+            ImageFormat::Rvl => "16UC1; compressedDepth rvl",
         }
     }
 }
@@ -82,6 +86,7 @@ pub fn compress(image: &RawImage, format: ImageFormat) -> Option<CompressedImage
         ImageFormat::Png => to_png(&surface, width, height)?,
         ImageFormat::Webp => to_webp(&surface, width, height)?,
         ImageFormat::Jpegxl => to_jpegxl(&surface, width, height)?,
+        ImageFormat::Rvl => to_rvl(&surface, width, height)?,
     };
     Some(CompressedImage {
         header: image.header.clone(),
@@ -203,6 +208,15 @@ fn to_webp(surface: &Surface, width: u32, height: u32) -> Option<Vec<u8>> {
         .encode(&bytes, width, height, color)
         .ok()?;
     Some(out)
+}
+
+/// RVL only describes 16-bit depth, so an 8-bit surface falls back to raw
+/// rather than being reinterpreted as depth.
+fn to_rvl(surface: &Surface, width: u32, height: u32) -> Option<Vec<u8>> {
+    match surface {
+        Surface::Gray16(values) => Some(crate::rvl::compress(values, width, height)),
+        _ => None,
+    }
 }
 
 fn to_jpegxl(surface: &Surface, width: u32, height: u32) -> Option<Vec<u8>> {
@@ -809,6 +823,25 @@ mod tests {
             .map(|pair| u16::from_be_bytes(*pair))
             .collect();
         assert_eq!(decoded, depths(&image));
+    }
+
+    #[test]
+    fn rvl_keeps_every_depth_sample_exact() {
+        let image = depth_image(9, 5);
+        let encoded = compress(&image, ImageFormat::Rvl).unwrap();
+        assert_eq!(encoded.format, "16UC1; compressedDepth rvl");
+
+        let (decoded, width, height) = crate::rvl::decompress(&encoded.data).unwrap();
+        assert_eq!((width as usize, height as usize), (image.width, image.height));
+        assert_eq!(decoded, depths(&image));
+    }
+
+    #[test]
+    fn rvl_refuses_anything_that_is_not_16_bit() {
+        // Depth is the only 16-bit stream, and reading 8-bit pixels as depth
+        // would write a recording full of nonsense rather than fall back to raw.
+        assert!(compress(&colour_image(16, 16), ImageFormat::Rvl).is_none());
+        assert!(compress(&gray_image(16, 16), ImageFormat::Rvl).is_none());
     }
 
     #[test]

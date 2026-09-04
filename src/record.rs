@@ -40,15 +40,17 @@ pub struct Sample {
     pub log_time: u64,
 }
 
-/// Chunk compression for the mcap file. Zstd costs the most CPU, which on a Pi
-/// is the scarce resource, so lz4 is the default: it halves point cloud size
-/// for a few percent of one core.
+/// Chunk compression for the mcap file. Zstd at level 1 is the default: on real
+/// 720p depth it beats lz4 on both size and CPU, because its entropy stage suits
+/// run-structured 16-bit data. Level 1 rather than zstd's own default of 3,
+/// which on a dense scene costs the writer thread three times as much for a few
+/// percent of size.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Compression {
     None,
-    #[default]
     Lz4,
+    #[default]
     Zstd,
 }
 
@@ -58,6 +60,14 @@ impl Compression {
             Compression::None => None,
             Compression::Lz4 => Some(mcap::Compression::Lz4),
             Compression::Zstd => Some(mcap::Compression::Zstd),
+        }
+    }
+
+    fn level(self) -> u32 {
+        match self {
+            Compression::Zstd => 1,
+            // lz4's own level scale starts at 0, and mcap reads 0 as "default".
+            Compression::None | Compression::Lz4 => 0,
         }
     }
 }
@@ -127,6 +137,7 @@ impl Recorder {
             File::create(path).with_context(|| format!("could not create {}", path.display()))?;
         let writer = WriteOptions::new()
             .compression(compression.to_mcap())
+            .compression_level(compression.level())
             .profile("ros2")
             .create(BufWriter::with_capacity(1 << 20, file))?;
 

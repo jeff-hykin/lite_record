@@ -77,3 +77,4 @@ codegen-units = 1
 
 [dev-dependencies]
 jxl-oxide = { version = "0.12.6", default-features = false }
+re_rvl = "0.37"

@@ -304,7 +304,6 @@ async fn download_recording(
         None => (StatusCode::OK, 0, length),
     };
     set(header::CONTENT_LENGTH, span.to_string());
-    drop(set);
 
     let mut file = file;
     if start > 0 {

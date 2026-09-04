@@ -14,6 +14,7 @@ pub mod livox_command;
 pub mod msgs;
 pub mod privileged;
 pub mod record;
+pub mod rvl;
 pub mod sensors;
 pub mod service;
 pub mod sysmon;
