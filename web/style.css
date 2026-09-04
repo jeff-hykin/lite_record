@@ -178,7 +178,8 @@ button:focus-visible {
     cursor: pointer;
 }
 
-button {
+button,
+a.button {
     background: var(--accent);
     border: none;
     border-radius: 8px;
@@ -189,12 +190,21 @@ button {
     cursor: pointer;
 }
 
+/* A download has to be a real link so the browser streams it to disk rather
+   than through fetch, which would buffer a gigabyte in the tab. */
+a.button {
+    display: inline-block;
+    text-decoration: none;
+    margin-right: 0.4rem;
+}
+
 button:disabled {
     opacity: 0.5;
     cursor: default;
 }
 
-button.secondary {
+button.secondary,
+a.button.secondary {
     background: var(--surface-strong);
     color: var(--text);
     border: 1px solid var(--hairline);

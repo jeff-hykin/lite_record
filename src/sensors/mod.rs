@@ -45,7 +45,9 @@ impl SensorKind {
 
     pub fn default_frame_prefix(self) -> &'static str {
         match self {
-            SensorKind::Realsense => "realsense",
+            // `camera` so the tf tree matches the dimos rust realsense module,
+            // whose frame_id defaults to `camera_link`.
+            SensorKind::Realsense => "camera",
             SensorKind::Orbbec => "orbbec",
             SensorKind::OakD => "oakd",
             SensorKind::Livox => "livox",
@@ -155,7 +157,7 @@ impl Naming {
         format!("{}/points", self.topic_prefix.trim_end_matches('/'))
     }
 
-    /// `realsense_depth_optical_frame`
+    /// `camera_depth_optical_frame`
     pub fn frame_id(&self, stream: StreamId) -> String {
         format!(
             "{}_{}",

@@ -33,7 +33,7 @@ clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 image-webp = "0.2.4"
-jpeg-encoder = "0.6"
+jpeg-encoder = { version = "0.6", features = ["simd"] }
 libc = "0.2"
 mcap = { version = "0.25.0", default-features = false, features = ["lz4", "zstd"] }
 png = "0.18.1"
@@ -50,7 +50,11 @@ tokio = { version = "1", features = [
     "signal",
     "process",
     "io-util",
+    "fs",
 ] }
+# Only for `ReaderStream`, which is what lets a recording be sent without the
+# Pi holding a gigabyte of it in memory first.
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 zune-core = "0.5.3"
 zune-jpeg = "0.5"
 zune-jpegxl = "0.5.2"

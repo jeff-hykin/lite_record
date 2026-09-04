@@ -63,6 +63,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/settings", put(put_settings))
         .route("/api/recordings", get(recordings))
         .route("/api/recordings/{name}", delete(remove_recording))
+        .route("/api/recordings/{name}/download", get(download_recording))
         .route("/api/record/start", post(start_recording))
         .route("/api/record/stop", post(stop_recording))
         .route("/api/sensors/{kind}/{action}", post(sensor_action))
@@ -154,8 +155,23 @@ async fn status(State(state): State<AppState>) -> Response {
 /// watching to see whether the change took.
 async fn put_settings(
     State(state): State<AppState>,
-    axum::Json(settings): axum::Json<Settings>,
+    axum::Json(change): axum::Json<serde_json::Value>,
 ) -> Response {
+    // `Settings` carries `#[serde(default)]` so an old settings file missing a
+    // key still loads, which means deserialising the request on its own turns
+    // every key the caller left out into its *default* rather than leaving it
+    // alone. Sending `{"preview_enabled": true}` that way disabled the lidar,
+    // dropped the camera to 640x480 and moved the recording directory. So merge
+    // over the settings in force and deserialise the result.
+    let mut merged = match serde_json::to_value(state.hub.settings()) {
+        Ok(value) => value,
+        Err(error) => return bad_request(format!("{error:#}")),
+    };
+    merge_into(&mut merged, change);
+    let settings: Settings = match serde_json::from_value(merged) {
+        Ok(settings) => settings,
+        Err(error) => return bad_request(format!("{error:#}")),
+    };
     let hub = Arc::clone(&state.hub);
     let applied = tokio::task::spawn_blocking(move || hub.update_settings(settings)).await;
     match applied {
@@ -163,6 +179,34 @@ async fn put_settings(
         Ok(Err(error)) => bad_request(format!("{error:#}")),
         Err(error) => bad_request(error),
     }
+}
+
+/// Overlays `change` onto `target`, descending into objects so that naming a
+/// single camera field leaves that camera's other fields standing. Anything that
+/// is not an object replaces wholesale, which is what an array of one setting
+/// should do.
+fn merge_into(target: &mut serde_json::Value, change: serde_json::Value) {
+    match (target, change) {
+        (serde_json::Value::Object(existing), serde_json::Value::Object(incoming)) => {
+            for (key, value) in incoming {
+                merge_into(existing.entry(key).or_insert(serde_json::Value::Null), value)
+            }
+        }
+        (target, change) => *target = change,
+    }
+}
+
+/// Whether `path` is the file a recording is writing *now*. The status keeps the
+/// last path after a recording stops so the UI can still name it, so the active
+/// flag has to be checked too — without it a finished recording could never be
+/// deleted or downloaded.
+fn is_being_recorded(state: &AppState, path: &std::path::Path) -> bool {
+    let status = state.hub.recording_status();
+    status.active
+        && status
+            .path
+            .as_deref()
+            .is_some_and(|writing| writing == path.to_string_lossy())
 }
 
 async fn recordings(State(state): State<AppState>) -> Response {
@@ -176,19 +220,103 @@ async fn remove_recording(Path(name): Path<String>, State(state): State<AppState
         Ok(path) => path,
         Err(error) => return bad_request(error),
     };
-    if state
-        .hub
-        .recording_status()
-        .path
-        .as_deref()
-        .is_some_and(|active| active == path.to_string_lossy())
-    {
+    if is_being_recorded(&state, &path) {
         return bad_request("that file is being recorded right now");
     }
     match std::fs::remove_file(&path) {
         Ok(()) => axum::Json(json!({ "ok": true })).into_response(),
         Err(error) => bad_request(error),
     }
+}
+
+/// The byte range a `Range` header asks for, as an inclusive pair clamped to the
+/// file. An unparseable or unsatisfiable header answers `None`, which sends the
+/// whole file: a server is allowed to ignore `Range`, and a download that is
+/// merely not resumable beats one that fails.
+fn requested_range(header: Option<&str>, length: u64) -> Option<(u64, u64)> {
+    let spec = header?.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') || length == 0 {
+        return None;
+    }
+    let (start, end) = spec.split_once('-')?;
+    let start: u64 = start.trim().parse().ok()?;
+    let end = match end.trim() {
+        "" => length - 1,
+        text => text.parse::<u64>().ok()?.min(length - 1),
+    };
+    (start <= end).then_some((start, end))
+}
+
+/// Streams a recording back over HTTP, so pulling one off the Pi needs nothing
+/// but a URL — no ssh, no scp, no account on the box.
+async fn download_recording(
+    Path(name): Path<String>,
+    headers_in: axum::http::HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    let directory = state.hub.settings().record_dir;
+    let path = match record::resolve(&directory, &name) {
+        Ok(path) => path,
+        Err(error) => return bad_request(error),
+    };
+    if is_being_recorded(&state, &path) {
+        // An mcap grows its index and footer at the end, so a copy taken now is
+        // one no indexed reader will open. Stopping first is the fix.
+        return bad_request("that file is being recorded right now; stop the recording first");
+    }
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(error) => return bad_request(format!("{}: {error}", path.display())),
+    };
+    let length = match file.metadata().await {
+        Ok(data) => data.len(),
+        Err(error) => return bad_request(error),
+    };
+
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.clone());
+    let mut headers = axum::http::HeaderMap::new();
+    let mut set = |name: header::HeaderName, value: String| {
+        if let Ok(value) = value.parse() {
+            headers.insert(name, value);
+        }
+    };
+    set(header::CONTENT_TYPE, "application/octet-stream".into());
+    set(header::ACCEPT_RANGES, "bytes".into());
+    set(
+        header::CONTENT_DISPOSITION,
+        format!("attachment; filename=\"{file_name}\""),
+    );
+
+    let asked = headers_in
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    let (status, start, span) = match requested_range(asked, length) {
+        Some((start, end)) => {
+            set(
+                header::CONTENT_RANGE,
+                format!("bytes {start}-{end}/{length}"),
+            );
+            (StatusCode::PARTIAL_CONTENT, start, end + 1 - start)
+        }
+        None => (StatusCode::OK, 0, length),
+    };
+    set(header::CONTENT_LENGTH, span.to_string());
+    drop(set);
+
+    let mut file = file;
+    if start > 0 {
+        use tokio::io::AsyncSeekExt;
+        if let Err(error) = file.seek(std::io::SeekFrom::Start(start)).await {
+            return bad_request(error);
+        }
+    }
+    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(
+        tokio::io::AsyncReadExt::take(file, span),
+    ));
+    (status, headers, body).into_response()
 }
 
 #[derive(Deserialize, Default)]
@@ -482,6 +610,34 @@ mod tests {
         AppState::new(Hub::new(Settings::default(), file))
     }
 
+    #[tokio::test]
+    async fn naming_one_setting_leaves_every_other_setting_alone() {
+        let state = scratch_state();
+        let mut wanted = state.hub.settings();
+        wanted.realsense.width = 1280;
+        wanted.realsense.height = 720;
+        wanted.livox.enabled = true;
+        wanted.record_dir = "/tmp/somewhere".into();
+        state.hub.update_settings(wanted).unwrap();
+
+        let response = put_settings(
+            State(state.clone()),
+            axum::Json(json!({"preview_enabled": true, "realsense": {"frame_rate": 15}})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let after = state.hub.settings();
+        assert!(after.preview_enabled);
+        assert_eq!(after.realsense.frame_rate, 15);
+        // The keys the request never mentioned.
+        assert_eq!(after.realsense.width, 1280);
+        assert_eq!(after.realsense.height, 720);
+        assert!(after.livox.enabled);
+        assert_eq!(after.record_dir, std::path::PathBuf::from("/tmp/somewhere"));
+        std::fs::remove_file(state.hub.settings_file()).ok();
+    }
+
     #[test]
     fn the_status_payload_never_carries_the_password() {
         let state = scratch_state();
@@ -490,6 +646,64 @@ mod tests {
         assert!(!payload.contains("hunter2"), "{payload}");
         // The UI still has to know whether it needs to ask for one.
         assert!(payload.contains("\"has_password\":true"));
+        std::fs::remove_file(state.hub.settings_file()).ok();
+    }
+
+    #[test]
+    fn a_range_header_is_read_as_an_inclusive_pair_clamped_to_the_file() {
+        assert_eq!(requested_range(Some("bytes=0-9"), 100), Some((0, 9)));
+        // An open end, which is what a resumed download sends.
+        assert_eq!(requested_range(Some("bytes=40-"), 100), Some((40, 99)));
+        // Past the end is clamped rather than refused.
+        assert_eq!(requested_range(Some("bytes=90-500"), 100), Some((90, 99)));
+    }
+
+    #[test]
+    fn a_range_that_cannot_be_honoured_sends_the_whole_file() {
+        assert_eq!(requested_range(None, 100), None);
+        assert_eq!(requested_range(Some("bytes=-20"), 100), None);
+        assert_eq!(requested_range(Some("bytes=0-9,20-29"), 100), None);
+        assert_eq!(requested_range(Some("items=0-9"), 100), None);
+        assert_eq!(requested_range(Some("bytes=80-40"), 100), None);
+        assert_eq!(requested_range(Some("bytes=0-9"), 0), None);
+    }
+
+    #[tokio::test]
+    async fn a_recording_downloads_whole_and_by_range() {
+        let state = scratch_state();
+        let directory = std::env::temp_dir().join(format!("lite_web_dl_{}", record::now_nanos()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut settings = state.hub.settings();
+        settings.record_dir = directory.clone();
+        state.hub.update_settings(settings).unwrap();
+        let body: Vec<u8> = (0..=255u8).collect();
+        std::fs::write(directory.join("clip.mcap"), &body).unwrap();
+
+        let fetch = |range: Option<&'static str>| {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Some(range) = range {
+                headers.insert(header::RANGE, range.parse().unwrap());
+            }
+            download_recording(
+                Path("clip.mcap".to_string()),
+                headers,
+                State(state.clone()),
+            )
+        };
+
+        let whole = fetch(None).await;
+        assert_eq!(whole.status(), StatusCode::OK);
+        assert_eq!(whole.headers()[header::ACCEPT_RANGES], "bytes");
+        let bytes = axum::body::to_bytes(whole.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(bytes.as_ref(), body.as_slice());
+
+        let part = fetch(Some("bytes=250-")).await;
+        assert_eq!(part.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(part.headers()[header::CONTENT_RANGE], "bytes 250-255/256");
+        let bytes = axum::body::to_bytes(part.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(bytes.as_ref(), &body[250..]);
+
+        std::fs::remove_dir_all(&directory).ok();
         std::fs::remove_file(state.hub.settings_file()).ok();
     }
 

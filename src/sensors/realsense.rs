@@ -281,7 +281,7 @@ mod tests {
     fn real_depth_intrinsics_become_a_usable_camera_info() {
         let info = camera_info(
             1_000_000_000,
-            "realsense_depth_optical_frame",
+            "camera_depth_optical_frame",
             848,
             480,
             [423.4735107421875, 423.4735107421875],
@@ -310,7 +310,7 @@ mod tests {
         let baseline = 0.0499585904181004;
         let info = camera_info(
             0,
-            "realsense_infra2_optical_frame",
+            "camera_infra2_optical_frame",
             848,
             480,
             [423.4735107421875, 423.4735107421875],
@@ -363,12 +363,12 @@ mod tests {
         );
         assert_eq!(transforms.len(), 2);
         // The root edge is what a urdf attaches to.
-        assert_eq!(transforms[0].header.frame_id, "realsense_link");
-        assert_eq!(transforms[0].child_frame_id, "realsense_depth_optical_frame");
+        assert_eq!(transforms[0].header.frame_id, "camera_link");
+        assert_eq!(transforms[0].child_frame_id, "camera_depth_optical_frame");
 
         let color = &transforms[1];
-        assert_eq!(color.header.frame_id, "realsense_depth_optical_frame");
-        assert_eq!(color.child_frame_id, "realsense_color_optical_frame");
+        assert_eq!(color.header.frame_id, "camera_depth_optical_frame");
+        assert_eq!(color.child_frame_id, "camera_color_optical_frame");
         // ~14.65 mm to the right, which is the physical spacing on a D435.
         assert!((color.translation[0] - 0.0146514037624002).abs() < 1e-12);
         let norm: f64 = color.rotation.iter().map(|v| v * v).sum();

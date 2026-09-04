@@ -1,7 +1,7 @@
 use crate::msgs::{CompressedImage, Header, RawImage};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
-use jpeg_encoder::{ColorType, Encoder};
+use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::io::Cursor;
@@ -46,11 +46,26 @@ impl ImageFormat {
 /// Pixel layouts the recording encoders share. Recording keeps the source
 /// resolution and bit depth — a recording that quietly threw precision away
 /// would be worse than a large one.
-enum Surface {
-    Gray8(Vec<u8>),
-    Rgb8(Vec<u8>),
-    Rgba8(Vec<u8>),
+enum Surface<'a> {
+    Gray8(Cow<'a, [u8]>),
+    /// `bgr` is carried rather than normalised away because jpeg encodes either
+    /// order natively, and the cameras here all deliver bgr.
+    Color { bytes: Cow<'a, [u8]>, channels: usize, bgr: bool },
     Gray16(Vec<u16>),
+}
+
+impl Surface<'_> {
+    /// The channel-swapped copy the encoders that only speak rgb need.
+    fn rgb_ordered(bytes: &[u8], channels: usize, bgr: bool) -> Cow<'_, [u8]> {
+        if !bgr {
+            return Cow::from(bytes);
+        }
+        let mut swapped = bytes.to_vec();
+        for pixel in swapped.chunks_exact_mut(channels) {
+            pixel.swap(0, 2);
+        }
+        Cow::from(swapped)
+    }
 }
 
 /// Re-encodes a frame for recording. `None` means the format cannot hold these
@@ -77,7 +92,7 @@ pub fn compress(image: &RawImage, format: ImageFormat) -> Option<CompressedImage
 
 /// Repacks the rows into a tight buffer, dropping any `step` padding and
 /// putting the channels in the order every encoder here expects.
-fn surface(image: &RawImage) -> Option<Surface> {
+fn surface(image: &RawImage) -> Option<Surface<'_>> {
     let bytes_per_pixel = match image.encoding.as_str() {
         "mono8" | "8UC1" => 1,
         "rgb8" | "8UC3" | "bgr8" => 3,
@@ -90,12 +105,13 @@ fn surface(image: &RawImage) -> Option<Surface> {
     if step < tight || image.data.len() < step.checked_mul(image.height)? {
         return None;
     }
-    let rows = (0..image.height).map(|row| &image.data[row * step..row * step + tight]);
+    let rows = || (0..image.height).map(|row| &image.data[row * step..row * step + tight]);
 
     if bytes_per_pixel == 2 {
         let big_endian = image.is_bigendian != 0;
         return Some(Surface::Gray16(
-            rows.flat_map(|row| row.as_chunks::<2>().0.iter().copied())
+            rows()
+                .flat_map(|row| row.as_chunks::<2>().0.iter().copied())
                 .map(|pair| {
                     if big_endian {
                         u16::from_be_bytes(pair)
@@ -107,28 +123,38 @@ fn surface(image: &RawImage) -> Option<Surface> {
         ));
     }
 
-    let mut packed: Vec<u8> = rows.flatten().copied().collect();
-    if image.encoding.starts_with("bgr") {
-        for pixel in packed.chunks_exact_mut(bytes_per_pixel) {
-            pixel.swap(0, 2);
-        }
+    // Rows are almost always already tight, and at 720p the repack is a 2.8 MB
+    // copy per frame, so borrowing when it would be a no-op is worth the branch.
+    let bytes = if step == tight {
+        Cow::from(&image.data[..tight * image.height])
+    } else {
+        Cow::from(rows().flatten().copied().collect::<Vec<u8>>())
+    };
+    if bytes_per_pixel == 1 {
+        return Some(Surface::Gray8(bytes));
     }
-    match bytes_per_pixel {
-        1 => Some(Surface::Gray8(packed)),
-        3 => Some(Surface::Rgb8(packed)),
-        _ => Some(Surface::Rgba8(packed)),
-    }
+    Some(Surface::Color {
+        bytes,
+        channels: bytes_per_pixel,
+        bgr: image.encoding.starts_with("bgr"),
+    })
 }
 
 fn to_jpeg(surface: &Surface, width: u32, height: u32) -> Option<Vec<u8>> {
     let (bytes, color) = match surface {
-        Surface::Gray8(bytes) => (bytes.as_slice(), ColorType::Luma),
-        Surface::Rgb8(bytes) => (bytes.as_slice(), ColorType::Rgb),
-        Surface::Rgba8(bytes) => (bytes.as_slice(), ColorType::Rgba),
+        Surface::Gray8(bytes) => (&bytes[..], ColorType::Luma),
+        Surface::Color { bytes, channels: 3, bgr: false } => (&bytes[..], ColorType::Rgb),
+        Surface::Color { bytes, channels: 3, bgr: true } => (&bytes[..], ColorType::Bgr),
+        Surface::Color { bytes, bgr: false, .. } => (&bytes[..], ColorType::Rgba),
+        Surface::Color { bytes, bgr: true, .. } => (&bytes[..], ColorType::Bgra),
         Surface::Gray16(_) => return None,
     };
     let mut out = Vec::new();
-    Encoder::new(&mut out, RECORD_JPEG_QUALITY)
+    let mut encoder = Encoder::new(&mut out, RECORD_JPEG_QUALITY);
+    // Above quality 90 the crate switches itself to 4:4:4, which triples the
+    // chroma work for a difference no camera-noise-limited frame shows.
+    encoder.set_sampling_factor(SamplingFactor::F_2_2);
+    encoder
         .encode(bytes, width as u16, height as u16, color)
         .ok()?;
     Some(out)
@@ -136,9 +162,12 @@ fn to_jpeg(surface: &Surface, width: u32, height: u32) -> Option<Vec<u8>> {
 
 fn to_png(surface: &Surface, width: u32, height: u32) -> Option<Vec<u8>> {
     let (color, depth, bytes) = match surface {
-        Surface::Gray8(b) => (png::ColorType::Grayscale, png::BitDepth::Eight, Cow::from(b)),
-        Surface::Rgb8(b) => (png::ColorType::Rgb, png::BitDepth::Eight, Cow::from(b)),
-        Surface::Rgba8(b) => (png::ColorType::Rgba, png::BitDepth::Eight, Cow::from(b)),
+        Surface::Gray8(b) => (png::ColorType::Grayscale, png::BitDepth::Eight, Cow::from(&b[..])),
+        Surface::Color { bytes, channels, bgr } => (
+            if *channels == 3 { png::ColorType::Rgb } else { png::ColorType::Rgba },
+            png::BitDepth::Eight,
+            Surface::rgb_ordered(bytes, *channels, *bgr),
+        ),
         // png stores 16-bit samples big-endian regardless of the host.
         Surface::Gray16(values) => (
             png::ColorType::Grayscale,
@@ -162,14 +191,16 @@ fn to_png(surface: &Surface, width: u32, height: u32) -> Option<Vec<u8>> {
 
 fn to_webp(surface: &Surface, width: u32, height: u32) -> Option<Vec<u8>> {
     let (bytes, color) = match surface {
-        Surface::Gray8(b) => (b.as_slice(), image_webp::ColorType::L8),
-        Surface::Rgb8(b) => (b.as_slice(), image_webp::ColorType::Rgb8),
-        Surface::Rgba8(b) => (b.as_slice(), image_webp::ColorType::Rgba8),
+        Surface::Gray8(b) => (Cow::from(&b[..]), image_webp::ColorType::L8),
+        Surface::Color { bytes, channels, bgr } => (
+            Surface::rgb_ordered(bytes, *channels, *bgr),
+            if *channels == 3 { image_webp::ColorType::Rgb8 } else { image_webp::ColorType::Rgba8 },
+        ),
         Surface::Gray16(_) => return None,
     };
     let mut out = Vec::new();
     image_webp::WebPEncoder::new(&mut out)
-        .encode(bytes, width, height, color)
+        .encode(&bytes, width, height, color)
         .ok()?;
     Some(out)
 }
@@ -179,9 +210,12 @@ fn to_jpegxl(surface: &Surface, width: u32, height: u32) -> Option<Vec<u8>> {
     use zune_core::bit_depth::BitDepth;
 
     let (bytes, colorspace, depth) = match surface {
-        Surface::Gray8(b) => (Cow::from(b), ColorSpace::Luma, BitDepth::Eight),
-        Surface::Rgb8(b) => (Cow::from(b), ColorSpace::RGB, BitDepth::Eight),
-        Surface::Rgba8(b) => (Cow::from(b), ColorSpace::RGBA, BitDepth::Eight),
+        Surface::Gray8(b) => (Cow::from(&b[..]), ColorSpace::Luma, BitDepth::Eight),
+        Surface::Color { bytes, channels, bgr } => (
+            Surface::rgb_ordered(bytes, *channels, *bgr),
+            if *channels == 3 { ColorSpace::RGB } else { ColorSpace::RGBA },
+            BitDepth::Eight,
+        ),
         // zune reads 16-bit samples as native-endian byte pairs.
         Surface::Gray16(values) => (
             Cow::from(values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<u8>>()),

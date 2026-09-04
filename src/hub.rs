@@ -103,8 +103,10 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Every frame id the recording will publish data on. These are what a URDF
-    /// has to cover for the tree to be complete.
+    /// The root frame of every engaged sensor. These are what a URDF has to
+    /// cover for the tree to be complete; the stream frames below each root are
+    /// supplied by `static_transforms`, so asking a URDF for them would reject
+    /// correct files and invite duplicate edges.
     pub fn sensor_frames(&self) -> Vec<String> {
         let mut frames = Vec::new();
         for config in [&self.realsense, &self.orbbec, &self.oakd] {
@@ -113,7 +115,7 @@ impl Settings {
             }
         }
         if self.livox.enabled {
-            frames.push(self.livox.naming.frame_id(StreamId::PointCloud));
+            frames.push(self.livox.naming.root_frame_id());
         }
         frames
     }
@@ -214,6 +216,13 @@ impl RateCounter {
             _ => self.hz,
         }
     }
+
+    /// Once carried a measured rate and has since decayed to nothing. A latched
+    /// topic like `camera_info` publishes a single message and then legitimately
+    /// stays quiet, so it never earns a rate and is not counted as stalled.
+    fn stalled(&self) -> bool {
+        self.hz > 0.0 && self.hz() == 0.0
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -236,6 +245,9 @@ pub struct Hub {
     rates: Mutex<BTreeMap<String, RateCounter>>,
     /// Frames the pipeline shed before they reached the encoder.
     pipeline_dropped: Mutex<BTreeMap<String, u64>>,
+    /// `pipeline_dropped` as it stood when the current recording started, so the
+    /// shed count can be narrowed to that one file.
+    shed_baseline: Mutex<BTreeMap<String, u64>>,
     /// The latest intrinsics seen on each camera_info topic.
     ///
     /// A backend announces these once when it opens, not on every frame, so a
@@ -254,9 +266,9 @@ pub struct Hub {
     /// Counts preview encodes so switching the preview off can be shown to
     /// actually stop the work rather than just hide the result.
     preview_encodes: AtomicU64,
-    /// Counts frames that reached an encode worker, for the same reason
-    /// `preview_encodes` exists: idling has to be demonstrably free, not just
-    /// look free from the outside.
+    /// Counts messages the hub encoded and stored, wherever that ran, for the
+    /// same reason `preview_encodes` exists: idling has to be demonstrably
+    /// free, not just look free from the outside.
     record_encodes: AtomicU64,
     preview_wanted: AtomicBool,
     health: Mutex<sysmon::Sampler>,
@@ -303,6 +315,7 @@ impl Hub {
             last_status: Mutex::new(record::idle_status()),
             rates: Mutex::new(BTreeMap::new()),
             pipeline_dropped: Mutex::new(BTreeMap::new()),
+            shed_baseline: Mutex::new(BTreeMap::new()),
             latest_intrinsics: Mutex::new(BTreeMap::new()),
             encode_senders,
             preview: Mutex::new(None),
@@ -408,6 +421,16 @@ impl Hub {
                 && !hub.recording_active.load(Ordering::Relaxed)
                 && !hub.preview_matches(produced.topic())
             {
+                return true;
+            }
+            // An imu sample and an intrinsics announcement hold no image to
+            // compress and serialise in microseconds, so they are written from
+            // here rather than queued. Sharing a worker's queue with them cost
+            // the colour stream a third of its frames at 720p30: a 200 Hz imu
+            // fills 128 slots faster than one 720p jpeg encode returns, and the
+            // frame that then finds the queue full is the one that is shed.
+            if matches!(produced, Produced::Imu { .. } | Produced::CameraInfo { .. }) {
+                hub.encode_and_store(produced);
                 return true;
             }
             match hub.encode_senders[worker_for(produced.topic(), hub.encode_senders.len())]
@@ -530,10 +553,18 @@ impl Hub {
         rates
             .iter()
             .map(|(topic, counter)| {
+                // A compressed image is written under `<topic>/compressed`, so
+                // looking the tally up under the raw topic alone reported zero
+                // drops for a stream that was losing frames.
                 let writer_dropped = written
                     .as_ref()
-                    .and_then(|status| status.topics.get(topic))
-                    .map(|tally| tally.dropped)
+                    .map(|status| {
+                        [topic.clone(), format!("{topic}/compressed")]
+                            .iter()
+                            .filter_map(|name| status.topics.get(name))
+                            .map(|tally| tally.dropped)
+                            .sum()
+                    })
                     .unwrap_or(0);
                 StreamStats {
                     topic: topic.clone(),
@@ -593,6 +624,9 @@ impl Hub {
     }
 
     pub fn sensor_status(&self) -> BTreeMap<String, crate::sensors::BackendStatus> {
+        // Read the settings before taking the backends lock: `update_settings`
+        // takes them the other way round, and meeting in the middle deadlocks.
+        let settings = self.settings();
         let backends = self.backends.lock().unwrap();
         [
             SensorKind::Realsense,
@@ -602,20 +636,45 @@ impl Hub {
         ]
             .into_iter()
             .map(|kind| {
-                let status = backends.get(&kind).map(|backend| backend.status()).unwrap_or(
-                    crate::sensors::BackendStatus {
-                        running: false,
-                        detail: if kind.compiled_in() {
-                            "disengaged".into()
-                        } else {
-                            "not compiled in".into()
+                let mut status =
+                    backends.get(&kind).map(|backend| backend.status()).unwrap_or(
+                        crate::sensors::BackendStatus {
+                            running: false,
+                            detail: if kind.compiled_in() {
+                                "disengaged".into()
+                            } else {
+                                "not compiled in".into()
+                            },
+                            error: None,
                         },
-                        error: None,
-                    },
-                );
+                    );
+                if status.running && status.error.is_none() {
+                    let silent = self.silent_topics(naming_for(&settings, kind));
+                    if !silent.is_empty() {
+                        status.error = Some(format!("stopped producing: {}", silent.join(", ")))
+                    }
+                }
                 (kind.as_str().to_string(), status)
             })
             .collect()
+    }
+
+    /// Topics under `prefix` that produced messages once and have since gone
+    /// quiet. A camera that loses power re-enumerates and can come back with
+    /// only some of its streams — the driver still reports itself as healthy, so
+    /// the missing stream is invisible unless the rates are consulted.
+    fn silent_topics(&self, prefix: &str) -> Vec<String> {
+        let prefix = prefix.trim_end_matches('/');
+        let mut silent: Vec<String> = self
+            .rates
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(topic, counter)| topic.starts_with(prefix) && counter.stalled())
+            .map(|(topic, _)| topic.clone())
+            .collect();
+        silent.sort();
+        silent
     }
 
     // -- urdf -------------------------------------------------------------
@@ -754,10 +813,27 @@ impl Hub {
         for (topic, info) in &intrinsics {
             recorder.offer(topic, crate::cdr::camera_info(info));
         }
+        *self.shed_baseline.lock().unwrap() = self.pipeline_dropped.lock().unwrap().clone();
         let status = recorder.status();
         *slot = Some(recorder);
         self.recording_active.store(true, Ordering::Relaxed);
         Ok(status)
+    }
+
+    /// Frames shed before the recorder ever saw them, per topic, since this
+    /// recording started. `pipeline_dropped` counts for the life of the
+    /// process, which is the wrong window for judging one file.
+    fn shed_this_recording(&self) -> BTreeMap<String, u64> {
+        let baseline = self.shed_baseline.lock().unwrap();
+        self.pipeline_dropped
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(topic, total)| {
+                let shed = total - baseline.get(topic).copied().unwrap_or(0);
+                (shed > 0).then(|| (topic.clone(), shed))
+            })
+            .collect()
     }
 
     pub fn stop_recording(&self) -> Result<RecordingStatus> {
@@ -772,16 +848,36 @@ impl Hub {
         let Some(recorder) = self.recorder.lock().unwrap().take() else {
             anyhow::bail!("not recording");
         };
-        let status = recorder.finish()?;
+        let status = self.with_shed_frames(recorder.finish()?);
         *self.last_status.lock().unwrap() = status.clone();
         Ok(status)
     }
 
-    pub fn recording_status(&self) -> RecordingStatus {
-        match self.recorder.lock().unwrap().as_ref() {
-            Some(recorder) => recorder.status(),
-            None => self.last_status.lock().unwrap().clone(),
+    /// A frame shed on the way to an encode worker never reaches the recorder,
+    /// so the recorder's own tally called it zero while a third of the colour
+    /// stream was going missing. The two counts are merged here, under the name
+    /// the file actually holds, so one number answers "did this recording lose
+    /// anything".
+    fn with_shed_frames(&self, mut status: RecordingStatus) -> RecordingStatus {
+        for (topic, shed) in self.shed_this_recording() {
+            let compressed = format!("{topic}/compressed");
+            let name = if status.topics.contains_key(&compressed) {
+                compressed
+            } else {
+                topic
+            };
+            status.topics.entry(name).or_default().dropped += shed;
+            status.dropped += shed;
         }
+        status
+    }
+
+    pub fn recording_status(&self) -> RecordingStatus {
+        let status = match self.recorder.lock().unwrap().as_ref() {
+            Some(recorder) => recorder.status(),
+            None => return self.last_status.lock().unwrap().clone(),
+        };
+        self.with_shed_frames(status)
     }
 
     pub fn shutdown(&self) {
@@ -837,6 +933,15 @@ impl UrdfReport {
 /// Used by the settings UI to offer sensible frame prefixes.
 pub fn default_naming(kind: SensorKind) -> Naming {
     Naming::for_kind(kind)
+}
+
+fn naming_for(settings: &Settings, kind: SensorKind) -> &str {
+    match kind {
+        SensorKind::Realsense => &settings.realsense.naming.topic_prefix,
+        SensorKind::Orbbec => &settings.orbbec.naming.topic_prefix,
+        SensorKind::OakD => &settings.oakd.naming.topic_prefix,
+        SensorKind::Livox => &settings.livox.naming.topic_prefix,
+    }
 }
 
 #[cfg(test)]
@@ -969,6 +1074,57 @@ mod tests {
         settings.preview_quality = 90;
         assert!(sensors_needing_restart(&mut backends, &previous, &settings).is_empty());
         assert!(applied.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stream_that_went_quiet_is_reported_even_though_the_driver_looks_healthy() {
+        let hub = scratch_hub();
+        hub.backends
+            .lock()
+            .unwrap()
+            .insert(SensorKind::Realsense, spy(true).0);
+
+        let stale = Instant::now()
+            .checked_sub(RATE_WINDOW * 4)
+            .expect("the clock has not been running long enough");
+        let mut rates = hub.rates.lock().unwrap();
+        rates.insert(
+            "/realsense/imu".into(),
+            RateCounter {
+                count: 1000,
+                window_started: Some(stale),
+                window_count: 0,
+                hz: 200.0,
+            },
+        );
+        rates.insert(
+            "/realsense/color/image_raw".into(),
+            RateCounter {
+                count: 500,
+                window_started: Some(Instant::now()),
+                window_count: 0,
+                hz: 30.0,
+            },
+        );
+        // Latched: one message, no rate, quiet ever since. Not a fault.
+        rates.insert(
+            "/realsense/color/camera_info".into(),
+            RateCounter {
+                count: 1,
+                window_started: Some(stale),
+                window_count: 1,
+                hz: 0.0,
+            },
+        );
+        drop(rates);
+
+        let realsense = &hub.sensor_status()["realsense"];
+        assert!(realsense.running);
+        let error = realsense.error.as_deref().expect("a dead stream is an error");
+        assert!(error.contains("/realsense/imu"), "{error}");
+        assert!(!error.contains("image_raw"), "{error}");
+        assert!(!error.contains("camera_info"), "{error}");
+        std::fs::remove_file(hub.settings_file()).ok();
     }
 
     #[test]
@@ -1336,9 +1492,9 @@ mod tests {
         settings.realsense.enabled = true;
         settings.urdf_xml = Some(
             r#"<robot name="rig">
-                <link name="base_link"/><link name="realsense_link"/>
+                <link name="base_link"/><link name="camera_link"/>
                 <joint name="j" type="fixed">
-                    <parent link="base_link"/><child link="realsense_link"/>
+                    <parent link="base_link"/><child link="camera_link"/>
                     <origin xyz="0 0 0.1"/>
                 </joint>
             </robot>"#
@@ -1383,7 +1539,7 @@ mod tests {
         hub.sink()(Produced::CameraInfo {
             topic: "/realsense/color/camera_info".into(),
             info: Box::new(CameraInfo::pinhole(
-                crate::msgs::Header::new(1, "realsense_color_optical_frame"),
+                crate::msgs::Header::new(1, "camera_color_optical_frame"),
                 640,
                 480,
                 600.0,
@@ -1425,8 +1581,8 @@ mod tests {
         let mut settings = hub.settings();
         settings.realsense.enabled = true;
         settings.urdf_xml = Some(
-            r#"<robot name="rig"><link name="base_link"/><link name="realsense_link"/>
-                <joint name="j" type="fixed"><parent link="base_link"/><child link="realsense_link"/></joint>
+            r#"<robot name="rig"><link name="base_link"/><link name="camera_link"/>
+                <joint name="j" type="fixed"><parent link="base_link"/><child link="camera_link"/></joint>
             </robot>"#
                 .into(),
         );
@@ -1437,11 +1593,11 @@ mod tests {
             .iter()
             .map(|t| t.child_frame_id.as_str())
             .collect();
-        assert!(children.contains(&"realsense_link"));
-        assert!(children.contains(&"realsense_depth_optical_frame"));
-        assert!(children.contains(&"realsense_color_optical_frame"));
-        assert!(children.contains(&"realsense_infra1_optical_frame"));
-        assert!(children.contains(&"realsense_imu_frame"));
+        assert!(children.contains(&"camera_link"));
+        assert!(children.contains(&"camera_depth_optical_frame"));
+        assert!(children.contains(&"camera_color_optical_frame"));
+        assert!(children.contains(&"camera_infra1_optical_frame"));
+        assert!(children.contains(&"camera_imu_frame"));
         // Every optical frame must trace back to the urdf root, or the file
         // contains data no consumer can place.
         let parents: std::collections::BTreeSet<&str> =
@@ -1511,9 +1667,79 @@ mod tests {
         let report = hub.inspect_urdf(Some(r#"<robot name="x"><link name="base_link"/></robot>"#));
         assert!(report.parse_error.is_none());
         assert!(report.problems.contains(&TreeProblem::UncoveredFrame {
-            frame: "livox_frame".into()
+            frame: "livox_link".into()
         }));
-        assert!(report.warning().unwrap().contains("livox_frame"));
+        assert!(report.warning().unwrap().contains("livox_link"));
+        std::fs::remove_file(hub.settings_file()).ok();
+    }
+
+    /// The colour stream lost a third of its frames at 720p30 while the
+    /// recording reported no drops at all, because a frame shed on the way to
+    /// an encode worker is counted under the raw topic and written under
+    /// `/compressed`.
+    #[test]
+    fn a_frame_shed_before_the_recorder_is_still_the_recordings_drop() {
+        let hub = scratch_hub();
+        let directory = std::env::temp_dir().join(format!("lite_shed_{}", record::now_nanos()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut settings = hub.settings();
+        settings.record_dir = directory.clone();
+        hub.update_settings(settings).unwrap();
+
+        // Shed before this recording, so it must not be charged to it.
+        *hub.pipeline_dropped
+            .lock()
+            .unwrap()
+            .entry("/cam/color/image_raw".into())
+            .or_default() += 7;
+        hub.start_recording(Some("shed")).unwrap();
+
+        hub.sink()(Produced::Image {
+            stream: StreamId::Color,
+            topic: "/cam/color/image_raw".into(),
+            image: an_image(4, 4),
+        });
+        assert!(wait_for(|| hub
+            .recording_status()
+            .topics
+            .contains_key("/cam/color/image_raw/compressed")));
+        *hub.pipeline_dropped
+            .lock()
+            .unwrap()
+            .entry("/cam/color/image_raw".into())
+            .or_default() += 3;
+
+        let status = hub.recording_status();
+        let tally = status
+            .topics
+            .get("/cam/color/image_raw/compressed")
+            .expect("the frame is written under the compressed topic");
+        assert_eq!(tally.written, 1);
+        assert_eq!(tally.dropped, 3);
+        assert_eq!(status.dropped, 3);
+
+        hub.stop_recording().unwrap();
+        std::fs::remove_dir_all(&directory).ok();
+        std::fs::remove_file(hub.settings_file()).ok();
+    }
+
+    /// A urdf that stops at the sensor's root frame is complete: the stream
+    /// frames under it come from `static_transforms`, not the file.
+    #[test]
+    fn a_urdf_covering_only_the_livox_root_frame_is_accepted() {
+        let hub = scratch_hub();
+        let mut settings = hub.settings();
+        settings.livox.enabled = true;
+        hub.update_settings(settings).unwrap();
+        let report = hub.inspect_urdf(Some(
+            r#"<robot name="x"><link name="base_link"/><link name="livox_link"/>
+                <joint name="j" type="fixed">
+                    <parent link="base_link"/><child link="livox_link"/>
+                </joint>
+            </robot>"#,
+        ));
+        assert_eq!(report.problems, Vec::new());
+        assert!(report.warning().is_none(), "{:?}", report.warning());
         std::fs::remove_file(hub.settings_file()).ok();
     }
 

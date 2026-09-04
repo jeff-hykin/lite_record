@@ -588,6 +588,11 @@ const refreshRecordings = async () => {
         const size = document.createElement("td")
         size.textContent = bytesToText(file.bytes)
         const actions = document.createElement("td")
+        const download = document.createElement("a")
+        download.className = "button secondary"
+        download.textContent = "Download"
+        download.href = `/api/recordings/${encodeURIComponent(file.name)}/download`
+        download.setAttribute("download", file.name)
         const remove = document.createElement("button")
         remove.className = "secondary"
         remove.textContent = "Delete"
@@ -602,7 +607,7 @@ const refreshRecordings = async () => {
                 toast(error.message, true)
             }
         })
-        actions.append(remove)
+        actions.append(download, remove)
         row.append(name, size, actions)
         body.append(row)
     }
