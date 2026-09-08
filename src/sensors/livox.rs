@@ -667,7 +667,7 @@ mod tests {
             ..LivoxConfig::default()
         };
         let backend = LivoxBackend::new(config);
-        assert_eq!(backend.config().naming.points_topic(), "/mid360/points");
+        assert_eq!(backend.config().naming.points_topic(), "/mid360/lidar");
         assert_eq!(backend.config().naming.imu_topic(), "/mid360/imu");
         assert_eq!(
             backend.config().naming.frame_id(StreamId::PointCloud),

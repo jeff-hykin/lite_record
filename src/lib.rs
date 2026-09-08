@@ -6,7 +6,9 @@
 //! same way the running program does — including pushing genuine Mid-360 packets
 //! at the real UDP ports.
 
+pub mod access;
 pub mod cdr;
+pub mod convert;
 pub mod hub;
 pub mod image;
 pub mod livox;
@@ -17,6 +19,8 @@ pub mod record;
 pub mod rvl;
 pub mod sensors;
 pub mod service;
+pub mod storage;
+pub mod summary;
 pub mod sysmon;
 pub mod urdf;
 pub mod web;

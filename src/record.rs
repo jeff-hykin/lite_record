@@ -239,7 +239,11 @@ fn drain(
     counters: Arc<Counters>,
     tallies: Arc<Mutex<BTreeMap<String, TopicTally>>>,
 ) -> Result<()> {
-    let mut channels: HashMap<String, (u16, u32)> = HashMap::new();
+    // Keyed by topic *and* schema: an image topic carries CompressedImage
+    // normally and falls back to Image when the codec cannot hold the stream's
+    // bit depth, and an mcap channel binds to exactly one schema. Keying on the
+    // topic alone would file the fallback frames under the wrong schema.
+    let mut channels: HashMap<(String, &'static str), (u16, u32)> = HashMap::new();
     let mut schemas: HashMap<&'static str, u16> = HashMap::new();
     let mut written_since_flush = 0usize;
     let mut last_flush = Instant::now();
@@ -264,7 +268,8 @@ fn drain(
         }
 
         for sample in batch {
-            let channel_id = match channels.get(&sample.topic) {
+            let key = (sample.topic.clone(), sample.encoded.schema_name);
+            let channel_id = match channels.get(&key) {
                 Some((id, _)) => *id,
                 None => {
                     let schema_id = match schemas.get(sample.encoded.schema_name) {
@@ -281,13 +286,13 @@ fn drain(
                     };
                     let id =
                         writer.add_channel(schema_id, &sample.topic, "cdr", &BTreeMap::new())?;
-                    channels.insert(sample.topic.clone(), (id, 0));
+                    channels.insert(key.clone(), (id, 0));
                     id
                 }
             };
 
             let sequence = {
-                let slot = channels.get_mut(&sample.topic).expect("just inserted");
+                let slot = channels.get_mut(&key).expect("just inserted");
                 slot.1 = slot.1.wrapping_add(1);
                 slot.1
             };
@@ -329,7 +334,11 @@ pub struct RecordingFile {
     pub name: String,
     pub path: String,
     pub bytes: u64,
-    pub seconds_old: f64,
+    /// Unix seconds, so the browser can render it in the operator's own zone.
+    /// The Pi has no battery-backed clock, so this can read 1970 until ntp
+    /// catches up — the browser shows whatever the file says rather than hiding
+    /// it, because a wrong-looking date is the symptom worth seeing.
+    pub modified: i64,
 }
 
 pub fn list(directory: &Path) -> Vec<RecordingFile> {
@@ -345,16 +354,16 @@ pub fn list(directory: &Path) -> Vec<RecordingFile> {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 path: entry.path().display().to_string(),
                 bytes: metadata.len(),
-                seconds_old: metadata
+                modified: metadata
                     .modified()
                     .ok()
-                    .and_then(|when| when.elapsed().ok())
-                    .map(|age| age.as_secs_f64())
-                    .unwrap_or(0.0),
+                    .and_then(|when| when.duration_since(UNIX_EPOCH).ok())
+                    .map(|since| since.as_secs() as i64)
+                    .unwrap_or(0),
             })
         })
         .collect();
-    files.sort_by(|left, right| left.seconds_old.total_cmp(&right.seconds_old));
+    files.sort_by_key(|file| std::cmp::Reverse(file.modified));
     files
 }
 
@@ -575,6 +584,23 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].name, "a.mcap");
         assert_eq!(files[0].bytes, 12);
+        // A clock that has not synced yet reads 0, which would make every
+        // recording look equally old and hide the ordering bug behind it.
+        assert!(files[0].modified > 1_700_000_000);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// The recording you just finished is the one you want to download, so it
+    /// has to be the top row rather than wherever the directory happens to
+    /// hand it back.
+    #[test]
+    fn listing_puts_the_newest_recording_first() {
+        let directory = scratch("listing_order");
+        std::fs::write(directory.join("older.mcap"), [0u8; 1]).unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        std::fs::write(directory.join("newer.mcap"), [0u8; 1]).unwrap();
+        let names: Vec<_> = list(&directory).into_iter().map(|file| file.name).collect();
+        assert_eq!(names, ["newer.mcap", "older.mcap"]);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 }

@@ -36,6 +36,9 @@ image-webp = "0.2.4"
 jpeg-encoder = { version = "0.6", features = ["simd"] }
 libc = "0.2"
 mcap = { version = "0.25.0", default-features = false, features = ["lz4", "zstd"] }
+# Converting a recording reads the whole file, and a long one is larger than the
+# Pi's memory. Mapping lets the kernel page it in and drop it again.
+memmap2 = "0.9"
 png = "0.18.1"
 quick-xml = "0.37"
 serde = { version = "1", features = ["derive"] }
@@ -65,6 +68,9 @@ openh264 = { version = "0.9.8", features = ["source"], optional = true }
 realsense-sys = { version = "2.56", optional = true }
 gamut-jxl-sys = "0.1"
 lerc-rs = "0.5"
+pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }
+sha2 = { version = "0.11.0", default-features = false }
+subtle = { version = "2.6.1", default-features = false }
 
 [build-dependencies]
 # Compiles the depthai shim. Optional so a build without the `oakd` feature does

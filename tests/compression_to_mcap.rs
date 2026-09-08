@@ -143,12 +143,12 @@ fn record_one_frame_each(
     let sink = hub.sink();
     sink(Produced::Image {
         stream: StreamId::Color,
-        topic: "/camera/color/image_raw".to_owned(),
+        topic: "/camera/color_image".to_owned(),
         image: colour_frame(32, 24),
     });
     sink(Produced::Image {
         stream: StreamId::Depth,
-        topic: "/camera/depth/image_raw".to_owned(),
+        topic: "/camera/depth_image".to_owned(),
         image: depth_frame(32, 24),
     });
 
@@ -167,8 +167,8 @@ fn choosing_jpeg_and_png_rewrites_the_topics_schemas_and_payloads() {
     let channels = record_one_frame_each("jpeg_png", ImageFormat::Jpeg, ImageFormat::Png);
 
     let (schema, payloads) = channels
-        .get("/camera/color/image_raw/compressed")
-        .expect("colour was not recorded on the compressed topic");
+        .get("/camera/color_image")
+        .expect("colour is missing from the file");
     assert_eq!(schema, "sensor_msgs/msg/CompressedImage");
     let (format, data) = read_compressed_image(&payloads[0]);
     assert_eq!(format, "jpeg");
@@ -178,8 +178,8 @@ fn choosing_jpeg_and_png_rewrites_the_topics_schemas_and_payloads() {
     assert!(data.len() < 32 * 24 * 3, "jpeg was not smaller than raw");
 
     let (schema, payloads) = channels
-        .get("/camera/depth/image_raw/compressed")
-        .expect("depth was not recorded on the compressed topic");
+        .get("/camera/depth_image")
+        .expect("depth is missing from the file");
     assert_eq!(schema, "sensor_msgs/msg/CompressedImage");
     let (format, data) = read_compressed_image(&payloads[0]);
     assert_eq!(format, "png");
@@ -207,8 +207,8 @@ fn choosing_jpeg_and_png_rewrites_the_topics_schemas_and_payloads() {
 fn webp_colour_survives_the_recording_pixel_for_pixel() {
     let channels = record_one_frame_each("webp", ImageFormat::Webp, ImageFormat::Png);
     let (_, payloads) = channels
-        .get("/camera/color/image_raw/compressed")
-        .expect("colour was not recorded on the compressed topic");
+        .get("/camera/color_image")
+        .expect("colour is missing from the file");
     let (format, data) = read_compressed_image(&payloads[0]);
     assert_eq!(format, "webp");
 
@@ -226,33 +226,34 @@ fn webp_colour_survives_the_recording_pixel_for_pixel() {
 fn a_codec_that_cannot_hold_depth_leaves_the_frame_raw_rather_than_truncating_it() {
     let channels = record_one_frame_each("lossy_depth", ImageFormat::Jpeg, ImageFormat::Jpeg);
 
-    assert!(
-        !channels.contains_key("/camera/depth/image_raw/compressed"),
+    // Raw and compressed share the topic, so the schema is what says whether
+    // the codec was applied or refused.
+    let (schema, payloads) = channels
+        .get("/camera/depth_image")
+        .expect("depth was dropped entirely instead of falling back to raw");
+    assert_eq!(
+        schema, "sensor_msgs/msg/Image",
         "16-bit depth was written through an 8-bit codec"
     );
-    let (schema, payloads) = channels
-        .get("/camera/depth/image_raw")
-        .expect("depth was dropped entirely instead of falling back to raw");
-    assert_eq!(schema, "sensor_msgs/msg/Image");
     assert!(!payloads.is_empty());
 
     // Colour still took the requested codec, so the fallback is per-stream.
-    assert!(channels.contains_key("/camera/color/image_raw/compressed"));
+    assert_eq!(
+        channels["/camera/color_image"].0,
+        "sensor_msgs/msg/CompressedImage"
+    );
 }
 
 #[test]
 fn the_raw_setting_records_an_image_message_untouched() {
     let channels = record_one_frame_each("raw", ImageFormat::Raw, ImageFormat::Raw);
-    for topic in ["/camera/color/image_raw", "/camera/depth/image_raw"] {
+    for topic in ["/camera/color_image", "/camera/depth_image"] {
         let (schema, payloads) = channels
             .get(topic)
             .unwrap_or_else(|| panic!("{topic} is missing"));
         assert_eq!(schema, "sensor_msgs/msg/Image");
         assert!(!payloads.is_empty());
     }
-    assert!(channels
-        .keys()
-        .all(|topic| !topic.ends_with("/compressed")));
 }
 
 /// Voxel downsampling is the lidar's half of the compression settings. It is

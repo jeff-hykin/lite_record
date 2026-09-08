@@ -10,35 +10,62 @@
 </head>
 <body>
 
+<div class="chrome">
 <header class="bar">
     <div class="brand">
         <span id="connection-dot" class="dot"></span>
         <strong>lite_record</strong>
+        <span id="record-clock" class="clock" hidden>0.0 s</span>
     </div>
     <button id="record-toggle" class="record">Start recording</button>
 </header>
+<nav class="tabs" role="tablist" aria-label="Sections">
+    <button class="tab" role="tab" data-tab="capture" aria-selected="true">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="8" class="stroke"></circle>
+            <circle cx="12" cy="12" r="3.5" class="fill"></circle>
+        </svg>
+        <span>Capture</span>
+    </button>
+    <button class="tab" role="tab" data-tab="monitor" aria-selected="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+            <polyline points="3 13 8 13 10.5 6 13.5 19 16 13 21 13" class="stroke"></polyline>
+        </svg>
+        <span>Monitor</span>
+    </button>
+    <button class="tab" role="tab" data-tab="files" aria-selected="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M3.5 6.5 H9 L11 9 H20.5 V18.5 H3.5 Z" class="stroke"></path>
+        </svg>
+        <span>Files</span>
+    </button>
+    <button class="tab" role="tab" data-tab="settings" aria-selected="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+            <line x1="4" y1="7.5" x2="20" y2="7.5" class="stroke"></line>
+            <line x1="4" y1="16.5" x2="20" y2="16.5" class="stroke"></line>
+            <circle cx="15" cy="7.5" r="2.4" class="knob"></circle>
+            <circle cx="9" cy="16.5" r="2.4" class="knob"></circle>
+        </svg>
+        <span>Settings</span>
+    </button>
+    <button class="tab" role="tab" data-tab="system" aria-selected="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+            <rect x="3" y="5" width="18" height="14" rx="2" class="stroke"></rect>
+            <polyline points="7 9.5 10 12 7 14.5" class="stroke"></polyline>
+            <line x1="12.5" y1="14.5" x2="17" y2="14.5" class="stroke"></line>
+        </svg>
+        <span>System</span>
+    </button>
+</nav>
+</div>
 
 <main>
 
-<section class="card">
-    <h2>Preview</h2>
-    <div class="row">
-        <label for="preview-topic">Stream</label>
-        <select id="preview-topic"></select>
-        <label class="check">
-            <input id="preview-enabled" type="checkbox" checked>
-            <span>On</span>
-        </label>
-    </div>
-    <p class="hint">Turning this off stops the encode entirely rather than just hiding it, which is the point on a Pi.</p>
-    <div class="preview-frame">
-        <img id="preview-image" alt="camera preview" hidden>
-        <p id="preview-idle" class="preview-idle">No frames yet.</p>
-    </div>
-</section>
+<!-- == capture ======================================================== -->
+<div class="panel" data-panel="capture">
 
 <section class="card" id="recording-card">
-    <div class="row">
+    <div class="field">
         <label for="recording-name">File name</label>
         <input id="recording-name" type="text" placeholder="auto (timestamp)" autocomplete="off">
     </div>
@@ -53,148 +80,214 @@
 </section>
 
 <section class="card">
+    <h2>Live view</h2>
+    <div class="row">
+        <select id="preview-topic"></select>
+        <label class="check">
+            <input id="preview-enabled" type="checkbox" checked>
+            <span>On</span>
+        </label>
+    </div>
+    <div class="preview-frame">
+        <img id="preview-image" alt="camera preview" hidden>
+        <p id="preview-idle" class="preview-idle">No frames yet.</p>
+    </div>
+    <div id="preview-streams" class="row wrap stream-switches" hidden></div>
+    <p class="hint">Turning the preview off stops the encode entirely rather than just hiding it, which is the point on a Pi. Switching a stream off stops the camera producing it at all, so it costs nothing and is not recorded.</p>
+</section>
+
+<section class="card">
     <h2>Sensors</h2>
     <!-- Engage/disengage exists so another process can borrow a camera or the
          lidar without restarting the recorder. -->
     <div id="sensor-list" class="sensor-list"></div>
 </section>
 
-<details class="card" id="monitor" open>
-    <summary><h2>Monitor</h2></summary>
+</div>
+
+<!-- == monitor ======================================================== -->
+<div class="panel" data-panel="monitor" hidden>
+
+<section class="card">
     <p id="throttle-warning" class="warning" hidden></p>
+    <div class="charts">
+        <figure class="chart" data-chart="cpu">
+            <figcaption><span>CPU</span><b id="cpu-busy">--</b></figcaption>
+            <svg viewBox="0 0 240 64" preserveAspectRatio="none" aria-hidden="true">
+                <path class="chart-area"></path>
+                <path class="chart-line"></path>
+            </svg>
+            <div class="chart-foot"><span class="chart-span"></span><span class="chart-top"></span></div>
+        </figure>
+        <figure class="chart" data-chart="temperature">
+            <figcaption><span>Temperature</span><b id="temperature">--</b></figcaption>
+            <svg viewBox="0 0 240 64" preserveAspectRatio="none" aria-hidden="true">
+                <path class="chart-area"></path>
+                <path class="chart-line"></path>
+            </svg>
+            <div class="chart-foot"><span class="chart-span"></span><span class="chart-top"></span></div>
+        </figure>
+        <figure class="chart" data-chart="memory">
+            <figcaption><span>Memory</span><b id="memory">--</b></figcaption>
+            <svg viewBox="0 0 240 64" preserveAspectRatio="none" aria-hidden="true">
+                <path class="chart-area"></path>
+                <path class="chart-line"></path>
+            </svg>
+            <div class="chart-foot"><span class="chart-span"></span><span class="chart-top"></span></div>
+        </figure>
+    </div>
     <dl class="stats">
-        <div><dt>CPU</dt><dd id="cpu-busy">--</dd></div>
         <div><dt>Load (1 min)</dt><dd id="load-one">--</dd></div>
-        <div><dt>Memory</dt><dd id="memory">--</dd></div>
-        <div><dt>Temperature</dt><dd id="temperature">--</dd></div>
         <div><dt>Disk free</dt><dd id="disk-free">--</dd></div>
     </dl>
+</section>
+
+<section class="card">
+    <h2>CPU cores</h2>
+    <p class="hint">Each bar is one core's share of the last few seconds, smoothed. Red is above 85%, which is where that core starts dropping frames.</p>
     <div id="cpu-cores" class="cores"></div>
-    <table class="streams">
-        <thead>
-            <tr><th>Topic</th><th>Hz</th><th>Messages</th><th>Dropped</th></tr>
-        </thead>
-        <tbody id="stream-rows"></tbody>
-    </table>
-</details>
+</section>
 
-<details class="card">
-    <summary><h2>Settings</h2></summary>
+<section class="card">
+    <h2>Streams</h2>
+    <!-- Topic names are long and there are a dozen of them, so the table gets
+         its own scroller both ways rather than pushing the page sideways. -->
+    <div class="table-scroll">
+        <table class="streams">
+            <thead>
+                <tr><th>Topic</th><th>Hz</th><th>Messages</th><th>Dropped</th><th>On</th></tr>
+            </thead>
+            <tbody id="stream-rows"></tbody>
+        </table>
+    </div>
+</section>
 
-    <div class="settings-group">
-        <h3>Storage</h3>
-        <div class="row">
-            <label for="record-dir">Save to</label>
-            <input id="record-dir" type="text" data-setting="record_dir">
-        </div>
-        <div class="row">
-            <label for="compression">mcap compression</label>
-            <select id="compression" data-setting="compression">
-                <option value="none">none</option>
-                <option value="lz4">lz4</option>
-                <option value="zstd">zstd</option>
-            </select>
-        </div>
-        <div class="row">
-            <label for="color-format">Colour / IR format</label>
-            <select id="color-format" data-setting="color_format">
-                <option value="raw">raw</option>
-                <option value="jpeg">jpeg</option>
-                <option value="png">png</option>
-                <option value="webp">webp</option>
-                <option value="jpegxl">jpegxl</option>
-            </select>
-        </div>
-        <div class="row">
-            <label for="depth-format">Depth format</label>
-            <select id="depth-format" data-setting="depth_format">
-                <option value="jpegxl">jpegxl</option>
-                <option value="rvl">rvl</option>
-                <option value="raw">raw</option>
-                <option value="png">png</option>
-                <option value="webp">webp</option>
-                <option value="lerc">lerc (lossy, 5 mm)</option>
-            </select>
-        </div>
+</div>
+
+<!-- == files ========================================================== -->
+<div class="panel" data-panel="files" hidden>
+
+<section class="card">
+    <h2>Recordings</h2>
+    <p id="conversion" class="notice" hidden></p>
+    <p id="transfer" class="notice" hidden></p>
+    <div id="recording-list" class="file-list"></div>
+    <p class="hint">Tap a recording for preview, download, post-processing and the rest.</p>
+</section>
+
+</div>
+
+<!-- == settings ======================================================= -->
+<div class="panel" data-panel="settings" hidden>
+
+<section class="card">
+    <h2>Recording</h2>
+    <div class="field">
+        <label for="record-dir">Save to</label>
+        <button id="record-dir" class="secondary path-button" type="button">choose a folder</button>
+    </div>
+    <div class="field">
+        <label for="compression">mcap compression</label>
+        <select id="compression" data-setting="compression">
+            <option value="none">none</option>
+            <option value="lz4">lz4</option>
+            <option value="zstd">zstd</option>
+        </select>
+    </div>
+    <div class="field">
+        <label for="color-format">Colour / IR</label>
+        <select id="color-format" data-setting="color_format">
+            <option value="raw">raw</option>
+            <option value="jpeg">jpeg</option>
+            <option value="png">png</option>
+            <option value="webp">webp</option>
+            <option value="jpegxl">jpegxl</option>
+        </select>
+    </div>
+    <div class="field">
+        <label for="depth-format">Depth</label>
+        <select id="depth-format" data-setting="depth_format">
+            <option value="jpegxl">jpegxl</option>
+            <option value="rvl">rvl</option>
+            <option value="raw">raw</option>
+            <option value="png">png</option>
+            <option value="webp">webp</option>
+            <option value="lerc">lerc (lossy, 5 mm)</option>
+        </select>
+    </div>
+    <details class="note">
+        <summary>About these formats</summary>
         <p class="hint">Infrared is 8-bit grey and follows the colour format. Depth is 16-bit, so a codec that cannot hold it falls back to raw rather than truncating. Every depth codec here is exact except <code>lerc</code>, which moves depths by up to 5 mm to get about a third off the size.</p>
-    </div>
+    </details>
+</section>
 
-    <div class="settings-group" id="camera-settings"></div>
+<section class="card">
+    <h2>Sensors</h2>
+    <!-- One collapsed row per sensor with its on/off switch in the header, so
+         the common case — check what is on, flip one — needs no expanding. -->
+    <div id="sensor-settings" class="config-list"></div>
+</section>
 
-    <div class="settings-group">
-        <h3>Livox Mid-360</h3>
-        <div class="row">
-            <label class="check"><input type="checkbox" data-setting="livox.enabled"><span>Enabled</span></label>
-            <label class="check"><input type="checkbox" data-setting="livox.imu"><span>IMU (200 Hz)</span></label>
-        </div>
-        <div class="row">
-            <label>Topic prefix</label>
-            <input type="text" data-setting="livox.naming.topic_prefix">
-            <label>Frame prefix</label>
-            <input type="text" data-setting="livox.naming.frame_prefix">
-        </div>
-        <div class="row">
-            <label>Host address</label>
-            <input type="text" data-setting="livox.host_address" placeholder="auto">
-            <label>Lidar address</label>
-            <input type="text" data-setting="livox.lidar_address" placeholder="multicast">
-        </div>
-        <div class="row">
-            <label>Cloud Hz</label>
-            <input type="number" step="0.5" min="1" data-setting="livox.frame_hz">
-            <label>Voxel leaf (m)</label>
-            <input type="number" step="0.01" min="0" data-setting="livox.voxel_leaf_size">
-        </div>
-        <p class="hint">A leaf size of 0 keeps every point. Downsampling happens before encoding, so it saves both CPU and disk.</p>
-        <div class="row">
-            <label for="lidar-interface">Lidar NIC</label>
-            <input id="lidar-interface" type="text" placeholder="eth0" autocomplete="off">
-            <button id="configure-network" class="secondary">Auto-configure Mid-360 network</button>
-        </div>
+<section class="card">
+    <h2>Preview quality</h2>
+    <div class="field">
+        <label for="preview-quality">JPEG quality</label>
+        <input id="preview-quality" type="number" min="1" max="100" data-setting="preview_quality">
     </div>
+    <div class="field">
+        <label for="preview-width">Max width</label>
+        <input id="preview-width" type="number" min="64" max="1920" data-setting="preview_max_width">
+    </div>
+</section>
 
-    <div class="settings-group">
-        <h3>Preview quality</h3>
-        <div class="row">
-            <label for="preview-quality">JPEG quality</label>
-            <input id="preview-quality" type="number" min="1" max="100" data-setting="preview_quality">
-            <label for="preview-width">Max width</label>
-            <input id="preview-width" type="number" min="64" max="1920" data-setting="preview_max_width">
-        </div>
+<section class="card">
+    <h2>URDF</h2>
+    <p id="urdf-warning" class="warning" hidden></p>
+    <div class="row">
+        <input id="urdf-file" type="file" accept=".urdf,.xml">
+        <button id="urdf-clear" class="secondary">Clear</button>
     </div>
+    <dl class="stats">
+        <div><dt>Robot</dt><dd id="urdf-name">none</dd></div>
+        <div><dt>Links</dt><dd id="urdf-links">0</dd></div>
+        <div><dt>Joints</dt><dd id="urdf-joints">0</dd></div>
+    </dl>
+    <ul id="urdf-problems" class="problems"></ul>
+    <div id="urdf-viewer" class="urdf-viewer"></div>
+    <p class="hint">The tree is written to <code>/tf_static</code>. Sensor frames come from the prefixes above, so the URDF has to cover them.</p>
+</section>
 
-    <div class="settings-group">
-        <h3>URDF</h3>
-        <p id="urdf-warning" class="warning" hidden></p>
-        <div class="row">
-            <input id="urdf-file" type="file" accept=".urdf,.xml">
-            <button id="urdf-clear" class="secondary">Clear</button>
-        </div>
-        <p class="hint">The tree is written to <code>/tf_static</code>. Sensor frames come from the prefixes above, so the URDF has to cover them.</p>
-        <dl class="stats">
-            <div><dt>Robot</dt><dd id="urdf-name">none</dd></div>
-            <div><dt>Links</dt><dd id="urdf-links">0</dd></div>
-            <div><dt>Joints</dt><dd id="urdf-joints">0</dd></div>
-        </dl>
-        <ul id="urdf-problems" class="problems"></ul>
-        <div id="urdf-viewer" class="urdf-viewer"></div>
-    </div>
+</div>
 
-    <div class="settings-group">
-        <h3>Privileged actions</h3>
-        <p class="hint">Mounting a drive and configuring a network interface need root. The password is held in this process's memory only — never written to the settings file, a log, or the recording.</p>
-        <div class="row">
-            <label for="sudo-password">sudo password</label>
-            <input id="sudo-password" type="password" autocomplete="off">
-            <button id="save-password" class="secondary">Hold</button>
-            <span id="password-state" class="pill">not set</span>
-        </div>
-        <div class="row">
-            <button id="mount-usb" class="secondary">Auto-mount USB drives</button>
-        </div>
-        <p id="removable-mounts" class="hint"></p>
+<!-- == system ========================================================= -->
+<div class="panel" data-panel="system" hidden>
+
+<section class="card">
+    <h2>Operator password</h2>
+    <p class="hint">Guards the actions on this tab — the terminal, mounting a drive, configuring the lidar's network, and holding the sudo password. Recording, previewing and the file list stay open, so nobody types a password to press record.</p>
+    <div class="row">
+        <span id="access-state" class="pill">no password</span>
+        <button id="access-change" class="secondary">Set password</button>
+        <button id="access-forget" class="secondary" hidden>Forget on this browser</button>
     </div>
-</details>
+</section>
+
+<section class="card">
+    <h2>Privileged actions</h2>
+    <p class="hint">Mounting a drive and configuring a network interface need root. The sudo password is held in this process's memory only — never written to the settings file, a log, or the recording.</p>
+    <div class="field">
+        <label for="sudo-password">sudo password</label>
+        <input id="sudo-password" type="password" autocomplete="off">
+    </div>
+    <div class="row">
+        <button id="save-password" class="secondary">Hold</button>
+        <span id="password-state" class="pill">not set</span>
+    </div>
+    <div class="row">
+        <button id="mount-usb" class="secondary">Auto-mount USB drives</button>
+    </div>
+    <p id="removable-mounts" class="hint"></p>
+</section>
 
 <details class="card" id="terminal-card">
     <summary><h2>Terminal</h2></summary>
@@ -206,15 +299,18 @@
     <pre id="terminal-output" class="terminal-output"></pre>
 </details>
 
-<details class="card">
-    <summary><h2>Recordings</h2></summary>
-    <table class="streams">
-        <thead><tr><th>File</th><th>Size</th><th></th></tr></thead>
-        <tbody id="recording-rows"></tbody>
-    </table>
-</details>
+</div>
 
 </main>
+
+<div id="scrim" class="scrim" hidden></div>
+<section id="sheet" class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title" hidden>
+    <header class="sheet-bar">
+        <h2 id="sheet-title"></h2>
+        <button id="sheet-close" class="secondary">Done</button>
+    </header>
+    <div id="sheet-body" class="sheet-body"></div>
+</section>
 
 <div id="toast" class="toast" hidden></div>
 

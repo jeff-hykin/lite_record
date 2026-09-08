@@ -153,14 +153,19 @@ is 8-bit.
 
 One mcap, ROS2 CDR encoded with schemas, so it opens in Foxglove without a conversion step.
 
-- `<prefix>/depth/image_raw`, `/color/image_raw`, `/infra_left/image_raw`,
-  `/infra_right/image_raw` as `sensor_msgs/Image` (or `CompressedImage` when a codec is
-  chosen)
-- `<prefix>/<stream>/camera_info` as `sensor_msgs/CameraInfo`, carrying the intrinsics read
-  from the camera's own factory calibration. Published once per stream, not once per frame.
-- `<prefix>/aligned_depth_to_color/image_raw` when alignment is on
+Topics are named after the matching dimos module's outputs, so a recording drops into a
+dimos graph without a remapping table. dimos carries raw and compressed images on one
+output and tells them apart by message type, which is why neither word appears in a name.
+
+- `<prefix>/depth_image`, `/color_image`, `/infrared_left`, `/infrared_right` as
+  `sensor_msgs/Image`, or `CompressedImage` when a codec is chosen — one topic either way
+- `<prefix>/camera_info` (colour) and `<prefix>/depth_camera_info`,
+  `/infrared_left_camera_info`, `/infrared_right_camera_info` as `sensor_msgs/CameraInfo`,
+  carrying the intrinsics read from the camera's own factory calibration. Published once
+  per stream, not once per frame.
+- `<prefix>/aligned_depth_image` when alignment is on
 - `<prefix>/imu` as `sensor_msgs/Imu`
-- `<prefix>/points` as `sensor_msgs/PointCloud2`, with `x y z intensity tag line offset_time`
+- `<prefix>/lidar` as `sensor_msgs/PointCloud2`, with `x y z intensity tag line offset_time`
   — the per-point time offset the Mid-360 reports, so the cloud can be de-skewed
 - `/tf_static` as `tf2_msgs/TFMessage`, written once at the start of each recording. It
   carries the uploaded URDF's joints plus one edge per sensor stream. An engaged RealSense

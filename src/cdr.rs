@@ -294,15 +294,13 @@ impl CdrWriter {
     }
 }
 
-/// Mirror of `CdrWriter` used by the tests to prove a message survives the round
-/// trip. Only ever compiled into the test binary.
-#[cfg(test)]
+/// Mirror of `CdrWriter`. The tests use it to prove a message survives the round
+/// trip; `crate::convert` uses it to read a recording back.
 pub struct CdrReader<'a> {
     data: &'a [u8],
     offset: usize,
 }
 
-#[cfg(test)]
 impl<'a> CdrReader<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         assert_eq!(&data[..4], &[0x00, 0x01, 0x00, 0x00], "not little-endian CDR");
@@ -370,6 +368,50 @@ impl<'a> CdrReader<'a> {
             stamp_nsec: self.u32() as i32,
             frame_id: self.string(),
         }
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.offset)
+    }
+
+    /// `string` panics past the end of the buffer, which is fine for a message
+    /// this program encoded itself and not fine for one read back off a card
+    /// that filled up mid-write. These `try_` readers stop instead.
+    pub fn try_string(&mut self) -> Option<String> {
+        let start = self.offset;
+        self.align(4);
+        if self.remaining() < 4 {
+            self.offset = start;
+            return None;
+        }
+        let length = self.u32() as usize;
+        if length == 0 || self.remaining() < length {
+            self.offset = start;
+            return None;
+        }
+        let text = String::from_utf8(self.data[self.offset..self.offset + length - 1].to_vec());
+        self.offset += length;
+        text.ok()
+    }
+
+    pub fn try_header(&mut self) -> Option<Header> {
+        self.align(4);
+        if self.remaining() < 12 {
+            return None;
+        }
+        Some(Header {
+            stamp_sec: self.i32(),
+            stamp_nsec: self.u32() as i32,
+            frame_id: self.try_string()?,
+        })
+    }
+
+    pub fn try_f64_array<const N: usize>(&mut self) -> Option<[f64; N]> {
+        self.align(8);
+        if self.remaining() < 8 * N {
+            return None;
+        }
+        Some(self.f64_array())
     }
 
     pub fn at_end(&self) -> bool {

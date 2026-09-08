@@ -1,8 +1,13 @@
+/* Dark, quiet, and built for a phone held in one hand next to a rig. The
+   spacing scale below is 8 pt steps, controls are 44 px tall where a thumb has
+   to find them, and colour is reserved for state — recording, hot, dropped —
+   so that when something does go red it means something. */
+
 :root {
-    --bg: #0b0d10;
-    --surface: rgba(255, 255, 255, 0.055);
+    --bg: #000000;
+    --surface: #16181d;
     --surface-strong: rgba(255, 255, 255, 0.09);
-    --hairline: rgba(255, 255, 255, 0.12);
+    --hairline: rgba(255, 255, 255, 0.11);
     --text: #f5f5f7;
     --muted: rgba(235, 235, 245, 0.62);
     --faint: rgba(235, 235, 245, 0.34);
@@ -10,42 +15,69 @@
     --good: #32d74b;
     --bad: #ff453a;
     --warn: #ffd60a;
-    --radius: 12px;
+    --radius: 14px;
+    --step: 8px;
+    --touch: 44px;
+    --tabbar: 58px;
 }
 
 * {
     box-sizing: border-box;
 }
 
+/* A `display` rule in a class beats the UA's `[hidden] { display: none }`, and
+   nearly everything hidden here — a panel, a sheet, the preview image — also
+   carries one. Without this the page shows every tab at once. */
+[hidden] {
+    display: none !important;
+}
+
 body {
     margin: 0;
     background: var(--bg);
     color: var(--text);
-    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    padding-bottom: 3rem;
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+    padding-bottom: calc(var(--step) + env(safe-area-inset-bottom));
+    -webkit-text-size-adjust: 100%;
+}
+
+body.sheet-open {
+    overflow: hidden;
 }
 
 /* -- top bar ---------------------------------------------------------- */
 
-.bar {
+/* Title row and tab row travel as one sticky block, so the record button and
+   the navigation are both reachable however far the page is scrolled. */
+.chrome {
     position: sticky;
     top: 0;
-    z-index: 10;
+    z-index: 20;
+    background: rgba(0, 0, 0, 0.86);
+    backdrop-filter: saturate(180%) blur(20px);
+    border-bottom: 1px solid var(--hairline);
+}
+
+.bar {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 1rem;
-    padding: 0.75rem 1rem;
-    background: rgba(11, 13, 16, 0.92);
-    backdrop-filter: blur(12px);
-    border-bottom: 1px solid var(--hairline);
+    gap: var(--step);
+    padding: calc(var(--step) * 1.25) var(--step) calc(var(--step) * 0.5);
+    padding-top: calc(var(--step) * 1.25 + env(safe-area-inset-top));
 }
 
 .brand {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: calc(var(--step) * 0.75);
     font-size: 1.05rem;
+}
+
+.clock {
+    font-variant-numeric: tabular-nums;
+    font-size: 0.85rem;
+    color: var(--bad);
 }
 
 .dot {
@@ -54,10 +86,87 @@ body {
     border-radius: 50%;
     background: var(--bad);
     transition: background 0.2s;
+    flex: none;
 }
 
 .dot-good {
     background: var(--good);
+}
+
+/* -- tabs ------------------------------------------------------------- */
+
+/* Five sections rather than one long scroll. The row lives under the title bar
+   inside `.chrome`. Every tab keeps its own hue at all times: on a page that is
+   otherwise black-and-blue, five same-coloured buttons disappear into the
+   chrome, and a new user never finds them. */
+.tabs {
+    display: flex;
+    /* Lighter than the page and the cards, so the row reads as a distinct bar
+       rather than more black chrome. */
+    background: #20242c;
+    border-top: 1px solid var(--hairline);
+}
+
+.tab {
+    --hue: var(--accent);
+    flex: 1;
+    min-height: var(--tabbar);
+    padding: 6px 2px 4px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    background: none;
+    /* Brighter than --faint: these are the primary navigation, and at 34%
+       opacity a new user reads them as disabled. */
+    color: rgba(235, 235, 245, 0.62);
+    border: none;
+    border-radius: 0;
+    font-size: 0.72rem;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    cursor: pointer;
+}
+
+.tab[data-tab="capture"] { --hue: #ff453a; }
+.tab[data-tab="monitor"] { --hue: #32d74b; }
+.tab[data-tab="files"] { --hue: #ff9f0a; }
+.tab[data-tab="settings"] { --hue: #bf5af2; }
+.tab[data-tab="system"] { --hue: #64d2ff; }
+
+.tab svg {
+    width: 22px;
+    height: 22px;
+    flex: none;
+    color: var(--hue);
+}
+
+.tab .stroke {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+.tab .fill {
+    fill: currentColor;
+}
+
+/* The slider knobs sit on their track lines, so they blank out the line behind
+   them with the bar's background before drawing their outline. */
+.tab .knob {
+    fill: #20242c;
+    stroke: currentColor;
+    stroke-width: 1.8;
+}
+
+.tab[aria-selected="true"] {
+    color: var(--hue);
+    font-weight: 600;
+    box-shadow: inset 0 -2px 0 var(--hue);
+    background: color-mix(in srgb, var(--hue) 14%, transparent);
 }
 
 /* -- layout ----------------------------------------------------------- */
@@ -65,26 +174,29 @@ body {
 main {
     max-width: 62rem;
     margin: 0 auto;
-    padding: 1rem;
+    padding: 0 var(--step) var(--step);
+}
+
+.panel {
     display: flex;
     flex-direction: column;
-    gap: 1rem;
+    gap: var(--step);
+    padding-top: var(--step);
 }
 
 .card {
     background: var(--surface);
-    border: 1px solid var(--hairline);
     border-radius: var(--radius);
-    padding: 1rem;
+    padding: calc(var(--step) * 1.5);
 }
 
 .card > h2,
 .card summary h2 {
-    margin: 0 0 0.75rem;
-    font-size: 0.95rem;
-    letter-spacing: 0.04em;
+    margin: 0 0 var(--step);
+    font-size: 0.78rem;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
-    color: var(--muted);
+    color: var(--faint);
     display: inline;
 }
 
@@ -93,7 +205,8 @@ summary {
     list-style: none;
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: calc(var(--step) * 0.5);
+    min-height: 28px;
 }
 
 summary::before {
@@ -107,19 +220,95 @@ details[open] > summary::before {
 }
 
 details[open] > summary {
-    margin-bottom: 0.75rem;
+    margin-bottom: var(--step);
 }
 
 h3 {
-    margin: 1rem 0 0.5rem;
+    margin: calc(var(--step) * 1.5) 0 var(--step);
     font-size: 0.9rem;
     color: var(--muted);
 }
 
-.settings-group + .settings-group {
+/* -- collapsible sensor blocks ---------------------------------------- */
+
+/* Four sensors, each with a dozen knobs, is more than a phone screen can hold
+   without becoming a wall. Collapsed, this is a list of names and switches;
+   the knobs are one tap away and the on/off — the only one touched often —
+   never is. */
+.config-list {
+    display: flex;
+    flex-direction: column;
+    gap: calc(var(--step) * 0.5);
+}
+
+.config {
+    background: var(--surface-strong);
+    border-radius: 10px;
+    overflow: hidden;
+}
+
+.config-head {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: var(--step);
+    padding: 0 var(--step);
+    min-height: var(--touch);
+}
+
+.config-title {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    justify-content: center;
+    min-width: 0;
+    align-self: stretch;
+    cursor: pointer;
+}
+
+.config-title b {
+    font-size: 0.92rem;
+    font-weight: 600;
+}
+
+.config-summary {
+    color: var(--faint);
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* The disclosure is its own button rather than a <summary> wrapping the
+   checkbox: a click on a checkbox inside a summary toggles both. */
+.config-toggle {
+    background: none;
+    color: var(--faint);
+    min-width: var(--touch);
+    min-height: var(--touch);
+    padding: 0;
+    font-size: 0.8rem;
+}
+
+.config-toggle::before {
+    content: "▸";
+    display: inline-block;
+    transition: transform 0.15s;
+}
+
+.config.open .config-toggle::before {
+    transform: rotate(90deg);
+}
+
+.config-body {
+    padding: 0 var(--step) var(--step);
     border-top: 1px solid var(--hairline);
-    margin-top: 1rem;
-    padding-top: 0.25rem;
+}
+
+.config-body .field-pair:first-child,
+.config-body .row:first-child {
+    margin-top: var(--step);
 }
 
 /* -- controls --------------------------------------------------------- */
@@ -127,12 +316,55 @@ h3 {
 .row {
     display: flex;
     align-items: center;
-    gap: 0.6rem;
-    margin: 0.5rem 0;
+    gap: var(--step);
+    margin: var(--step) 0;
 }
 
 .row.wrap {
     flex-wrap: wrap;
+}
+
+/* A label column and a control column. Left to a flex row, every select was
+   only as wide as its longest option, so a stack of them came out ragged —
+   which is most of what made the settings tab look like a pile. */
+.field {
+    display: grid;
+    grid-template-columns: minmax(6rem, 11rem) 1fr;
+    align-items: center;
+    gap: var(--step);
+    margin: calc(var(--step) * 0.75) 0;
+}
+
+.field > label {
+    white-space: normal;
+}
+
+.field > input,
+.field > select,
+.field > button {
+    width: 100%;
+    min-width: 0;
+}
+
+/* Two of these side by side — width/height, frame rate/IMU rate — with the
+   label above rather than beside, because two label columns will not fit. */
+.field-pair {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--step);
+    margin: calc(var(--step) * 0.75) 0;
+}
+
+.field-pair label {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 0.76rem;
+    color: var(--faint);
+}
+
+.field-pair input {
+    width: 100%;
 }
 
 label {
@@ -146,10 +378,11 @@ input[type="password"],
 input[type="number"],
 select {
     background: var(--surface-strong);
-    border: 1px solid var(--hairline);
-    border-radius: 8px;
+    border: 1px solid transparent;
+    border-radius: 9px;
     color: var(--text);
-    padding: 0.4rem 0.55rem;
+    padding: 0 calc(var(--step) * 1.25);
+    height: 36px;
     font: inherit;
     font-size: 0.9rem;
     min-width: 0;
@@ -164,6 +397,11 @@ input[type="number"] {
     width: 6rem;
 }
 
+input[type="file"] {
+    color: var(--muted);
+    font-size: 0.82rem;
+}
+
 input:focus,
 select:focus,
 button:focus-visible {
@@ -174,17 +412,65 @@ button:focus-visible {
 .check {
     display: inline-flex;
     align-items: center;
-    gap: 0.35rem;
+    gap: calc(var(--step) * 0.5);
+    min-height: 32px;
     cursor: pointer;
+}
+
+/* Every boolean is an iOS-style switch. The input stays a real checkbox, so
+   nothing in app.js changes — only the drawing does. */
+.check input {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 40px;
+    height: 24px;
+    margin: 0;
+    flex: none;
+    position: relative;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.22);
+    transition: background 0.15s;
+    cursor: pointer;
+}
+
+.check input::before {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+    transition: left 0.15s;
+}
+
+.check input:checked {
+    background: var(--good);
+}
+
+.check input:checked::before {
+    left: 18px;
+}
+
+.check input:focus {
+    outline: none;
+}
+
+.check input:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
 }
 
 button,
 a.button {
     background: var(--accent);
     border: none;
-    border-radius: 8px;
+    border-radius: 10px;
     color: white;
-    padding: 0.45rem 0.9rem;
+    padding: 0 calc(var(--step) * 1.75);
+    min-height: var(--touch);
     font: inherit;
     font-weight: 600;
     cursor: pointer;
@@ -193,13 +479,13 @@ a.button {
 /* A download has to be a real link so the browser streams it to disk rather
    than through fetch, which would buffer a gigabyte in the tab. */
 a.button {
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
     text-decoration: none;
-    margin-right: 0.4rem;
 }
 
 button:disabled {
-    opacity: 0.5;
+    opacity: 0.4;
     cursor: default;
 }
 
@@ -207,13 +493,17 @@ button.secondary,
 a.button.secondary {
     background: var(--surface-strong);
     color: var(--text);
-    border: 1px solid var(--hairline);
     font-weight: 500;
+}
+
+button.danger {
+    color: var(--bad);
 }
 
 button.record {
     background: var(--good);
     color: #06210c;
+    min-width: 9.5rem;
 }
 
 button.record.recording {
@@ -221,23 +511,43 @@ button.record.recording {
     color: white;
 }
 
+/* A chosen path is data, not a caption, so it gets the monospace treatment and
+   an ellipsis rather than wrapping a settings row onto three lines. */
+button.path-button {
+    justify-content: flex-start;
+    text-align: left;
+    min-height: 36px;
+    padding: 0 calc(var(--step) * 1.25);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.82rem;
+    font-weight: 400;
+    display: flex;
+    align-items: center;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
 /* -- pills and stats -------------------------------------------------- */
 
 .pill {
     display: inline-block;
-    padding: 0.15rem 0.55rem;
+    padding: 2px calc(var(--step) * 0.9);
     border-radius: 999px;
-    font-size: 0.75rem;
+    font-size: 0.72rem;
     background: var(--surface-strong);
     color: var(--muted);
-    border: 1px solid var(--hairline);
     white-space: nowrap;
 }
 
 .pill-good {
     background: rgba(50, 215, 75, 0.16);
     color: var(--good);
-    border-color: transparent;
+}
+
+.pill-bad {
+    background: rgba(255, 69, 58, 0.16);
+    color: var(--bad);
 }
 
 .pill-idle {
@@ -247,8 +557,8 @@ button.record.recording {
 .stats {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.5rem 1.5rem;
-    margin: 0.75rem 0 0;
+    gap: var(--step) calc(var(--step) * 3);
+    margin: var(--step) 0 0;
 }
 
 .stats div {
@@ -257,7 +567,7 @@ button.record.recording {
 }
 
 .stats dt {
-    font-size: 0.72rem;
+    font-size: 0.7rem;
     text-transform: uppercase;
     letter-spacing: 0.05em;
     color: var(--faint);
@@ -278,23 +588,53 @@ button.record.recording {
 }
 
 .warning {
-    margin: 0 0 0.75rem;
-    padding: 0.5rem 0.7rem;
-    border-radius: 8px;
+    margin: 0 0 var(--step);
+    padding: calc(var(--step) * 0.75) var(--step);
+    border-radius: 10px;
     background: rgba(255, 214, 10, 0.13);
-    border: 1px solid rgba(255, 214, 10, 0.35);
     color: var(--warn);
     font-size: 0.85rem;
 }
 
+.notice {
+    margin: 0 0 var(--step);
+    padding: calc(var(--step) * 0.75) var(--step);
+    border-radius: 10px;
+    background: rgba(10, 132, 255, 0.14);
+    color: #7ab8ff;
+    font-size: 0.85rem;
+}
+
+/* A slow transfer is still a running transfer, so the line keeps its place and
+   changes colour rather than turning into an error. */
+.notice.notice-warn {
+    background: rgba(255, 214, 10, 0.13);
+    color: var(--warn);
+}
+
+.warning-inline {
+    font-weight: 600;
+}
+
 .hint {
-    margin: 0.4rem 0;
+    margin: calc(var(--step) * 0.5) 0;
     color: var(--faint);
     font-size: 0.8rem;
 }
 
+/* Explanations that are worth having but not worth reading twice. */
+.note > summary {
+    color: var(--faint);
+    font-size: 0.78rem;
+    min-height: var(--touch);
+}
+
+.note > .hint {
+    margin: 0 0 calc(var(--step) * 0.5);
+}
+
 .path {
-    margin: 0.6rem 0 0;
+    margin: var(--step) 0 0;
     color: var(--faint);
     font-size: 0.78rem;
     word-break: break-all;
@@ -306,22 +646,28 @@ button.record.recording {
 .sensor-list {
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: calc(var(--step) * 0.75);
 }
 
 .sensor {
     display: grid;
     grid-template-columns: 6rem auto 1fr auto;
     align-items: center;
-    gap: 0.75rem;
-    padding: 0.55rem 0.7rem;
+    gap: var(--step);
+    padding: var(--step);
     background: var(--surface-strong);
-    border-radius: 8px;
+    border-radius: 10px;
 }
 
 .sensor-actions {
     display: flex;
-    gap: 0.4rem;
+    gap: calc(var(--step) * 0.5);
+}
+
+.sensor-actions button {
+    min-height: 34px;
+    padding: 0 var(--step);
+    font-size: 0.82rem;
 }
 
 .sensor .detail {
@@ -335,10 +681,10 @@ button.record.recording {
 /* -- preview ---------------------------------------------------------- */
 
 .preview-frame {
-    margin-top: 0.6rem;
+    margin-top: var(--step);
     background: #000;
-    border-radius: 8px;
-    min-height: 180px;
+    border-radius: 10px;
+    min-height: 200px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -355,39 +701,136 @@ button.record.recording {
     font-size: 0.85rem;
 }
 
-/* -- monitor ---------------------------------------------------------- */
+/* -- charts ----------------------------------------------------------- */
+
+.charts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+    gap: var(--step);
+}
+
+.chart {
+    margin: 0;
+    padding: var(--step);
+    background: var(--surface-strong);
+    border-radius: 10px;
+}
+
+.chart figcaption {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--faint);
+}
+
+.chart figcaption b {
+    font-size: 1.25rem;
+    font-weight: 600;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+}
+
+.chart svg {
+    display: block;
+    width: 100%;
+    height: 64px;
+    margin-top: calc(var(--step) * 0.5);
+    overflow: visible;
+}
+
+.chart-line {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 1.5;
+    stroke-linejoin: round;
+    vector-effect: non-scaling-stroke;
+}
+
+.chart-area {
+    fill: rgba(10, 132, 255, 0.16);
+    stroke: none;
+}
+
+.chart[data-chart="temperature"] .chart-line {
+    stroke: #ff9f0a;
+}
+
+.chart[data-chart="temperature"] .chart-area {
+    fill: rgba(255, 159, 10, 0.15);
+}
+
+.chart[data-chart="memory"] .chart-line {
+    stroke: #bf5af2;
+}
+
+.chart[data-chart="memory"] .chart-area {
+    fill: rgba(191, 90, 242, 0.15);
+}
+
+.chart-foot {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 2px;
+    font-size: 0.7rem;
+    color: var(--faint);
+    font-variant-numeric: tabular-nums;
+}
+
+/* -- cores ------------------------------------------------------------ */
 
 .cores {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    margin: 0.75rem 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+    gap: calc(var(--step) * 0.75) calc(var(--step) * 2);
 }
 
 .core {
-    flex: 1 1 3rem;
+    display: grid;
+    grid-template-columns: 2.6rem 1fr 2.6rem;
+    align-items: center;
+    gap: calc(var(--step) * 0.75);
+    font-size: 0.75rem;
+    color: var(--faint);
+}
+
+.core-value {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+}
+
+.core-track {
     height: 6px;
     background: var(--surface-strong);
     border-radius: 3px;
     overflow: hidden;
 }
 
-.core span {
+.core-fill {
     display: block;
     height: 100%;
     width: 0;
     background: var(--accent);
-    transition: width 0.2s linear;
+    border-radius: 3px;
+    /* Matched to the sampler's cadence, so a bar glides between readings rather
+       than stepping, which is most of what made them look like they flickered. */
+    transition: width 0.5s linear;
 }
 
-.core span.hot {
+.core-fill.hot {
     background: var(--bad);
 }
+
+/* -- tables ----------------------------------------------------------- */
 
 table.streams {
     width: 100%;
     border-collapse: collapse;
-    margin-top: 0.5rem;
     font-size: 0.85rem;
 }
 
@@ -395,41 +838,183 @@ table.streams th {
     text-align: left;
     color: var(--faint);
     font-weight: 500;
-    font-size: 0.72rem;
+    font-size: 0.7rem;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    padding-bottom: 0.3rem;
+    padding-bottom: calc(var(--step) * 0.5);
+    white-space: nowrap;
 }
 
 table.streams td {
-    padding: 0.3rem 0.5rem 0.3rem 0;
+    padding: calc(var(--step) * 0.6) var(--step) calc(var(--step) * 0.6) 0;
     border-top: 1px solid var(--hairline);
     font-variant-numeric: tabular-nums;
+    white-space: nowrap;
 }
 
-table.streams td:first-child {
+table.streams td.topic {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 0.8rem;
+    white-space: normal;
+}
+
+/* The toggle column is the one thing here that is touched rather than read, so
+   it is pinned to the right edge where a thumb reaches it. */
+table.streams td.switch,
+table.streams th:last-child {
+    text-align: right;
+    padding-right: 0;
+    width: 1%;
+}
+
+/* A dozen topics with long names overflow a phone in both directions. Capping
+   the height keeps the card a fixed size so the page below it does not jump
+   as topics appear, and `sticky` keeps the header readable while scrolling. */
+.table-scroll {
+    overflow: auto;
+    max-height: 22rem;
+    margin: var(--step) 0 0;
+    overscroll-behavior: contain;
+}
+
+.table-scroll table.streams th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--surface);
+    padding-top: calc(var(--step) * 0.4);
+}
+
+.stream-switches {
+    gap: var(--step);
+    font-size: 0.8rem;
+    color: var(--faint);
+}
+
+/* A label the screen reader announces and the eye does not, for the stream
+   rows, where the topic beside the box is already the visible label. */
+.sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
 }
 
 td.empty {
     color: var(--faint);
     text-align: center;
-    padding: 0.75rem 0;
+    padding: var(--step) 0;
+}
+
+/* -- recordings ------------------------------------------------------- */
+
+.file-list {
+    display: flex;
+    flex-direction: column;
+    gap: calc(var(--step) * 0.5);
+}
+
+/* Five buttons per recording is four too many on a phone, and they all read as
+   equally important. The row itself is the control now; the actions live in a
+   sheet where each one can carry a sentence saying what it does. */
+.file {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: var(--step);
+    width: 100%;
+    padding: calc(var(--step) * 0.75) var(--step);
+    min-height: var(--touch);
+    background: var(--surface-strong);
+    border-radius: 10px;
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.file:active {
+    background: rgba(255, 255, 255, 0.14);
+}
+
+.file-head {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.file-name {
+    font-weight: 600;
+    font-size: 0.9rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.file-meta {
+    color: var(--faint);
+    font-size: 0.76rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.file-chevron {
+    color: var(--faint);
+    font-size: 0.9rem;
+}
+
+/* -- action sheets ---------------------------------------------------- */
+
+.actions {
+    display: flex;
+    flex-direction: column;
+    gap: calc(var(--step) * 0.5);
+}
+
+.action {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    width: 100%;
+    text-align: left;
+    padding: calc(var(--step) * 0.9) calc(var(--step) * 1.25);
+    min-height: var(--touch);
+    font-weight: 600;
+    font-size: 0.92rem;
+}
+
+/* `a.button` centres its content and pads wider, and being type+class it
+   outranks `.action`, so the link row needs the same declarations again. */
+a.button.action {
+    display: flex;
+    align-items: flex-start;
+    padding: calc(var(--step) * 0.9) calc(var(--step) * 1.25);
+}
+
+.action-detail {
+    color: var(--faint);
+    font-size: 0.76rem;
+    font-weight: 400;
+    white-space: normal;
+}
+
+.action.danger .action-detail {
+    color: rgba(255, 69, 58, 0.72);
 }
 
 /* -- urdf ------------------------------------------------------------- */
 
 .problems {
-    margin: 0.5rem 0;
+    margin: var(--step) 0;
     padding-left: 1.1rem;
     color: var(--warn);
     font-size: 0.82rem;
 }
 
 .urdf-viewer {
-    margin-top: 0.75rem;
-    border-radius: 8px;
+    margin-top: var(--step);
+    border-radius: 10px;
     overflow: hidden;
     background: #11141a;
     color: var(--faint);
@@ -444,10 +1029,10 @@ td.empty {
 /* -- terminal --------------------------------------------------------- */
 
 .terminal-output {
-    margin: 0.75rem 0 0;
-    padding: 0.7rem;
+    margin: var(--step) 0 0;
+    padding: var(--step);
     background: #000;
-    border-radius: 8px;
+    border-radius: 10px;
     color: #d0d6dd;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 0.8rem;
@@ -458,25 +1043,121 @@ td.empty {
     min-height: 2.5rem;
 }
 
+/* -- sheets ----------------------------------------------------------- */
+
+/* Everything that is a detour — a summary, a destination, a password — arrives
+   as a sheet over the page, so dismissing it puts the operator back exactly
+   where they were rather than on a page they have to navigate out of. */
+.scrim {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(2px);
+    z-index: 30;
+}
+
+.sheet {
+    position: fixed;
+    left: 50%;
+    bottom: 0;
+    transform: translateX(-50%);
+    width: min(46rem, 100%);
+    max-height: 88vh;
+    display: flex;
+    flex-direction: column;
+    background: #1c1e23;
+    border-radius: 18px 18px 0 0;
+    z-index: 31;
+    animation: sheet-in 0.22s ease-out;
+}
+
+@keyframes sheet-in {
+    from { transform: translate(-50%, 20px); opacity: 0; }
+    to { transform: translate(-50%, 0); opacity: 1; }
+}
+
+.sheet-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--step);
+    padding: var(--step) calc(var(--step) * 1.5);
+    border-bottom: 1px solid var(--hairline);
+}
+
+.sheet-bar h2 {
+    margin: 0;
+    font-size: 1rem;
+    font-weight: 600;
+    word-break: break-all;
+}
+
+.sheet-bar button {
+    min-height: 34px;
+    padding: 0 var(--step);
+    flex: none;
+}
+
+.sheet-body {
+    padding: calc(var(--step) * 1.5);
+    padding-bottom: calc(var(--step) * 1.5 + env(safe-area-inset-bottom));
+    overflow: auto;
+}
+
+.sheet-body > button {
+    width: 100%;
+    margin-top: var(--step);
+}
+
+.picker {
+    display: flex;
+    flex-direction: column;
+    gap: calc(var(--step) * 0.5);
+    margin: var(--step) 0;
+}
+
+.picker-item {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    text-align: left;
+    padding: calc(var(--step) * 0.75) var(--step);
+    min-height: var(--touch);
+}
+
+.picker-detail {
+    color: var(--faint);
+    font-size: 0.76rem;
+    font-weight: 400;
+}
+
+.frame-list {
+    margin: var(--step) 0 0;
+    padding-left: 1.1rem;
+    color: var(--muted);
+    font-size: 0.8rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
 /* -- toast ------------------------------------------------------------ */
 
 .toast {
     position: fixed;
     left: 50%;
-    bottom: 1.25rem;
+    bottom: calc(var(--step) * 1.5 + env(safe-area-inset-bottom));
     transform: translateX(-50%);
-    background: var(--surface-strong);
+    background: rgba(40, 42, 48, 0.95);
     backdrop-filter: blur(12px);
-    border: 1px solid var(--hairline);
     border-radius: 999px;
-    padding: 0.5rem 1rem;
+    padding: calc(var(--step) * 0.75) calc(var(--step) * 2);
     font-size: 0.85rem;
-    z-index: 20;
+    z-index: 40;
     max-width: 90vw;
+    text-align: center;
 }
 
 .toast-bad {
-    border-color: var(--bad);
     color: var(--bad);
 }
 
@@ -493,5 +1174,18 @@ body.is-recording .bar {
     .sensor .detail {
         grid-column: 1 / -1;
         white-space: normal;
+    }
+
+    .tab {
+        font-size: 0.68rem;
+    }
+
+    .field {
+        grid-template-columns: minmax(5.5rem, 9rem) 1fr;
+    }
+
+    button.record {
+        min-width: 0;
+        padding: 0 var(--step);
     }
 }

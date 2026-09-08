@@ -19,10 +19,14 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::access::{self, Access};
+use crate::convert;
 use crate::hub::{Hub, Settings};
 use crate::privileged::{self, Secret};
 use crate::record;
 use crate::sensors::SensorKind;
+use crate::storage;
+use crate::sysmon;
 
 /// The monitor's tick. Jeff asked for about 5 Hz specifically so the readout
 /// does not itself become a measurable load on a Pi.
@@ -32,24 +36,91 @@ const MONITOR_INTERVAL: Duration = Duration::from_millis(200);
 /// newest frame and a client that fell behind should skip to it.
 const PREVIEW_POLL: Duration = Duration::from_millis(20);
 
+/// A running or finished depth conversion. Only one is kept: the Pi is already
+/// thermally limited, so two at once would both finish later than two run back to
+/// back, and would make a recording running alongside them drop frames.
+struct Conversion {
+    source: String,
+    output: String,
+    progress: Arc<convert::Progress>,
+    /// `None` while it runs, then the report or the reason it stopped.
+    outcome: Option<Result<convert::Report, String>>,
+}
+
+/// A running or finished move or copy of a recording onto another volume.
+struct Move {
+    /// "move" or "copy", so the page can say which one is running.
+    kind: &'static str,
+    source: String,
+    destination: String,
+    started: std::time::Instant,
+    progress: Arc<storage::Progress>,
+    outcome: Option<Result<String, String>>,
+}
+
+/// About what a USB 2.0 link sustains in practice: 480 Mbit/s nominal, and
+/// nothing like that once protocol overhead is paid. Below this the operator is
+/// on a 2.0 port, a 2.0 cable or a hub that has quietly downgraded the link, and
+/// a recording that would take three minutes takes half an hour — worth saying
+/// while there is still time to move the plug.
+const USB2_BYTES_PER_SECOND: f64 = 40_000_000.0;
+
+/// Enough of a transfer to judge its speed by. The first seconds are dominated
+/// by the write cache absorbing the head of the file, which reads as far faster
+/// than the drive can really go and would make the warning flap.
+const SPEED_SETTLES_AFTER: (f64, u64) = (4.0, 64 << 20);
+
 #[derive(Clone)]
 pub struct AppState {
     pub hub: Arc<Hub>,
     /// The sudo password, held in memory for this process only. Never
     /// serialised, never written to the settings file, never logged.
     password: Arc<Mutex<Secret>>,
+    conversion: Arc<Mutex<Option<Conversion>>>,
+    transfer: Arc<Mutex<Option<Move>>>,
+    /// The password guarding the system commands. Nothing to do with the sudo
+    /// password above: that one is a credential this program *uses*, this one
+    /// decides who may ask it to.
+    access: Arc<Mutex<Access>>,
 }
 
 impl AppState {
     pub fn new(hub: Arc<Hub>) -> Self {
+        // Beside the settings, because the two are the same kind of thing: state
+        // this install keeps across restarts.
+        let access = hub.settings_file().with_file_name("lite_record_access.json");
         AppState {
             hub,
             password: Arc::new(Mutex::new(Secret::default())),
+            conversion: Arc::new(Mutex::new(None)),
+            transfer: Arc::new(Mutex::new(None)),
+            access: Arc::new(Mutex::new(Access::load(&access))),
         }
     }
 
     fn password(&self) -> Secret {
         self.password.lock().unwrap().clone()
+    }
+
+    /// Whether this request may run a system command. Returns the 401 to send
+    /// back if not, so a handler is one `if let` away from being guarded.
+    fn refuse_unless_allowed(&self, headers: &axum::http::HeaderMap) -> Option<Response> {
+        let offered = headers
+            .get(access::HEADER)
+            .and_then(|value| value.to_str().ok());
+        if self.access.lock().unwrap().allows(offered) {
+            return None;
+        }
+        Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(json!({
+                    "error": "this needs the operator password",
+                    "password_required": true,
+                })),
+            )
+                .into_response(),
+        )
     }
 }
 
@@ -64,12 +135,22 @@ pub fn router(state: AppState) -> Router {
         .route("/api/recordings", get(recordings))
         .route("/api/recordings/{name}", delete(remove_recording))
         .route("/api/recordings/{name}/download", get(download_recording))
+        .route("/api/recordings/{name}/convert", post(convert_recording))
+        .route("/api/recordings/{name}/summary", get(recording_summary))
+        .route("/api/recordings/{name}/move", post(move_recording))
+        .route("/api/recordings/{name}/copy", post(copy_recording))
+        .route("/api/move", get(move_status))
+        .route("/api/storage/volumes", get(storage_volumes))
+        .route("/api/storage/browse", get(storage_browse))
+        .route("/api/storage/folder", post(storage_create_folder))
+        .route("/api/convert", get(conversion_status))
         .route("/api/record/start", post(start_recording))
         .route("/api/record/stop", post(stop_recording))
         .route("/api/sensors/{kind}/{action}", post(sensor_action))
         .route("/api/urdf", get(get_urdf).put(put_urdf))
         .route("/api/urdf/inspect", post(inspect_urdf))
         .route("/api/password", post(set_password))
+        .route("/api/access", get(access_state).post(set_access))
         .route("/api/terminal", post(terminal))
         .route("/api/usb/mount", post(mount_usb))
         .route("/api/network/mid360", post(configure_lidar_network))
@@ -135,6 +216,9 @@ fn status_payload(state: &AppState) -> serde_json::Value {
         "recording": state.hub.recording_status(),
         "streams": state.hub.stream_stats(),
         "preview_topics": state.hub.preview_topics(),
+        // Which settings field switches each topic off, so a stream row can
+        // carry a working toggle without the page knowing the topic scheme.
+        "topic_settings": state.hub.topic_settings(),
         // Not the same as settings.preview_topic: with nothing chosen the hub
         // picks one, and the dropdown has to show what is really being encoded.
         "preview_topic": state.hub.preview_topic(),
@@ -142,6 +226,7 @@ fn status_payload(state: &AppState) -> serde_json::Value {
         "removable_mounts": privileged::likely_removable_mounts(),
         "is_root": privileged::is_root(),
         "has_password": !state.password().is_empty(),
+        "password_required": state.access.lock().unwrap().is_set(),
     })
 }
 
@@ -227,6 +312,276 @@ async fn remove_recording(Path(name): Path<String>, State(state): State<AppState
         Ok(()) => axum::Json(json!({ "ok": true })).into_response(),
         Err(error) => bad_request(error),
     }
+}
+
+/// Per-topic counts, rates and stalls. Reading the file's indexes takes a
+/// quarter of a second for a gigabyte, but it is still file I/O, so it runs off
+/// the runtime's worker threads.
+async fn recording_summary(Path(name): Path<String>, State(state): State<AppState>) -> Response {
+    let directory = state.hub.settings().record_dir;
+    let path = match record::resolve(&directory, &name) {
+        Ok(path) => path,
+        Err(error) => return bad_request(error),
+    };
+    match tokio::task::spawn_blocking(move || crate::summary::summarise(&path)).await {
+        Ok(Ok(summary)) => axum::Json(summary).into_response(),
+        Ok(Err(error)) => bad_request(format!("{error:#}")),
+        Err(error) => bad_request(error),
+    }
+}
+
+async fn storage_volumes() -> Response {
+    axum::Json(json!({ "volumes": storage::volumes() })).into_response()
+}
+
+#[derive(Deserialize)]
+struct BrowseQuery {
+    path: String,
+}
+
+async fn storage_browse(
+    axum::extract::Query(query): axum::extract::Query<BrowseQuery>,
+) -> Response {
+    match storage::browse(std::path::Path::new(&query.path)) {
+        Ok(listing) => axum::Json(listing).into_response(),
+        Err(error) => bad_request(format!("{error:#}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct FolderRequest {
+    parent: String,
+    name: String,
+}
+
+async fn storage_create_folder(axum::Json(request): axum::Json<FolderRequest>) -> Response {
+    match storage::create_folder(std::path::Path::new(&request.parent), &request.name) {
+        Ok(path) => axum::Json(json!({ "path": path })).into_response(),
+        Err(error) => bad_request(format!("{error:#}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct MoveRequest {
+    destination: String,
+}
+
+/// Moves a recording onto another volume. Answers as soon as the copy starts;
+/// `/api/move` reports how far it has got, because a gigabyte onto a USB stick
+/// outlasts any sensible request timeout.
+async fn move_recording(
+    Path(name): Path<String>,
+    State(state): State<AppState>,
+    axum::Json(request): axum::Json<MoveRequest>,
+) -> Response {
+    start_transfer(state, name, request.destination, "move").await
+}
+
+/// Copies a recording onto another volume, leaving the original in place.
+async fn copy_recording(
+    Path(name): Path<String>,
+    State(state): State<AppState>,
+    axum::Json(request): axum::Json<MoveRequest>,
+) -> Response {
+    start_transfer(state, name, request.destination, "copy").await
+}
+
+async fn start_transfer(
+    state: AppState,
+    name: String,
+    destination: String,
+    kind: &'static str,
+) -> Response {
+    let directory = state.hub.settings().record_dir;
+    let source = match record::resolve(&directory, &name) {
+        Ok(path) => path,
+        Err(error) => return bad_request(error),
+    };
+    if is_being_recorded(&state, &source) {
+        return bad_request("that file is being recorded right now; stop the recording first");
+    }
+    if !source.exists() {
+        return bad_request(format!("there is no recording called {name}"));
+    }
+    // Only somewhere the picker would have offered: this endpoint must not
+    // become a way to write a gigabyte anywhere on the filesystem.
+    let destination = match storage::browse(std::path::Path::new(&destination)) {
+        Ok(listing) => listing.path,
+        Err(error) => return bad_request(format!("{error:#}")),
+    };
+
+    let progress = Arc::new(storage::Progress::default());
+    {
+        let mut slot = state.transfer.lock().unwrap();
+        if let Some(job) = slot.as_ref().filter(|job| job.outcome.is_none()) {
+            return bad_request(format!("a {} is already running", job.kind));
+        }
+        *slot = Some(Move {
+            kind,
+            source: name.clone(),
+            destination: destination.to_string_lossy().into_owned(),
+            started: std::time::Instant::now(),
+            progress: Arc::clone(&progress),
+            outcome: None,
+        });
+    }
+
+    let slot = Arc::clone(&state.transfer);
+    let running = Arc::clone(&progress);
+    tokio::task::spawn_blocking(move || {
+        let placed = match kind {
+            "copy" => storage::copy_recording(&source, &destination, &running),
+            _ => storage::move_recording(&source, &destination, &running),
+        };
+        let outcome = placed
+            .map(|path| path.to_string_lossy().into_owned())
+            .map_err(|error| format!("{error:#}"));
+        running.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(job) = slot.lock().unwrap().as_mut() {
+            job.outcome = Some(outcome);
+        }
+    });
+
+    axum::Json(json!({ "started": true })).into_response()
+}
+
+async fn move_status(State(state): State<AppState>) -> Response {
+    let slot = state.transfer.lock().unwrap();
+    let Some(job) = slot.as_ref() else {
+        return axum::Json(json!({ "running": false })).into_response();
+    };
+    let relaxed = std::sync::atomic::Ordering::Relaxed;
+    let copied = job.progress.copied_bytes.load(relaxed);
+    let verified = job.progress.verified_bytes.load(relaxed);
+    let total = job.progress.total_bytes.load(relaxed);
+    // Reading the copy back is a second pass over the same bytes, so it is half
+    // the work and belongs in the bar rather than looking like a stall at 100%.
+    let passes = if job.progress.will_verify.load(relaxed) {
+        2
+    } else {
+        1
+    };
+    let (rate, eta) = transfer_speed(job.started.elapsed().as_secs_f64(), copied + verified, total * passes);
+    axum::Json(json!({
+        "running": job.outcome.is_none(),
+        "source": job.source,
+        "destination": job.destination,
+        "copied_bytes": copied,
+        "verified_bytes": verified,
+        "verifying": job.progress.will_verify.load(relaxed) && copied >= total && total > 0,
+        "total_bytes": total,
+        "total_work_bytes": total * passes,
+        "bytes_per_second": rate,
+        "eta_seconds": eta,
+        "slow_link": rate.is_some_and(|rate| rate < USB2_BYTES_PER_SECOND),
+        "kind": job.kind,
+        "moved_to": job.outcome.as_ref().and_then(|outcome| outcome.as_ref().ok()),
+        "error": job.outcome.as_ref().and_then(|outcome| outcome.as_ref().err()),
+    }))
+    .into_response()
+}
+
+/// Bytes per second and seconds remaining, or `None` until the transfer has run
+/// long enough for either to mean anything.
+fn transfer_speed(elapsed: f64, done: u64, work: u64) -> (Option<f64>, Option<f64>) {
+    let (least_seconds, least_bytes) = SPEED_SETTLES_AFTER;
+    if elapsed < least_seconds || done < least_bytes {
+        return (None, None);
+    }
+    let rate = done as f64 / elapsed;
+    if rate <= 0.0 {
+        return (None, None);
+    }
+    (Some(rate), Some(work.saturating_sub(done) as f64 / rate))
+}
+
+/// What conversions were named before they became in-place. Such a file is
+/// already raw, so converting it again would only find nothing to do.
+const VIEWABLE_SUFFIX: &str = ".viewable.mcap";
+
+/// Raw 16-bit depth is roughly 1.6x the size of the jxl it replaces once mcap's
+/// zstd has had it, and the temporary copy exists alongside the original until
+/// the swap. Refusing up front beats filling the card and losing the recording
+/// that is still being written.
+const SPACE_MARGIN: u64 = 2;
+
+/// Decodes the jxl depth stream into raw pixels so Foxglove will draw it,
+/// replacing the file in place once every frame has decoded. Answers as soon as
+/// the job starts; `/api/convert` reports how far it has got.
+async fn convert_recording(Path(name): Path<String>, State(state): State<AppState>) -> Response {
+    let directory = state.hub.settings().record_dir;
+    let source = match record::resolve(&directory, &name) {
+        Ok(path) => path,
+        Err(error) => return bad_request(error),
+    };
+    if is_being_recorded(&state, &source) {
+        return bad_request("that file is being recorded right now; stop the recording first");
+    }
+    if name.ends_with(VIEWABLE_SUFFIX) {
+        return bad_request("that file is already a conversion");
+    }
+
+    let Ok(metadata) = source.metadata() else {
+        return bad_request(format!("there is no recording called {name}"));
+    };
+    let needed = metadata.len() * SPACE_MARGIN;
+    if let Some(free) = sysmon::free_bytes(&directory) {
+        if free < needed {
+            return bad_request(format!(
+                "not enough room: the conversion needs about {} MB and {} MB are free",
+                needed / 1_000_000,
+                free / 1_000_000
+            ));
+        }
+    }
+
+    let progress = Arc::new(convert::Progress::default());
+    {
+        let mut slot = state.conversion.lock().unwrap();
+        if slot.as_ref().is_some_and(|job| job.outcome.is_none()) {
+            return bad_request("a conversion is already running");
+        }
+        *slot = Some(Conversion {
+            source: name.clone(),
+            output: name.clone(),
+            progress: Arc::clone(&progress),
+            outcome: None,
+        });
+    }
+
+    let slot = Arc::clone(&state.conversion);
+    let running = Arc::clone(&progress);
+    // Blocking rather than async: the work is libjxl and zstd on a worker thread,
+    // and holding a tokio runtime thread for minutes would stall the monitor.
+    tokio::task::spawn_blocking(move || {
+        let outcome =
+            convert::depth_in_place(&source, &running).map_err(|error| error.to_string());
+        if let Some(job) = slot.lock().unwrap().as_mut() {
+            job.outcome = Some(outcome);
+        }
+    });
+
+    axum::Json(json!({ "started": true })).into_response()
+}
+
+async fn conversion_status(State(state): State<AppState>) -> Response {
+    let slot = state.conversion.lock().unwrap();
+    let Some(job) = slot.as_ref() else {
+        return axum::Json(json!({ "running": false })).into_response();
+    };
+    axum::Json(json!({
+        "running": job.outcome.is_none(),
+        "source": job.source,
+        "output": job.output,
+        "messages": job.progress.messages.load(std::sync::atomic::Ordering::Relaxed),
+        "bytes": job.progress.bytes.load(std::sync::atomic::Ordering::Relaxed),
+        "report": job.outcome.as_ref().and_then(|outcome| outcome.as_ref().ok()),
+        "error": job
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.as_ref().err()),
+    }))
+    .into_response()
 }
 
 /// The byte range a `Range` header asks for, as an inclusive pair clamped to the
@@ -416,10 +771,56 @@ struct PasswordBody {
 /// echoes nothing back but a boolean.
 async fn set_password(
     State(state): State<AppState>,
+    headers_in: axum::http::HeaderMap,
     axum::Json(body): axum::Json<PasswordBody>,
 ) -> Response {
+    if let Some(refusal) = state.refuse_unless_allowed(&headers_in) {
+        return refusal;
+    }
     *state.password.lock().unwrap() = Secret::new(body.password);
     axum::Json(json!({ "has_password": !state.password().is_empty() })).into_response()
+}
+
+#[derive(Deserialize)]
+struct AccessBody {
+    #[serde(default)]
+    current: Option<String>,
+    #[serde(default)]
+    next: Option<String>,
+}
+
+/// Sets, changes or removes the operator password. Sending no `next` removes it.
+///
+/// The first password can be set without one, which is the only way to set the
+/// first one; every change after that needs the password in force.
+async fn set_access(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<AccessBody>,
+) -> Response {
+    let mut access = state.access.lock().unwrap();
+    let outcome = match body.next.as_deref().filter(|next| !next.is_empty()) {
+        Some(next) => access.set(body.current.as_deref(), next),
+        None => access.clear(body.current.as_deref()),
+    };
+    match outcome {
+        Ok(()) => axum::Json(json!({ "password_required": access.is_set() })).into_response(),
+        Err(error) => bad_request(format!("{error:#}")),
+    }
+}
+
+/// Whether a password is set, and whether the one this browser cached is still
+/// the right one — which is how a page decides to ask for it before the operator
+/// presses something and gets a 401.
+async fn access_state(State(state): State<AppState>, headers_in: axum::http::HeaderMap) -> Response {
+    let access = state.access.lock().unwrap();
+    let offered = headers_in
+        .get(access::HEADER)
+        .and_then(|value| value.to_str().ok());
+    axum::Json(json!({
+        "password_required": access.is_set(),
+        "allowed": access.allows(offered),
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -431,8 +832,12 @@ struct TerminalBody {
 
 async fn terminal(
     State(state): State<AppState>,
+    headers_in: axum::http::HeaderMap,
     axum::Json(body): axum::Json<TerminalBody>,
 ) -> Response {
+    if let Some(refusal) = state.refuse_unless_allowed(&headers_in) {
+        return refusal;
+    }
     let planned = privileged::terminal_plan(&body.line, body.as_root);
     let password = state.password();
     match privileged::run(&planned, Some(&password)).await {
@@ -476,7 +881,10 @@ async fn run_plan(plan: &[privileged::Planned], password: &Secret) -> serde_json
     json!({ "steps": transcript, "failed": failed })
 }
 
-async fn mount_usb(State(state): State<AppState>) -> Response {
+async fn mount_usb(State(state): State<AppState>, headers_in: axum::http::HeaderMap) -> Response {
+    if let Some(refusal) = state.refuse_unless_allowed(&headers_in) {
+        return refusal;
+    }
     let password = state.password();
     let listing = privileged::terminal_plan("lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT,LABEL,TRAN -J", false);
     let found = match privileged::run(&listing, None).await {
@@ -510,8 +918,12 @@ struct NetworkBody {
 
 async fn configure_lidar_network(
     State(state): State<AppState>,
+    headers_in: axum::http::HeaderMap,
     axum::Json(body): axum::Json<NetworkBody>,
 ) -> Response {
+    if let Some(refusal) = state.refuse_unless_allowed(&headers_in) {
+        return refusal;
+    }
     let settings = state.hub.settings();
     let host_address = body
         .host_address
@@ -544,13 +956,22 @@ async fn run_monitor_socket(socket: WebSocket, state: AppState) {
         // A client that fell behind should get the next tick, not a burst of
         // the ones it missed, which would only push it further behind.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The charted series only grows once a second, and resending 240 points
+        // five times a second would be most of this socket's bandwidth over a
+        // handheld rig's wifi. Starting at `None` sends it on the first tick, so
+        // a page opened just now draws the last four minutes right away.
+        let mut sent_history: Option<u64> = None;
         loop {
             ticker.tick().await;
             let health = writer_state.hub.health();
             let warning = health.throttle.as_ref().and_then(crate::sysmon::Throttle::warning);
+            let history = writer_state.hub.health_history();
+            let unsent = sent_history != Some(history.revision);
+            sent_history = Some(history.revision);
             let payload = json!({
                 "health": health,
                 "warning": warning,
+                "history": unsent.then_some(history),
                 "streams": writer_state.hub.stream_stats(),
                 "recording": writer_state.hub.recording_status(),
                 "sensors": writer_state.hub.sensor_status(),
@@ -607,6 +1028,27 @@ mod tests {
     fn scratch_state() -> AppState {
         let file = std::env::temp_dir().join(format!("lite_record_web_{}.json", record::now_nanos()));
         AppState::new(Hub::new(Settings::default(), file))
+    }
+
+    #[test]
+    fn no_speed_is_reported_until_the_write_cache_has_stopped_flattering_it() {
+        // The head of a file lands at RAM speed, so an early reading would
+        // announce hundreds of MB/s and then retract it.
+        assert_eq!(transfer_speed(1.0, 1 << 30, 2 << 30), (None, None));
+        assert_eq!(transfer_speed(30.0, 1 << 20, 2 << 30), (None, None));
+    }
+
+    #[test]
+    fn the_eta_covers_the_read_back_as_well_as_the_write() {
+        // Half of a 400 MB job done in 10 s: 20 MB/s, and the 200 MB left is
+        // another 10 s. That "half" is a 200 MB file whose copy is finished and
+        // whose verification has not started.
+        let (rate, eta) = transfer_speed(10.0, 200_000_000, 400_000_000);
+        assert_eq!(rate, Some(20_000_000.0));
+        assert_eq!(eta, Some(10.0));
+        // ... and that speed is under what a USB 2.0 link manages, so the page
+        // is told to say so.
+        assert!(rate.is_some_and(|rate| rate < USB2_BYTES_PER_SECOND));
     }
 
     #[tokio::test]

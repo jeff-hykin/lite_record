@@ -134,24 +134,74 @@ impl Settings {
 }
 
 /// Every image topic the settings could preview, whether or not the camera is
-/// engaged yet. Cameras that are switched on come first, so both the dropdown
-/// and the automatic choice start at a stream that can actually produce a frame.
+/// engaged and whether or not the stream is switched on.
+///
+/// A switched-off stream stays in the list because the page's stream switch sits
+/// beside this dropdown: dropping it would mean the last stream a camera has
+/// could be switched off and never switched back on. Engaged cameras come first
+/// and switched-on streams before switched-off ones, so both the automatic
+/// choice and the operator's eye land on a stream that can produce a frame.
 fn image_topics(settings: &Settings) -> Vec<String> {
     let cameras = [&settings.realsense, &settings.orbbec, &settings.oakd];
-    let mut topics = Vec::new();
-    for listing_enabled in [true, false] {
-        for config in cameras {
-            if config.enabled != listing_enabled {
-                continue;
-            }
-            for stream in config.streams() {
-                if stream.is_image() {
-                    topics.push(config.naming.image_topic(stream));
-                }
-            }
+    let mut ranked = Vec::new();
+    for config in cameras {
+        let switched_on = config.streams();
+        for stream in [
+            StreamId::Depth,
+            StreamId::Color,
+            StreamId::InfraLeft,
+            StreamId::InfraRight,
+        ] {
+            let rank = (!config.enabled, !switched_on.contains(&stream));
+            ranked.push((rank, config.naming.image_topic(stream)));
         }
     }
-    topics
+    // Stable, so cameras and streams keep their declared order within a rank.
+    ranked.sort_by_key(|entry| entry.0);
+    ranked.into_iter().map(|(_, topic)| topic).collect()
+}
+
+/// The settings field that switches each topic off, as a dotted path the
+/// browser can write straight back into the Settings struct it already holds.
+///
+/// Built from the configs rather than parsed out of the topic string, because
+/// the prefixes are operator-editable: a rig that renames `/realsense` to
+/// `/front_cam` still has to be able to turn its colour stream off.
+fn topic_settings(settings: &Settings) -> BTreeMap<String, String> {
+    let mut paths = BTreeMap::new();
+    let cameras = [
+        ("realsense", &settings.realsense),
+        ("orbbec", &settings.orbbec),
+        ("oakd", &settings.oakd),
+    ];
+    for (kind, config) in cameras {
+        // Both infrared imagers are one switch, as they are on the device.
+        for (stream, field) in [
+            (StreamId::Depth, "depth"),
+            (StreamId::Color, "color"),
+            (StreamId::InfraLeft, "infrared"),
+            (StreamId::InfraRight, "infrared"),
+        ] {
+            let path = format!("{kind}.{field}");
+            paths.insert(config.naming.image_topic(stream), path.clone());
+            // The intrinsics go silent with the imager they describe, so the one
+            // switch has to claim both topics or camera_info looks untoggleable.
+            paths.insert(config.naming.camera_info_topic(stream), path);
+        }
+        paths.insert(
+            config.naming.topic("aligned_depth_image"),
+            format!("{kind}.align_depth_to_color"),
+        );
+        paths.insert(config.naming.imu_topic(), format!("{kind}.imu"));
+    }
+    paths.insert(settings.livox.naming.imu_topic(), "livox.imu".to_owned());
+    // The cloud is the lidar's reason for being open, so its only switch is the
+    // lidar's own.
+    paths.insert(
+        settings.livox.naming.points_topic(),
+        "livox.enabled".to_owned(),
+    );
+    paths
 }
 
 /// Which engaged sensors have to be cycled for a settings change to reach the
@@ -271,7 +321,7 @@ pub struct Hub {
     /// free, not just look free from the outside.
     record_encodes: AtomicU64,
     preview_wanted: AtomicBool,
-    health: Mutex<sysmon::Sampler>,
+    monitor: Mutex<sysmon::Monitor>,
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
@@ -321,11 +371,28 @@ impl Hub {
             preview: Mutex::new(None),
             preview_encodes: AtomicU64::new(0),
             record_encodes: AtomicU64::new(0),
-            health: Mutex::new(sysmon::Sampler::default()),
+            monitor: Mutex::new(sysmon::Monitor::default()),
             workers: Mutex::new(Vec::new()),
         });
         hub.spawn_encoders(encode_receivers);
+        hub.spawn_monitor();
         hub
+    }
+
+    /// Samples host health on its own cadence rather than whenever a browser
+    /// asks. Two browsers polling used to each halve the other's /proc/stat
+    /// measurement window, and a history that only advances while someone is
+    /// watching would leave a freshly opened page with an empty chart.
+    fn spawn_monitor(self: &Arc<Self>) {
+        let hub = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("monitor".into())
+            .spawn(move || loop {
+                std::thread::sleep(sysmon::SAMPLE_INTERVAL);
+                let record_dir = hub.settings().record_dir;
+                hub.monitor.lock().unwrap().tick(&record_dir, sysmon::SAMPLE_INTERVAL);
+            })
+            .expect("failed to spawn monitor thread");
     }
 
     fn spawn_encoders(self: &Arc<Self>, receivers: Vec<Receiver<Produced>>) {
@@ -464,11 +531,12 @@ impl Hub {
                 }
                 // A codec that cannot hold this stream's bit depth returns
                 // nothing, and the frame is stored raw rather than truncated.
+                // Both land on the one topic, as they do in dimos; the message
+                // type is what says which arrived.
                 match crate::image::compress(&image, settings.format_for(stream)) {
-                    Some(compressed) => self.offer(
-                        &format!("{topic}/compressed"),
-                        crate::cdr::compressed_image(&compressed),
-                    ),
+                    Some(compressed) => {
+                        self.offer(&topic, crate::cdr::compressed_image(&compressed))
+                    }
                     None => self.offer(&topic, crate::cdr::raw_image(&image)),
                 }
             }
@@ -500,9 +568,13 @@ impl Hub {
     /// instead of sitting on "no frames yet" with no hint a choice is needed.
     pub fn preview_topic(&self) -> Option<String> {
         let settings = self.settings.read().unwrap();
+        let mut topics = image_topics(&settings);
+        // A chosen topic no sensor publishes is ignored rather than honoured:
+        // a settings file written before a topic was renamed would otherwise
+        // hold the preview permanently blank with nothing on screen saying why.
         match &settings.preview_topic {
-            Some(chosen) => Some(chosen.clone()),
-            None => image_topics(&settings).into_iter().next(),
+            Some(chosen) if topics.iter().any(|topic| topic == chosen) => Some(chosen.clone()),
+            _ => topics.drain(..).next(),
         }
     }
 
@@ -553,18 +625,10 @@ impl Hub {
         rates
             .iter()
             .map(|(topic, counter)| {
-                // A compressed image is written under `<topic>/compressed`, so
-                // looking the tally up under the raw topic alone reported zero
-                // drops for a stream that was losing frames.
                 let writer_dropped = written
                     .as_ref()
-                    .map(|status| {
-                        [topic.clone(), format!("{topic}/compressed")]
-                            .iter()
-                            .filter_map(|name| status.topics.get(name))
-                            .map(|tally| tally.dropped)
-                            .sum()
-                    })
+                    .and_then(|status| status.topics.get(topic))
+                    .map(|tally| tally.dropped)
                     .unwrap_or(0);
                 StreamStats {
                     topic: topic.clone(),
@@ -583,9 +647,17 @@ impl Hub {
         image_topics(&self.settings())
     }
 
+    /// Topic to the settings path that switches it off. See [`topic_settings`].
+    pub fn topic_settings(&self) -> BTreeMap<String, String> {
+        topic_settings(&self.settings())
+    }
+
     pub fn health(&self) -> sysmon::Health {
-        let record_dir = self.settings().record_dir;
-        self.health.lock().unwrap().sample(&record_dir)
+        self.monitor.lock().unwrap().health()
+    }
+
+    pub fn health_history(&self) -> sysmon::History {
+        self.monitor.lock().unwrap().history()
     }
 
     // -- sensors ----------------------------------------------------------
@@ -855,18 +927,11 @@ impl Hub {
 
     /// A frame shed on the way to an encode worker never reaches the recorder,
     /// so the recorder's own tally called it zero while a third of the colour
-    /// stream was going missing. The two counts are merged here, under the name
-    /// the file actually holds, so one number answers "did this recording lose
-    /// anything".
+    /// stream was going missing. The two counts are merged here, so one number
+    /// answers "did this recording lose anything".
     fn with_shed_frames(&self, mut status: RecordingStatus) -> RecordingStatus {
         for (topic, shed) in self.shed_this_recording() {
-            let compressed = format!("{topic}/compressed");
-            let name = if status.topics.contains_key(&compressed) {
-                compressed
-            } else {
-                topic
-            };
-            status.topics.entry(name).or_default().dropped += shed;
+            status.topics.entry(topic).or_default().dropped += shed;
             status.dropped += shed;
         }
         status
@@ -1098,7 +1163,7 @@ mod tests {
             },
         );
         rates.insert(
-            "/realsense/color/image_raw".into(),
+            "/realsense/color_image".into(),
             RateCounter {
                 count: 500,
                 window_started: Some(Instant::now()),
@@ -1108,7 +1173,7 @@ mod tests {
         );
         // Latched: one message, no rate, quiet ever since. Not a fault.
         rates.insert(
-            "/realsense/color/camera_info".into(),
+            "/realsense/camera_info".into(),
             RateCounter {
                 count: 1,
                 window_started: Some(stale),
@@ -1122,7 +1187,7 @@ mod tests {
         assert!(realsense.running);
         let error = realsense.error.as_deref().expect("a dead stream is an error");
         assert!(error.contains("/realsense/imu"), "{error}");
-        assert!(!error.contains("image_raw"), "{error}");
+        assert!(!error.contains("color_image"), "{error}");
         assert!(!error.contains("camera_info"), "{error}");
         std::fs::remove_file(hub.settings_file()).ok();
     }
@@ -1152,9 +1217,80 @@ mod tests {
     fn an_explicit_preview_choice_is_never_overridden_by_the_automatic_one() {
         let hub = scratch_hub();
         let mut settings = hub.settings();
-        settings.preview_topic = Some("/whatever/image_raw".into());
+        let wanted = settings.oakd.naming.image_topic(StreamId::InfraRight);
+        settings.preview_topic = Some(wanted.clone());
         hub.update_settings(settings).unwrap();
-        assert_eq!(hub.preview_topic().as_deref(), Some("/whatever/image_raw"));
+        assert_eq!(hub.preview_topic(), Some(wanted));
+        std::fs::remove_file(hub.settings_file()).ok();
+    }
+
+    /// The UI can only offer topics that exist, so a choice naming one that does
+    /// not comes from a settings file written before a rename. Honouring it
+    /// leaves the preview permanently blank *and* has the dropdown showing a
+    /// different topic than the one the backend is matching on.
+    #[test]
+    fn a_preview_choice_no_sensor_publishes_falls_back_to_a_real_one() {
+        let hub = scratch_hub();
+        let mut settings = hub.settings();
+        settings.preview_topic = Some("/realsense/color/image_raw".into());
+        hub.update_settings(settings).unwrap();
+        let chosen = hub.preview_topic().expect("something has to be previewed");
+        assert!(hub.preview_topics().contains(&chosen), "picked {chosen}");
+        std::fs::remove_file(hub.settings_file()).ok();
+    }
+
+    /// Switching a camera's last stream off used to take the whole camera out of
+    /// the preview dropdown, and the dropdown is where the switches live, so
+    /// there was no way to switch anything back on without editing the settings
+    /// file by hand.
+    #[test]
+    fn a_camera_with_every_stream_switched_off_is_still_listed() {
+        let hub = scratch_hub();
+        let mut settings = hub.settings();
+        settings.realsense.depth = false;
+        settings.realsense.color = false;
+        settings.realsense.infrared = false;
+        settings.realsense.imu = false;
+        hub.update_settings(settings).unwrap();
+
+        let topics = hub.preview_topics();
+        assert!(topics.contains(&"/realsense/color_image".to_owned()), "{topics:?}");
+        // Still last, so the automatic choice lands on a stream that can produce.
+        let chosen = hub.preview_topic().unwrap();
+        assert!(!chosen.starts_with("/realsense"), "previewing a dead stream: {chosen}");
+        std::fs::remove_file(hub.settings_file()).ok();
+    }
+
+    /// The monitor's per-stream switch is only as good as this map: a topic the
+    /// map has no entry for gets no checkbox, so an operator who renamed a
+    /// prefix would silently lose the ability to switch that stream off.
+    #[test]
+    fn every_stream_topic_names_the_setting_that_switches_it_off() {
+        let hub = scratch_hub();
+        let mut settings = hub.settings();
+        settings.realsense.naming.topic_prefix = "/front_cam".into();
+        let paths = super::topic_settings(&settings);
+
+        assert_eq!(paths.get("/front_cam/color_image").unwrap(), "realsense.color");
+        assert_eq!(paths.get("/front_cam/camera_info").unwrap(), "realsense.color");
+        assert_eq!(paths.get("/front_cam/depth_image").unwrap(), "realsense.depth");
+        // One switch for the stereo pair, as on the device itself.
+        assert_eq!(paths.get("/front_cam/infrared_left").unwrap(), "realsense.infrared");
+        assert_eq!(paths.get("/front_cam/infrared_right").unwrap(), "realsense.infrared");
+        assert_eq!(paths.get("/front_cam/imu").unwrap(), "realsense.imu");
+        assert_eq!(paths.get("/livox/lidar").unwrap(), "livox.enabled");
+        assert_eq!(paths.get("/livox/imu").unwrap(), "livox.imu");
+
+        // Every path has to resolve in the Settings the browser writes back to,
+        // or the checkbox saves a key the server then ignores.
+        let json = serde_json::to_value(&settings).unwrap();
+        for (topic, path) in &paths {
+            let mut at = &json;
+            for key in path.split('.') {
+                at = at.get(key).unwrap_or_else(|| panic!("{topic} -> {path}"));
+            }
+            assert!(at.is_boolean(), "{path} is not a switch");
+        }
         std::fs::remove_file(hub.settings_file()).ok();
     }
 
@@ -1217,14 +1353,14 @@ mod tests {
         let hub = scratch_hub();
         let mut settings = hub.settings();
         settings.preview_enabled = true;
-        settings.preview_topic = Some("/cam/color/image_raw".into());
+        settings.preview_topic = Some("/realsense/color_image".into());
         hub.update_settings(settings.clone()).unwrap();
 
         let sink = hub.sink();
         for _ in 0..3 {
             sink(Produced::Image {
                 stream: StreamId::Color,
-                topic: "/cam/color/image_raw".into(),
+                topic: "/realsense/color_image".into(),
                 image: an_image(32, 16),
             });
         }
@@ -1237,7 +1373,7 @@ mod tests {
         for _ in 0..10 {
             sink(Produced::Image {
                 stream: StreamId::Color,
-                topic: "/cam/color/image_raw".into(),
+                topic: "/realsense/color_image".into(),
                 image: an_image(32, 16),
             });
         }
@@ -1254,13 +1390,13 @@ mod tests {
     fn a_stream_that_is_not_the_previewed_one_is_never_encoded_for_preview() {
         let hub = scratch_hub();
         let mut settings = hub.settings();
-        settings.preview_topic = Some("/cam/color/image_raw".into());
+        settings.preview_topic = Some("/realsense/color_image".into());
         hub.update_settings(settings).unwrap();
         let sink = hub.sink();
         for _ in 0..5 {
             sink(Produced::Image {
                 stream: StreamId::Depth,
-                topic: "/cam/depth/image_raw".into(),
+                topic: "/realsense/depth_image".into(),
                 image: an_image(32, 16),
             });
         }
@@ -1272,11 +1408,16 @@ mod tests {
     #[test]
     fn frames_are_not_compressed_while_nothing_is_recording_or_previewing() {
         let hub = scratch_hub();
+        // Aimed away from depth: an unset preview falls back to the first image
+        // stream, and that is depth.
+        let mut settings = hub.settings();
+        settings.preview_topic = Some("/realsense/color_image".into());
+        hub.update_settings(settings).unwrap();
         let sink = hub.sink();
         for _ in 0..20 {
             sink(Produced::Image {
                 stream: StreamId::Depth,
-                topic: "/cam/depth/image_raw".into(),
+                topic: "/realsense/depth_image".into(),
                 image: an_image(64, 48),
             });
         }
@@ -1293,7 +1434,7 @@ mod tests {
         for _ in 0..20 {
             sink(Produced::Image {
                 stream: StreamId::Depth,
-                topic: "/cam/depth/image_raw".into(),
+                topic: "/realsense/depth_image".into(),
                 image: an_image(64, 48),
             });
         }
@@ -1537,7 +1678,7 @@ mod tests {
         hub.update_settings(settings).unwrap();
 
         hub.sink()(Produced::CameraInfo {
-            topic: "/realsense/color/camera_info".into(),
+            topic: "/realsense/camera_info".into(),
             info: Box::new(CameraInfo::pinhole(
                 crate::msgs::Header::new(1, "camera_color_optical_frame"),
                 640,
@@ -1568,7 +1709,7 @@ mod tests {
             .map(|message| message.unwrap().channel.topic.clone())
             .collect();
         assert!(
-            topics.iter().any(|t| t == "/realsense/color/camera_info"),
+            topics.iter().any(|t| t == "/realsense/camera_info"),
             "got {topics:?}"
         );
         std::fs::remove_dir_all(&directory).ok();
@@ -1675,8 +1816,8 @@ mod tests {
 
     /// The colour stream lost a third of its frames at 720p30 while the
     /// recording reported no drops at all, because a frame shed on the way to
-    /// an encode worker is counted under the raw topic and written under
-    /// `/compressed`.
+    /// an encode worker never reaches the writer, so only the hub knows it
+    /// happened.
     #[test]
     fn a_frame_shed_before_the_recorder_is_still_the_recordings_drop() {
         let hub = scratch_hub();
@@ -1690,30 +1831,30 @@ mod tests {
         *hub.pipeline_dropped
             .lock()
             .unwrap()
-            .entry("/cam/color/image_raw".into())
+            .entry("/realsense/color_image".into())
             .or_default() += 7;
         hub.start_recording(Some("shed")).unwrap();
 
         hub.sink()(Produced::Image {
             stream: StreamId::Color,
-            topic: "/cam/color/image_raw".into(),
+            topic: "/realsense/color_image".into(),
             image: an_image(4, 4),
         });
         assert!(wait_for(|| hub
             .recording_status()
             .topics
-            .contains_key("/cam/color/image_raw/compressed")));
+            .contains_key("/realsense/color_image")));
         *hub.pipeline_dropped
             .lock()
             .unwrap()
-            .entry("/cam/color/image_raw".into())
+            .entry("/realsense/color_image".into())
             .or_default() += 3;
 
         let status = hub.recording_status();
         let tally = status
             .topics
-            .get("/cam/color/image_raw/compressed")
-            .expect("the frame is written under the compressed topic");
+            .get("/realsense/color_image")
+            .expect("the frame is written under the stream topic");
         assert_eq!(tally.written, 1);
         assert_eq!(tally.dropped, 3);
         assert_eq!(status.dropped, 3);

@@ -92,6 +92,36 @@ impl StreamId {
         }
     }
 
+    /// The topic's last segment. These are the dimos module output names, so a
+    /// recording drops into a dimos graph without a remapping table. dimos
+    /// carries raw and compressed images on one output and tells them apart by
+    /// message type, which is why neither word appears here.
+    pub fn topic_leaf(self) -> &'static str {
+        match self {
+            StreamId::Depth => "depth_image",
+            StreamId::Color => "color_image",
+            StreamId::InfraLeft => "infrared_left",
+            StreamId::InfraRight => "infrared_right",
+            StreamId::Imu => "imu",
+            // dimos names the RealSense's cloud `pointcloud` and the Mid-360's
+            // `lidar`; only the lidar publishes a cloud here.
+            StreamId::PointCloud => "lidar",
+        }
+    }
+
+    /// The `CameraInfo` topic's last segment. Colour's is bare `camera_info`
+    /// rather than `color_camera_info`, matching dimos, whose RealSense module
+    /// treats colour as the camera's default intrinsics.
+    pub fn camera_info_leaf(self) -> &'static str {
+        match self {
+            StreamId::Color => "camera_info",
+            StreamId::Depth => "depth_camera_info",
+            StreamId::InfraLeft => "infrared_left_camera_info",
+            StreamId::InfraRight => "infrared_right_camera_info",
+            StreamId::Imu | StreamId::PointCloud => "camera_info",
+        }
+    }
+
     /// The frame id suffix. Both infrared images come out of the depth module's
     /// two imagers, which are distinct optical centres, so they cannot share
     /// one frame.
@@ -131,30 +161,27 @@ impl Naming {
         }
     }
 
-    /// `/realsense/depth/image_raw`
+    /// `/realsense/depth_image`
     pub fn image_topic(&self, stream: StreamId) -> String {
-        format!(
-            "{}/{}/image_raw",
-            self.topic_prefix.trim_end_matches('/'),
-            stream.as_str()
-        )
+        self.topic(stream.topic_leaf())
     }
 
-    /// `/realsense/depth/camera_info`
+    /// `/realsense/depth_camera_info`
     pub fn camera_info_topic(&self, stream: StreamId) -> String {
-        format!(
-            "{}/{}/camera_info",
-            self.topic_prefix.trim_end_matches('/'),
-            stream.as_str()
-        )
+        self.topic(stream.camera_info_leaf())
     }
 
     pub fn imu_topic(&self) -> String {
-        format!("{}/imu", self.topic_prefix.trim_end_matches('/'))
+        self.topic(StreamId::Imu.topic_leaf())
     }
 
+    /// `/livox/lidar`
     pub fn points_topic(&self) -> String {
-        format!("{}/points", self.topic_prefix.trim_end_matches('/'))
+        self.topic(StreamId::PointCloud.topic_leaf())
+    }
+
+    pub fn topic(&self, leaf: &str) -> String {
+        format!("{}/{leaf}", self.topic_prefix.trim_end_matches('/'))
     }
 
     /// `camera_depth_optical_frame`
@@ -371,13 +398,19 @@ mod tests {
             topic_prefix: "/front_cam".into(),
             frame_prefix: "front".into(),
         };
+        assert_eq!(naming.image_topic(StreamId::Depth), "/front_cam/depth_image");
         assert_eq!(
-            naming.image_topic(StreamId::Depth),
-            "/front_cam/depth/image_raw"
+            naming.image_topic(StreamId::InfraLeft),
+            "/front_cam/infrared_left"
         );
+        // Colour's intrinsics are the camera's, so this one is not prefixed.
         assert_eq!(
             naming.camera_info_topic(StreamId::Color),
-            "/front_cam/color/camera_info"
+            "/front_cam/camera_info"
+        );
+        assert_eq!(
+            naming.camera_info_topic(StreamId::Depth),
+            "/front_cam/depth_camera_info"
         );
         assert_eq!(naming.imu_topic(), "/front_cam/imu");
         assert_eq!(
@@ -393,7 +426,7 @@ mod tests {
             topic_prefix: "/cam/".into(),
             frame_prefix: "cam_".into(),
         };
-        assert_eq!(naming.image_topic(StreamId::Depth), "/cam/depth/image_raw");
+        assert_eq!(naming.image_topic(StreamId::Depth), "/cam/depth_image");
         assert_eq!(naming.frame_id(StreamId::Depth), "cam_depth_optical_frame");
     }
 

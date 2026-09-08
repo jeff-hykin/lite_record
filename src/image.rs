@@ -8,7 +8,12 @@ use gamut_jxl_sys::encode::{
     JxlEncoderSetBasicInfo, JxlEncoderSetColorEncoding, JxlEncoderSetFrameLossless,
     JxlEncoderStatus,
 };
-use gamut_jxl_sys::types::{JxlBool, JxlDataType, JxlEndianness, JxlPixelFormat};
+use gamut_jxl_sys::decode::{
+    JxlDecoder, JxlDecoderCloseInput, JxlDecoderCreate, JxlDecoderDestroy, JxlDecoderGetBasicInfo,
+    JxlDecoderImageOutBufferSize, JxlDecoderProcessInput, JxlDecoderSetImageOutBuffer,
+    JxlDecoderSetInput, JxlDecoderStatus, JxlDecoderSubscribeEvents,
+};
+use gamut_jxl_sys::types::{JxlBasicInfo, JxlBool, JxlDataType, JxlEndianness, JxlPixelFormat};
 use jpeg_encoder::{ColorType, Encoder as JpegEncoder, SamplingFactor};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -417,6 +422,100 @@ pub fn container_format(image: &RawImage) -> Option<&'static str> {
     match compressed_codec(image)? {
         Codec::Jpeg => Some("jpeg"),
         Codec::Png => Some("png"),
+    }
+}
+
+/// Owns the decoder so every early return below frees it.
+struct Decoder(*mut JxlDecoder);
+
+impl Drop for Decoder {
+    fn drop(&mut self) {
+        unsafe { JxlDecoderDestroy(self.0) };
+    }
+}
+
+/// Undoes [`to_jpegxl`]. Nothing in the recording path needs this — it exists so
+/// a finished recording can be converted into something Foxglove will draw, which
+/// it will not do for jxl. Uses the same static libjxl the encoder does, so it
+/// costs no extra dependency.
+pub fn decode_jpegxl(data: &[u8]) -> Result<RawImage> {
+    let decoder = Decoder(unsafe { JxlDecoderCreate(std::ptr::null()) });
+    if decoder.0.is_null() {
+        bail!("could not create a jxl decoder");
+    }
+    unsafe {
+        let events = JxlDecoderStatus::BASIC_INFO.0 | JxlDecoderStatus::FULL_IMAGE.0;
+        if JxlDecoderSubscribeEvents(decoder.0, events) != JxlDecoderStatus::SUCCESS {
+            bail!("jxl decoder refused the event subscription");
+        }
+        if JxlDecoderSetInput(decoder.0, data.as_ptr(), data.len()) != JxlDecoderStatus::SUCCESS {
+            bail!("jxl decoder refused the input");
+        }
+        JxlDecoderCloseInput(decoder.0);
+
+        let mut info: JxlBasicInfo = std::mem::zeroed();
+        let mut format = JxlPixelFormat {
+            num_channels: 1,
+            data_type: JxlDataType::UINT8,
+            endianness: JxlEndianness::NATIVE,
+            align: 0,
+        };
+        let mut pixels = Vec::new();
+        loop {
+            match JxlDecoderProcessInput(decoder.0) {
+                JxlDecoderStatus::BASIC_INFO => {
+                    if JxlDecoderGetBasicInfo(decoder.0, &mut info) != JxlDecoderStatus::SUCCESS {
+                        bail!("jxl basic info unreadable");
+                    }
+                    format.num_channels = info.num_color_channels;
+                    // Ask for the depth the codestream was written at. A 16-bit
+                    // depth frame narrowed to 8 would still render, which is
+                    // exactly the silent-corruption case worth refusing.
+                    format.data_type = if info.bits_per_sample > 8 {
+                        JxlDataType::UINT16
+                    } else {
+                        JxlDataType::UINT8
+                    };
+                }
+                JxlDecoderStatus::NEED_IMAGE_OUT_BUFFER => {
+                    let mut size = 0usize;
+                    if JxlDecoderImageOutBufferSize(decoder.0, &format, &mut size)
+                        != JxlDecoderStatus::SUCCESS
+                    {
+                        bail!("jxl output size unreadable");
+                    }
+                    pixels = vec![0u8; size];
+                    if JxlDecoderSetImageOutBuffer(
+                        decoder.0,
+                        &format,
+                        pixels.as_mut_ptr().cast(),
+                        size,
+                    ) != JxlDecoderStatus::SUCCESS
+                    {
+                        bail!("jxl decoder refused the output buffer");
+                    }
+                }
+                JxlDecoderStatus::FULL_IMAGE => break,
+                JxlDecoderStatus::SUCCESS => break,
+                JxlDecoderStatus::NEED_MORE_INPUT => bail!("jxl stream is truncated"),
+                status => bail!("jxl decode failed with status {}", status.0),
+            }
+        }
+        if pixels.is_empty() {
+            bail!("jxl stream carried no frame");
+        }
+        let encoding = match (format.num_channels, format.data_type) {
+            (1, JxlDataType::UINT16) => "mono16",
+            (1, JxlDataType::UINT8) => "mono8",
+            (3, JxlDataType::UINT8) => "rgb8",
+            (channels, _) => bail!("unsupported jxl layout: {channels} channels"),
+        };
+        Ok(decoded_image(
+            info.xsize as usize,
+            info.ysize as usize,
+            encoding,
+            pixels,
+        ))
     }
 }
 
@@ -975,6 +1074,31 @@ mod tests {
             .map(|value| (value * scale).round() as u16)
             .collect();
         assert_eq!(decoded, depths(&image));
+    }
+
+    #[test]
+    fn decode_jpegxl_returns_the_depth_samples_that_were_encoded() {
+        // Round-tripped through our own decoder rather than jxl-oxide, because
+        // this is the one a conversion actually runs.
+        let image = depth_image(9, 5);
+        let encoded = compress(&image, ImageFormat::Jpegxl).unwrap();
+        let decoded = decode_jpegxl(&encoded.data).unwrap();
+
+        assert_eq!((decoded.width, decoded.height), (image.width, image.height));
+        assert_eq!(decoded.encoding, "mono16");
+        let samples: Vec<u16> = decoded
+            .data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_ne_bytes(*pair))
+            .collect();
+        assert_eq!(samples, depths(&image));
+    }
+
+    #[test]
+    fn decode_jpegxl_refuses_bytes_that_are_not_jxl() {
+        assert!(decode_jpegxl(b"not a codestream").is_err());
     }
 
     #[test]

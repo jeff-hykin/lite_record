@@ -5,10 +5,21 @@
 //! itself be a measurable share of a Pi's CPU. The one exception is the
 //! throttle word, which has no sysfs equivalent on older firmware.
 
+use std::collections::VecDeque;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
+
+/// How often the host is read. A busy fraction measured over a shorter window
+/// than this is mostly scheduler noise, which is what made the core bars flick
+/// between empty and full several times a second.
+pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// One charted point per second, kept for four minutes. The whole series is
+/// resent on the second it changes, so it has to stay small.
+pub const HISTORY_INTERVAL: Duration = Duration::from_secs(1);
+pub const HISTORY_POINTS: usize = 240;
 
 /// Raspberry Pi firmware throttle bits, as reported by `vcgencmd get_throttled`
 /// and by the mailbox sysfs node. The low half is "now", the high half is
@@ -225,6 +236,180 @@ impl Sampler {
     }
 }
 
+/// An exponential moving average. `weight` is the share of each new reading
+/// that is taken; the rest is carried over from what came before.
+#[derive(Debug, Clone)]
+pub struct Ema {
+    weight: f64,
+    value: Option<f64>,
+}
+
+impl Ema {
+    pub fn new(weight: f64) -> Self {
+        Ema { weight, value: None }
+    }
+
+    pub fn push(&mut self, sample: f64) -> f64 {
+        let next = match self.value {
+            // The first reading is taken whole, so a fresh process shows the
+            // truth immediately rather than climbing out of zero.
+            None => sample,
+            Some(previous) => previous + (sample - previous) * self.weight,
+        };
+        self.value = Some(next);
+        next
+    }
+
+    pub fn value(&self) -> Option<f64> {
+        self.value
+    }
+}
+
+/// Reports the median of the last few readings. A thermal zone produces the
+/// occasional single-sample spike, and a median drops it outright where an
+/// average would smear it across the next several seconds.
+#[derive(Debug, Clone)]
+pub struct Median {
+    window: VecDeque<f64>,
+    capacity: usize,
+}
+
+impl Median {
+    pub fn new(capacity: usize) -> Self {
+        Median { window: VecDeque::new(), capacity: capacity.max(1) }
+    }
+
+    pub fn push(&mut self, sample: f64) -> f64 {
+        if self.window.len() == self.capacity {
+            self.window.pop_front();
+        }
+        self.window.push_back(sample);
+        let mut sorted: Vec<f64> = self.window.iter().copied().collect();
+        sorted.sort_by(|left, right| left.partial_cmp(right).unwrap());
+        sorted[sorted.len() / 2]
+    }
+}
+
+fn rounded(value: f64, places: u32) -> f64 {
+    let scale = 10f64.powi(places as i32);
+    (value * scale).round() / scale
+}
+
+/// The charted series, oldest point first. Held on the server rather than
+/// accumulated in the browser so a page opened just now still draws the last
+/// four minutes instead of an empty box.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct History {
+    /// Bumped once per appended point, so a socket can skip resending a series
+    /// that has not moved.
+    pub revision: u64,
+    pub interval_seconds: f64,
+    pub cpu_percent: Vec<f64>,
+    /// Empty when the machine exposes no thermal zone at all.
+    pub temperature_celsius: Vec<f64>,
+    pub memory_percent: Vec<f64>,
+    pub cores_percent: Vec<Vec<f64>>,
+}
+
+impl History {
+    fn push_capped(series: &mut Vec<f64>, value: f64) {
+        if series.len() == HISTORY_POINTS {
+            series.remove(0);
+        }
+        series.push(value);
+    }
+
+    fn append(&mut self, health: &Health) {
+        self.revision += 1;
+        self.interval_seconds = HISTORY_INTERVAL.as_secs_f64();
+        Self::push_capped(&mut self.cpu_percent, rounded(health.cpu_busy * 100.0, 1));
+        let memory = if health.memory_total_bytes > 0 {
+            health.memory_used_bytes as f64 / health.memory_total_bytes as f64 * 100.0
+        } else {
+            0.0
+        };
+        Self::push_capped(&mut self.memory_percent, rounded(memory, 1));
+        if let Some(celsius) = health.temperature_celsius {
+            Self::push_capped(&mut self.temperature_celsius, rounded(celsius, 1));
+        }
+        self.cores_percent.resize(health.cpu_cores.len(), Vec::new());
+        for (series, busy) in self.cores_percent.iter_mut().zip(&health.cpu_cores) {
+            Self::push_capped(series, rounded(busy * 100.0, 1));
+        }
+    }
+}
+
+/// Samples the host on a fixed cadence, smooths what it reads, and keeps the
+/// recent past for the charts.
+///
+/// This exists because the raw numbers are unreadable: a 200 ms busy fraction
+/// swings the full range several times a second, and a thermal zone jitters by
+/// a degree or two between consecutive reads. It also fixes a real bug — the
+/// sampler holds the previous /proc/stat reading, so two browsers each asking
+/// for health on their own tick used to halve each other's measurement window.
+pub struct Monitor {
+    sampler: Sampler,
+    cpu: Ema,
+    cores: Vec<Ema>,
+    temperature_spikes: Median,
+    temperature: Ema,
+    history: History,
+    since_history: Duration,
+    latest: Health,
+}
+
+impl Default for Monitor {
+    fn default() -> Self {
+        Monitor {
+            sampler: Sampler::default(),
+            // Roughly a two-second time constant at the sampling cadence:
+            // slow enough to read, fast enough that engaging a camera shows up
+            // before the operator wonders whether the click landed.
+            cpu: Ema::new(0.25),
+            cores: Vec::new(),
+            temperature_spikes: Median::new(5),
+            temperature: Ema::new(0.15),
+            history: History::default(),
+            since_history: Duration::ZERO,
+            latest: Health::default(),
+        }
+    }
+}
+
+impl Monitor {
+    /// Reads the host once and folds the reading into the smoothed values.
+    /// `elapsed` is the time since the previous tick, which is what decides
+    /// when a history point is due.
+    pub fn tick(&mut self, record_dir: &Path, elapsed: Duration) {
+        let mut health = self.sampler.sample(record_dir);
+
+        health.cpu_busy = self.cpu.push(health.cpu_busy);
+        self.cores.resize_with(health.cpu_cores.len(), || Ema::new(0.25));
+        for (average, busy) in self.cores.iter_mut().zip(health.cpu_cores.iter_mut()) {
+            *busy = average.push(*busy);
+        }
+        if let Some(celsius) = health.temperature_celsius {
+            let despiked = self.temperature_spikes.push(celsius);
+            health.temperature_celsius = Some(self.temperature.push(despiked));
+        }
+
+        self.latest = health;
+        self.since_history += elapsed;
+        if self.since_history >= HISTORY_INTERVAL {
+            self.since_history = Duration::ZERO;
+            self.history.append(&self.latest);
+        }
+    }
+
+    pub fn health(&self) -> Health {
+        self.latest.clone()
+    }
+
+    pub fn history(&self) -> History {
+        self.history.clone()
+    }
+}
+
 /// Newer Pi kernels expose the word without a fork; fall back to `vcgencmd`
 /// only when they do not.
 fn read_throttle() -> Option<Throttle> {
@@ -255,7 +440,7 @@ fn read_temperature() -> Option<f64> {
     None
 }
 
-fn free_bytes(directory: &Path) -> Option<u64> {
+pub fn free_bytes(directory: &Path) -> Option<u64> {
     let path = std::ffi::CString::new(directory.as_os_str().as_encoded_bytes()).ok()?;
     let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: `path` is a valid NUL-terminated string and `stats` is a
@@ -338,6 +523,81 @@ mod tests {
         let (used, total) = parse_meminfo(text);
         assert_eq!(total, 8_000_000 * 1024);
         assert_eq!(used, 2_000_000 * 1024);
+    }
+
+    #[test]
+    fn an_average_takes_its_first_reading_whole_then_lags() {
+        let mut average = Ema::new(0.25);
+        // Starting from zero would make a fresh process report an idle machine
+        // for several seconds regardless of what it is actually doing.
+        assert_eq!(average.push(80.0), 80.0);
+        assert_eq!(average.push(0.0), 60.0);
+        assert_eq!(average.push(0.0), 45.0);
+        assert_eq!(average.value(), Some(45.0));
+    }
+
+    #[test]
+    fn a_median_drops_a_single_sample_spike_entirely() {
+        let mut window = Median::new(5);
+        for reading in [70.0, 70.0, 71.0, 70.0] {
+            window.push(reading);
+        }
+        // One 95 degree outlier among four steady readings must not move the
+        // reported temperature at all.
+        assert_eq!(window.push(95.0), 70.0);
+        // A sustained rise does move it, otherwise the filter would hide a
+        // genuinely overheating Pi.
+        for reading in [95.0, 95.0, 95.0] {
+            window.push(reading);
+        }
+        assert_eq!(window.push(95.0), 95.0);
+    }
+
+    #[test]
+    fn history_keeps_percentages_and_forgets_the_oldest_point() {
+        let mut history = History::default();
+        let health = |busy: f64| Health {
+            cpu_busy: busy,
+            cpu_cores: vec![busy, 0.0],
+            memory_used_bytes: 512,
+            memory_total_bytes: 1024,
+            temperature_celsius: Some(61.25),
+            ..Health::default()
+        };
+        for step in 0..HISTORY_POINTS + 10 {
+            history.append(&health(step as f64 / 1000.0));
+        }
+        assert_eq!(history.revision, HISTORY_POINTS as u64 + 10);
+        assert_eq!(history.cpu_percent.len(), HISTORY_POINTS);
+        assert_eq!(history.cores_percent.len(), 2);
+        assert_eq!(history.cores_percent[0].len(), HISTORY_POINTS);
+        // Oldest first, so the newest reading is the last element.
+        assert_eq!(*history.cpu_percent.last().unwrap(), 24.9);
+        assert_eq!(*history.memory_percent.last().unwrap(), 50.0);
+        // Rounded on the way in, because the whole series is resent every
+        // second and full f64 precision would triple the payload.
+        assert_eq!(*history.temperature_celsius.last().unwrap(), 61.3);
+    }
+
+    #[test]
+    fn a_machine_with_no_thermal_zone_charts_no_temperature() {
+        let mut history = History::default();
+        history.append(&Health { temperature_celsius: None, ..Health::default() });
+        assert!(history.temperature_celsius.is_empty());
+        assert_eq!(history.cpu_percent.len(), 1);
+    }
+
+    #[test]
+    fn the_monitor_appends_a_point_only_once_an_interval_has_passed() {
+        let mut monitor = Monitor::default();
+        let directory = std::env::temp_dir();
+        monitor.tick(&directory, Duration::ZERO);
+        assert_eq!(monitor.history().revision, 0);
+        monitor.tick(&directory, HISTORY_INTERVAL / 2);
+        assert_eq!(monitor.history().revision, 0);
+        monitor.tick(&directory, HISTORY_INTERVAL / 2);
+        assert_eq!(monitor.history().revision, 1);
+        assert_eq!(monitor.history().interval_seconds, 1.0);
     }
 
     #[test]

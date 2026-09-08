@@ -825,13 +825,7 @@ impl Pump {
             StreamId::Depth,
             format,
             stamp_nanos,
-            Some((
-                format!(
-                    "{}/aligned_depth_to_color/image_raw",
-                    self.naming.topic_prefix.trim_end_matches('/')
-                ),
-                frame_id,
-            )),
+            Some((self.naming.topic("aligned_depth_image"), frame_id)),
         )
     }
 

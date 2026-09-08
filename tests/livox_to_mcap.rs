@@ -120,7 +120,7 @@ fn captured_mid360_traffic_lands_in_an_mcap_that_reads_back() {
     }
 
     let points = channels
-        .get("/livox/points")
+        .get("/livox/lidar")
         .expect("no point cloud topic in the mcap");
     assert_eq!(points.0, "sensor_msgs/msg/PointCloud2");
     assert!(points.1 >= 2, "expected repeated clouds, got {}", points.1);
