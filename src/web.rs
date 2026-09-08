@@ -512,11 +512,19 @@ fn transfer_speed(elapsed: f64, done: u64, work: u64) -> (Option<f64>, Option<f6
 /// already raw, so converting it again would only find nothing to do.
 const VIEWABLE_SUFFIX: &str = ".viewable.mcap";
 
-/// Raw 16-bit depth is roughly 1.6x the size of the jxl it replaces once mcap's
-/// zstd has had it, and the temporary copy exists alongside the original until
-/// the swap. Refusing up front beats filling the card and losing the recording
-/// that is still being written.
-const SPACE_MARGIN: u64 = 2;
+/// How much bigger than the original the rewrite is allowed to come out, as a
+/// percent.
+///
+/// mcap cannot be edited in place — a message that changes size shifts every
+/// offset after it — so the conversion writes a whole second copy and renames it
+/// over the original, and the card has to hold both for a moment. Only the depth
+/// stream changes though, and while raw 16-bit depth is several times the bulk of
+/// the jxl it replaces, it also compresses far better, so almost all of the
+/// growth disappears back into mcap's zstd. Measured on a real recording whose
+/// depth was 40% of the file, the output came out 2.7% larger; a tenth covers
+/// even an all-depth recording. Running out anyway is not destructive: the
+/// half-written copy is deleted and the original is left untouched.
+const OUTPUT_HEADROOM_PERCENT: u64 = 10;
 
 /// Decodes the jxl depth stream into raw pixels so Foxglove will draw it,
 /// replacing the file in place once every frame has decoded. Answers as soon as
@@ -537,11 +545,12 @@ async fn convert_recording(Path(name): Path<String>, State(state): State<AppStat
     let Ok(metadata) = source.metadata() else {
         return bad_request(format!("there is no recording called {name}"));
     };
-    let needed = metadata.len() * SPACE_MARGIN;
+    let needed = metadata.len() + metadata.len() * OUTPUT_HEADROOM_PERCENT / 100;
     if let Some(free) = sysmon::free_bytes(&directory) {
         if free < needed {
             return bad_request(format!(
-                "not enough room: the conversion needs about {} MB and {} MB are free",
+                "not enough room: the rewrite is written beside the original before it \
+                 replaces it, so it needs about {} MB free and there are {} MB",
                 needed / 1_000_000,
                 free / 1_000_000
             ));
