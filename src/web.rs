@@ -461,9 +461,22 @@ async fn move_status(State(state): State<AppState>) -> Response {
     } else {
         1
     };
-    let (rate, eta) = transfer_speed(job.started.elapsed().as_secs_f64(), copied + verified, total * passes);
+    // Only a running transfer has a rate. Once it finishes `started` goes on
+    // ticking while the byte counts stand still, so the same arithmetic reports
+    // a speed that falls forever and eventually calls a finished instant rename
+    // a slow link.
+    let running = job.outcome.is_none();
+    let (rate, eta) = if running {
+        transfer_speed(
+            job.started.elapsed().as_secs_f64(),
+            copied + verified,
+            total * passes,
+        )
+    } else {
+        (None, None)
+    };
     axum::Json(json!({
-        "running": job.outcome.is_none(),
+        "running": running,
         "source": job.source,
         "destination": job.destination,
         "copied_bytes": copied,
