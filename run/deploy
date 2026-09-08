@@ -3,7 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-HOST="${LITE_RECORD_HOST:-dimensional@100.111.62.124}"
+# dimpi5 over tailscale. The address is the tailnet one on purpose: the LAN
+# address moves whenever the Pi changes wifi, and the name only resolves for
+# whoever has its host key.
+HOST="${LITE_RECORD_HOST:-dimos@100.86.59.57}"
 REMOTE_BIN="/home/${HOST%@*}/.local/bin/lite_record"
 UNIT="/etc/systemd/system/lite_record.service"
 
