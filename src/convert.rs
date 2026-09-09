@@ -11,8 +11,9 @@
 //! look at, which is the point — a viewing copy would mean carrying two.
 
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::BufWriter;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -44,6 +45,9 @@ pub struct Report {
     /// Size of the finished file. Not the sum of the payloads: raw depth is far
     /// larger than the jxl it replaces, and mcap's zstd takes most of that back.
     pub bytes: u64,
+    /// Bytes handed back to the filesystem out of the source while the rewrite
+    /// was still running. Zero unless the job was asked to reclaim.
+    pub reclaimed: u64,
 }
 
 /// Live message count, so the browser can show a conversion moving rather than a
@@ -133,19 +137,28 @@ fn depth_encoding(encoding: &str) -> &str {
 /// which replaces the original only when every single frame decoded — the
 /// decode is exact, so the swap loses nothing, but a recording with even one
 /// undecodable frame is left untouched rather than silently thinned.
-pub fn in_place(input: &Path, progress: &Arc<Progress>) -> Result<Report> {
+pub fn in_place(input: &Path, progress: &Arc<Progress>, reclaim: Reclaim) -> Result<Report> {
     let mut name = input.file_name().unwrap_or_default().to_os_string();
     name.push(".converting");
     let temp = input.with_file_name(name);
-    let report = match to_viewable(input, &temp, progress) {
+    // Once the source has had chunks punched out of it, the half-written temp
+    // holds the only copy of everything converted so far. Deleting it on the way
+    // out — which is the right thing to do for a conversion that kept its source
+    // intact — would be the one action that actually loses messages.
+    let discard = |temp: &Path| {
+        if reclaim == Reclaim::No {
+            let _ = std::fs::remove_file(temp);
+        }
+    };
+    let report = match to_viewable(input, &temp, progress, reclaim) {
         Ok(report) => report,
         Err(error) => {
-            let _ = std::fs::remove_file(&temp);
+            discard(&temp);
             return Err(error);
         }
     };
     if report.failed > 0 {
-        let _ = std::fs::remove_file(&temp);
+        discard(&temp);
         anyhow::bail!(
             "{} frames would not decode, so {} was left untouched",
             report.failed,
@@ -155,7 +168,7 @@ pub fn in_place(input: &Path, progress: &Arc<Progress>) -> Result<Report> {
     if report.decoded == 0 {
         // Nothing changed, so swapping in the rewrite would only churn the
         // file's compression. This is also what a second run hits.
-        let _ = std::fs::remove_file(&temp);
+        discard(&temp);
         anyhow::bail!("no jxl images in the file — nothing to convert");
     }
     std::fs::rename(&temp, input)
@@ -163,28 +176,35 @@ pub fn in_place(input: &Path, progress: &Arc<Progress>) -> Result<Report> {
     Ok(report)
 }
 
-pub fn to_viewable(input: &Path, output: &Path, progress: &Arc<Progress>) -> Result<Report> {
-    let source = File::open(input).with_context(|| format!("could not open {}", input.display()))?;
-    // Mapped rather than read: a long recording is larger than the Pi's memory,
-    // and the pages behind an mcap are touched once and never again.
-    let mapped = unsafe { memmap2::Mmap::map(&source) }
-        .with_context(|| format!("could not map {}", input.display()))?;
+/// The output file and the bookkeeping that maps each source channel onto its
+/// replacement. Split out from the drivers because the whole-file walk and the
+/// chunk-at-a-time walk differ only in how they find the next message.
+struct Rewriter {
+    writer: mcap::Writer<BufWriter<File>>,
+    /// Keyed by source channel id, to the output channel id and its running
+    /// sequence number. A decoded channel and a copied channel never share an
+    /// id, so one map covers both.
+    channels: HashMap<u16, (u16, u32)>,
+    report: Report,
+}
 
-    let destination =
-        File::create(output).with_context(|| format!("could not create {}", output.display()))?;
-    let mut writer = mcap::WriteOptions::new()
-        .compression(Some(mcap::Compression::Zstd))
-        .compression_level(1)
-        .profile("ros2")
-        .create(BufWriter::with_capacity(1 << 20, destination))?;
+impl Rewriter {
+    fn new(output: &Path) -> Result<Self> {
+        let destination = File::create(output)
+            .with_context(|| format!("could not create {}", output.display()))?;
+        let writer = mcap::WriteOptions::new()
+            .compression(Some(mcap::Compression::Zstd))
+            .compression_level(1)
+            .profile("ros2")
+            .create(BufWriter::with_capacity(1 << 20, destination))?;
+        Ok(Self {
+            writer,
+            channels: HashMap::new(),
+            report: Report::default(),
+        })
+    }
 
-    // Keyed by source channel id. A decoded channel and a copied channel never
-    // share an id, so one map covers both.
-    let mut channels: HashMap<u16, (u16, u32)> = HashMap::new();
-    let mut report = Report::default();
-
-    for message in mcap::MessageStream::new(&mapped)? {
-        let message = message?;
+    fn write(&mut self, message: &mcap::Message) -> Result<()> {
         let channel = &message.channel;
         let decoded = channel
             .schema
@@ -195,7 +215,7 @@ pub fn to_viewable(input: &Path, output: &Path, progress: &Arc<Progress>) -> Res
         let rewritten = match decoded {
             Some(Ok(image)) => match viewable_format(&image.encoding) {
                 ImageFormat::Raw => {
-                    report.decoded += 1;
+                    self.report.decoded += 1;
                     Some(cdr::raw_image(&RawImage {
                         encoding: depth_encoding(&image.encoding).to_string(),
                         ..image
@@ -203,34 +223,34 @@ pub fn to_viewable(input: &Path, output: &Path, progress: &Arc<Progress>) -> Res
                 }
                 format => match compress(&image, format) {
                     Some(encoded) => {
-                        report.decoded += 1;
+                        self.report.decoded += 1;
                         Some(cdr::compressed_image(&encoded))
                     }
                     // Only reachable if a layout reaches a format that cannot
                     // hold it, which `viewable_format` exists to prevent. Failing
                     // here leaves the recording untouched rather than thinning it.
                     None => {
-                        report.failed += 1;
-                        continue;
+                        self.report.failed += 1;
+                        return Ok(());
                     }
                 },
             },
             Some(Err(_)) => {
                 // A frame that will not decode is dropped rather than written as
                 // broken pixels, and shows up in the report.
-                report.failed += 1;
-                continue;
+                self.report.failed += 1;
+                return Ok(());
             }
             None => {
-                report.copied += 1;
+                self.report.copied += 1;
                 None
             }
         };
 
-        if let std::collections::hash_map::Entry::Vacant(slot) = channels.entry(channel.id) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.channels.entry(channel.id) {
             let (schema_id, topic) = match &rewritten {
                 Some(encoded) => (
-                    writer.add_schema(
+                    self.writer.add_schema(
                         encoded.schema_name,
                         "ros2msg",
                         encoded.schema_text.as_bytes(),
@@ -253,28 +273,26 @@ pub fn to_viewable(input: &Path, output: &Path, progress: &Arc<Progress>) -> Res
                         .as_ref()
                         .context("a channel with no schema cannot be copied through")?;
                     (
-                        writer.add_schema(&schema.name, &schema.encoding, &schema.data)?,
+                        self.writer
+                            .add_schema(&schema.name, &schema.encoding, &schema.data)?,
                         channel.topic.as_str(),
                     )
                 }
             };
-            let id = writer.add_channel(
-                schema_id,
-                topic,
-                &channel.message_encoding,
-                &channel.metadata,
-            )?;
+            let id =
+                self.writer
+                    .add_channel(schema_id, topic, &channel.message_encoding, &channel.metadata)?;
             slot.insert((id, 0));
         }
 
-        let entry = channels.get_mut(&channel.id).expect("just inserted");
+        let entry = self.channels.get_mut(&channel.id).expect("just inserted");
         entry.1 = entry.1.wrapping_add(1);
         let (channel_id, sequence) = *entry;
 
         let payload = rewritten
             .as_ref()
             .map_or(message.data.as_ref(), |encoded| encoded.data.as_slice());
-        writer.write_to_known_channel(
+        self.writer.write_to_known_channel(
             &mcap::records::MessageHeader {
                 channel_id,
                 sequence,
@@ -283,17 +301,255 @@ pub fn to_viewable(input: &Path, output: &Path, progress: &Arc<Progress>) -> Res
             },
             payload,
         )?;
-        let written = report.decoded + report.copied;
-        progress.messages.store(written, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn written(&self) -> u64 {
+        self.report.decoded + self.report.copied
+    }
+}
+
+/// Whether the source may be eaten as it is read. See [`by_chunk`].
+#[derive(Clone, Copy, PartialEq)]
+pub enum Reclaim {
+    No,
+    /// Punch each source chunk out once its replacement is on disk and reads
+    /// back. Peak space becomes the output alone rather than both files, at the
+    /// cost of destroying the source progressively.
+    AsItGoes,
+}
+
+pub fn to_viewable(
+    input: &Path,
+    output: &Path,
+    progress: &Arc<Progress>,
+    reclaim: Reclaim,
+) -> Result<Report> {
+    // Write access only when we intend to punch: a plain conversion should not
+    // be able to touch the source even by accident.
+    let source = OpenOptions::new()
+        .read(true)
+        .write(reclaim == Reclaim::AsItGoes)
+        .open(input)
+        .with_context(|| format!("could not open {}", input.display()))?;
+    // Mapped rather than read: a long recording is larger than the Pi's memory,
+    // and the pages behind an mcap are touched once and never again.
+    let mapped = unsafe { memmap2::Mmap::map(&source) }
+        .with_context(|| format!("could not map {}", input.display()))?;
+
+    // The summary sits at the end of the file and carries every chunk's offset,
+    // which is what makes a chunk-at-a-time walk possible. A file without one —
+    // a recovered or truncated recording — can still be converted, just only by
+    // reading it straight through.
+    let summary = mcap::Summary::read(&mapped).ok().flatten();
+    match summary.filter(|summary| !summary.chunk_indexes.is_empty()) {
+        Some(summary) => by_chunk(&mapped, &source, &summary, output, progress, reclaim),
+        None if reclaim == Reclaim::AsItGoes => anyhow::bail!(
+            "{} has no chunk index, so it cannot be converted a chunk at a time — \
+             run it through mcap_recover first",
+            input.display()
+        ),
+        None => whole_file(&mapped, output, progress),
+    }
+}
+
+/// The straight-through walk, for a file whose index is missing.
+fn whole_file(mapped: &[u8], output: &Path, progress: &Arc<Progress>) -> Result<Report> {
+    let mut rewriter = Rewriter::new(output)?;
+    for message in mcap::MessageStream::new(mapped)? {
+        rewriter.write(&message?)?;
+        progress.messages.store(rewriter.written(), Ordering::Relaxed);
         // Stat rather than sum the payloads, so the browser shows room going off
         // the card. Occasionally, because it is a syscall in the message loop.
-        if written % 256 == 0 {
+        if rewriter.written() % 256 == 0 {
             progress.bytes.store(file_size(output), Ordering::Relaxed);
         }
     }
-
-    writer.finish()?;
+    rewriter.writer.finish()?;
+    let mut report = rewriter.report;
     report.bytes = file_size(output);
     progress.bytes.store(report.bytes, Ordering::Relaxed);
     Ok(report)
+}
+
+/// Converts one source chunk at a time, and — when asked — hands each source
+/// chunk back to the filesystem as soon as its replacement is on disk.
+///
+/// The order matters and is the whole safety argument: a chunk is converted,
+/// flushed so it is a complete chunk record rather than a half-written
+/// compression stream, read back off the disk to prove it parses, and only then
+/// is the source's copy punched out. Nothing is ever released on the strength of
+/// a write that has not been verified.
+///
+/// What this cannot do is put the rewritten chunk back where the old one was.
+/// It is bigger — that is the point of the conversion — and every offset after
+/// it would shift, so the output is still a second file that gets renamed over
+/// the source at the end. Reclaiming is what keeps the two from having to
+/// coexist at full size: peak usage is the output alone, not both.
+///
+/// The cost, and it is a real one: once punching has started the source is no
+/// longer a whole recording. If the job dies midway the messages all still
+/// exist, but split across the partial output and the un-punched tail of the
+/// source, and putting them back together is a manual job.
+fn by_chunk(
+    mapped: &[u8],
+    source: &File,
+    summary: &mcap::Summary,
+    output: &Path,
+    progress: &Arc<Progress>,
+    reclaim: Reclaim,
+) -> Result<Report> {
+    if !summary.attachment_indexes.is_empty() || !summary.metadata_indexes.is_empty() {
+        anyhow::bail!(
+            "this recording carries attachments or metadata, which a chunk-at-a-time \
+             rewrite would drop"
+        );
+    }
+
+    // Punching walks forward through the file, so the chunks have to be in file
+    // order rather than whatever order the index happens to list them in.
+    let mut chunks = summary.chunk_indexes.clone();
+    chunks.sort_by_key(|chunk| chunk.chunk_start_offset);
+
+    let block = source.metadata().map(|data| data.blksize()).unwrap_or(4096);
+    let mut rewriter = Rewriter::new(output)?;
+    // The header and the leading magic go out now, so that every range measured
+    // from here on starts on a record boundary and can be parsed on its own.
+    rewriter.writer.flush()?;
+    let mut checked = file_size(output);
+    let mut reclaimed = 0;
+
+    for chunk in &chunks {
+        let before = rewriter.written();
+        for message in summary.stream_chunk(mapped, chunk)? {
+            rewriter.write(&message?)?;
+        }
+        // Ends the output chunk and pushes it through the BufWriter, so what we
+        // are about to read back is actually on the disk.
+        rewriter.writer.flush()?;
+
+        let grown = file_size(output);
+        let found = verify(output, checked, grown).with_context(|| {
+            format!(
+                "the output written for the chunk at {} did not read back",
+                chunk.chunk_start_offset
+            )
+        })?;
+        let expected = rewriter.written() - before;
+        if found != expected {
+            anyhow::bail!(
+                "the chunk at {} wrote {expected} messages but only {found} read back",
+                chunk.chunk_start_offset
+            );
+        }
+        checked = grown;
+
+        if reclaim == Reclaim::AsItGoes {
+            // The message index records sit right behind the chunk and are just
+            // as dead once it has been converted, so they go too.
+            let length = chunk.chunk_length + chunk.message_index_length;
+            reclaimed += release(source, chunk.chunk_start_offset, length, block)?;
+        }
+
+        progress.messages.store(rewriter.written(), Ordering::Relaxed);
+        progress.bytes.store(grown, Ordering::Relaxed);
+    }
+
+    rewriter.writer.finish()?;
+    let mut report = rewriter.report;
+    report.bytes = file_size(output);
+    report.reclaimed = reclaimed;
+    progress.bytes.store(report.bytes, Ordering::Relaxed);
+
+    // A message living outside a chunk would never have been visited, and the
+    // only way to notice is to count. Better to refuse than to hand back a
+    // recording that is quietly missing messages.
+    if let Some(stats) = &summary.stats {
+        let seen = report.decoded + report.copied + report.failed;
+        if stats.message_count != 0 && stats.message_count != seen {
+            anyhow::bail!(
+                "the index accounts for {} messages but the file says it holds {} — \
+                 some of them are outside the chunks",
+                seen,
+                stats.message_count
+            );
+        }
+    }
+    Ok(report)
+}
+
+/// Reads back the bytes just appended to the output and parses every record in
+/// them, returning how many messages they hold. This is what a chunk is
+/// released on the strength of, so it reads from the file rather than trusting
+/// the buffer it was written from.
+fn verify(output: &Path, from: u64, to: u64) -> Result<u64> {
+    if to <= from {
+        return Ok(0);
+    }
+    let file = File::open(output)?;
+    let mut bytes = vec![0; (to - from) as usize];
+    file.read_exact_at(&mut bytes, from)?;
+
+    // `LinearReader` walks into chunks rather than handing them back whole, so a
+    // message only turns up here if its chunk's zstd stream decompressed and
+    // every record in it parsed — which is exactly what needs proving before the
+    // source's copy is released.
+    let mut messages = 0;
+    for record in mcap::read::LinearReader::sans_magic(&bytes) {
+        if matches!(record?, mcap::records::Record::Message { .. }) {
+            messages += 1;
+        }
+    }
+    Ok(messages)
+}
+
+/// Hands a byte range back to the filesystem, leaving a hole where it was. The
+/// file keeps its length; reading the hole gives zeros.
+///
+/// Only whole blocks are released. A partial block at either end is left alone:
+/// macOS refuses an unaligned punch outright, and on Linux it would only zero
+/// the bytes without freeing anything. Returns how much was actually freed.
+fn release(file: &File, offset: u64, length: u64, block: u64) -> Result<u64> {
+    let start = offset.div_ceil(block) * block;
+    let end = (offset + length) / block * block;
+    if end <= start {
+        return Ok(0);
+    }
+    punch(file, start, end - start)
+        .with_context(|| format!("could not release {} bytes at {start}", end - start))?;
+    Ok(end - start)
+}
+
+#[cfg(target_os = "linux")]
+fn punch(file: &File, offset: u64, length: u64) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let result = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            offset as libc::off_t,
+            length as libc::off_t,
+        )
+    };
+    match result {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn punch(file: &File, offset: u64, length: u64) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let mut hole = libc::fpunchhole_t {
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: offset as libc::off_t,
+        fp_length: length as libc::off_t,
+    };
+    let result =
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &mut hole as *mut _) };
+    match result {
+        -1 => Err(std::io::Error::last_os_error()),
+        _ => Ok(()),
+    }
 }

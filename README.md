@@ -152,6 +152,18 @@ It costs disk. Measured on real recordings the file grows 15–26%, most of it r
 mcap's zstd only partly takes back, and the rewrite is written beside the original before it
 replaces it, so the card needs room for both. The button refuses when it does not have it.
 
+When that room is the only thing missing, it offers to convert **reclaiming** instead. The work
+goes one source chunk at a time: convert the chunk, flush it so it is a complete chunk rather than
+a half-written compression stream, read it back off the disk to prove it parses and holds every
+message, and only then punch the source's copy out of the file. Peak usage becomes the output
+alone rather than both files, which is the difference between a 51 GB recording fitting on a
+117 GB card and not.
+
+The catch, and it is why this takes a deliberate yes: once punching starts the original is no
+longer a whole recording. Nothing is released before its replacement is verified, so no messages
+are lost, but if the job is interrupted they are split across the partial output and the untouched
+tail of the original, and putting them back together is a manual job.
+
 ### Why there is no H.264
 
 There is an `h264` cargo feature wired to `openh264`, but it is off by default and not

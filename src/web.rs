@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -517,7 +517,9 @@ const VIEWABLE_SUFFIX: &str = ".viewable.mcap";
 ///
 /// mcap cannot be edited in place — a message that changes size shifts every
 /// offset after it — so the conversion writes a whole second copy and renames it
-/// over the original, and the card has to hold both for a moment.
+/// over the original, and the card has to hold both for a moment. A reclaiming
+/// conversion gives each source chunk back as it goes, so only this growth has
+/// to fit rather than a second whole file.
 ///
 /// Measured whole file in, whole file out, on recordings off dimpi5:
 ///
@@ -537,10 +539,22 @@ const VIEWABLE_SUFFIX: &str = ".viewable.mcap";
 /// only buys failing in a second rather than after hours of decoding.
 const OUTPUT_HEADROOM_PERCENT: u64 = 35;
 
+#[derive(Deserialize)]
+struct ConvertQuery {
+    /// Free each source chunk as its replacement is verified. Off unless asked
+    /// for, because it destroys the source as it goes.
+    #[serde(default)]
+    reclaim: bool,
+}
+
 /// Rewrites every jxl stream into a format Foxglove can decode, replacing the
 /// file in place once every frame has come through. Answers as soon as the job
 /// starts; `/api/convert` reports how far it has got.
-async fn convert_recording(Path(name): Path<String>, State(state): State<AppState>) -> Response {
+async fn convert_recording(
+    Path(name): Path<String>,
+    Query(query): Query<ConvertQuery>,
+    State(state): State<AppState>,
+) -> Response {
     let directory = state.hub.settings().record_dir;
     let source = match record::resolve(&directory, &name) {
         Ok(path) => path,
@@ -556,12 +570,27 @@ async fn convert_recording(Path(name): Path<String>, State(state): State<AppStat
     let Ok(metadata) = source.metadata() else {
         return bad_request(format!("there is no recording called {name}"));
     };
-    let needed = metadata.len() + metadata.len() * OUTPUT_HEADROOM_PERCENT / 100;
+    // Reclaiming gives each source chunk back as it goes, so the two files never
+    // both exist at full size and only the growth has to fit. Without it the
+    // whole second copy does.
+    let growth = metadata.len() * OUTPUT_HEADROOM_PERCENT / 100;
+    let needed = match query.reclaim {
+        true => growth,
+        false => metadata.len() + growth,
+    };
     if let Some(free) = sysmon::free_bytes(&directory) {
         if free < needed {
+            let hint = match query.reclaim {
+                true => String::new(),
+                false => format!(
+                    ". Converting with reclaim would need about {} MB instead, but it \
+                     destroys the original as it goes",
+                    growth / 1_000_000
+                ),
+            };
             return bad_request(format!(
                 "not enough room: the rewrite is written beside the original before it \
-                 replaces it, so it needs about {} MB free and there are {} MB",
+                 replaces it, so it needs about {} MB free and there are {} MB{hint}",
                 needed / 1_000_000,
                 free / 1_000_000
             ));
@@ -586,9 +615,13 @@ async fn convert_recording(Path(name): Path<String>, State(state): State<AppStat
     let running = Arc::clone(&progress);
     // Blocking rather than async: the work is libjxl and zstd on a worker thread,
     // and holding a tokio runtime thread for minutes would stall the monitor.
+    let reclaim = match query.reclaim {
+        true => convert::Reclaim::AsItGoes,
+        false => convert::Reclaim::No,
+    };
     tokio::task::spawn_blocking(move || {
         let outcome =
-            convert::in_place(&source, &running).map_err(|error| error.to_string());
+            convert::in_place(&source, &running, reclaim).map_err(|error| error.to_string());
         if let Some(job) = slot.lock().unwrap().as_mut() {
             job.outcome = Some(outcome);
         }

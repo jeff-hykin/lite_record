@@ -1407,7 +1407,10 @@ const watchConversion = async () => {
             if (status.error) {
                 toast(status.error, true)
             } else if (status.report) {
-                toast(`${status.output}: ${status.report.decoded} frames re-encoded`)
+                const freed = status.report.reclaimed
+                    ? `, ${bytesToText(status.report.reclaimed)} freed as it went`
+                    : ""
+                toast(`${status.output}: ${status.report.decoded} frames re-encoded${freed}`)
             }
             refreshRecordings()
             return
@@ -1469,16 +1472,33 @@ const openFileSheet = (file) => {
 
         if (!isConverted(file.name)) {
             const convert = action("secondary", "Post process", "Re-encode every JPEG XL stream into something Foxglove can draw: webp colour, png infrared, raw 16-bit depth. Lossless, and replaces this file in place — only if every frame decodes.")
+            const start = (reclaim) =>
+                postJson(`/api/recordings/${encodeURIComponent(file.name)}/convert${reclaim ? "?reclaim=true" : ""}`)
             convert.addEventListener("click", async () => {
                 convert.disabled = true
                 try {
-                    await postJson(`/api/recordings/${encodeURIComponent(file.name)}/convert`)
-                    closeSheet()
-                    watchConversion()
+                    await start(false)
                 } catch (error) {
-                    toast(error.message, true)
-                    convert.disabled = false
+                    // The rewrite needs room for a second copy. When that is the
+                    // only thing stopping it, the card can still do the job by
+                    // giving each chunk back as it is converted — but that eats
+                    // the original as it goes, so it takes a deliberate yes.
+                    const tight = error.message.includes("not enough room")
+                    if (!tight || !confirm(`${error.message}.\n\nConvert ${file.name} by freeing the original as it goes? Every chunk is checked before its space is released, but if this is interrupted the recording is left split across two files and has to be put back together by hand.`)) {
+                        toast(error.message, true)
+                        convert.disabled = false
+                        return
+                    }
+                    try {
+                        await start(true)
+                    } catch (retry) {
+                        toast(retry.message, true)
+                        convert.disabled = false
+                        return
+                    }
                 }
+                closeSheet()
+                watchConversion()
             })
         }
 
