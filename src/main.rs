@@ -128,9 +128,10 @@ fn post_process(recording: &Path, reclaim: bool) -> Result<()> {
     let _ = ticker.join();
     let report = report?;
     println!(
-        "{}: {} decoded, {} copied, {} failed, {:.2} GB, {:.2} GB reclaimed, {}s",
+        "{}: {} decoded, {} refitted, {} copied, {} failed, {:.2} GB, {:.2} GB reclaimed, {}s",
         recording.display(),
         report.decoded,
+        report.refitted,
         report.copied,
         report.failed,
         report.bytes as f64 / 1e9,
