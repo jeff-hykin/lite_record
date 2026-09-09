@@ -140,6 +140,18 @@ another process, and re-engages it later without restarting `lite_record`.
   16-bit depth. Colour can be jpeg, webp, png or jpeg-xl; depth and IR fall back to a
   lossless codec when the chosen one cannot hold their bit depth.
 
+### Post processing
+
+Foxglove ships png, jpeg, webp and avif decoders and nothing for jpeg-xl, so a jxl recording
+opens with every image panel blank. **Post process** rewrites the file in place, moving each
+jxl stream into the smallest format Foxglove can decode that still holds its pixels exactly:
+webp for colour, png for infrared, raw `16UC1` for depth. Nothing is thrown away, so the
+result is still the archive — there is no separate viewing copy to keep track of.
+
+It costs disk. Measured on real recordings the file grows 15–26%, most of it raw depth that
+mcap's zstd only partly takes back, and the rewrite is written beside the original before it
+replaces it, so the card needs room for both. The button refuses when it does not have it.
+
 ### Why there is no H.264
 
 There is an `h264` cargo feature wired to `openh264`, but it is off by default and not
@@ -158,9 +170,9 @@ dimos graph without a remapping table.
 
 - `<prefix>/depth_image`, `/color_image`, `/infrared_left`, `/infrared_right` as
   `sensor_msgs/Image`, and the same names with a `/compressed` suffix as
-  `sensor_msgs/CompressedImage` when a codec is chosen. Post-processing decodes the
-  compressed depth and gives the result the bare `<prefix>/depth_image` name, so a
-  processed recording is the one that drops straight into a dimos graph
+  `sensor_msgs/CompressedImage` when a codec is chosen. Post-processing gives decoded
+  depth the bare `<prefix>/depth_image` name, so a processed recording is the one that
+  drops straight into a dimos graph
 - `<prefix>/camera_info` (colour) and `<prefix>/depth_camera_info`,
   `/infrared_left_camera_info`, `/infrared_right_camera_info` as `sensor_msgs/CameraInfo`,
   carrying the intrinsics read from the camera's own factory calibration. Published once

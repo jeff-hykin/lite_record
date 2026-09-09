@@ -1,15 +1,14 @@
 //! Turning a finished recording into one Foxglove will draw.
 //!
-//! Depth records as lossless JPEG XL, which is the right choice for the card —
+//! Images record as lossless JPEG XL, which is the right choice for the card —
 //! but Foxglove ships png, jpeg, webp and avif decoders and nothing for jxl, so
-//! the depth panel comes up empty. There is no extension to install for it the
+//! every image panel comes up empty. There is no extension to install for it the
 //! way there was for RVL.
 //!
-//! So: decode the jxl depth frames and write them back as raw `sensor_msgs/Image`
-//! with `16UC1`, which Foxglove renders natively with its depth colormap. Every
-//! other channel is copied through byte for byte, colour included — see
-//! [`is_depth_topic`] for why colour is left compressed even though Foxglove
-//! cannot draw it either.
+//! So: decode every jxl frame and write it back in a format Foxglove has a
+//! decoder for, picked per pixel layout by [`viewable_format`]. All of them are
+//! lossless. The result is one file that is both the archive and the thing you
+//! look at, which is the point — a viewing copy would mean carrying two.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -22,7 +21,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::cdr::{self, CdrReader};
-use crate::image::decode_jpegxl;
+use crate::image::{compress, decode_jpegxl, ImageFormat};
 use crate::msgs::RawImage;
 
 /// What `format` on a CompressedImage looks like when the payload is JPEG XL.
@@ -36,7 +35,7 @@ pub const COMPRESSED_SUFFIX: &str = "/compressed";
 
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
-    /// Frames decoded from jxl into raw pixels.
+    /// Frames re-encoded out of jxl into something Foxglove can decode.
     pub decoded: u64,
     /// Messages copied through untouched.
     pub copied: u64,
@@ -63,21 +62,33 @@ fn is_jxl(format: &str) -> bool {
     JXL_FORMATS.contains(&format.to_ascii_lowercase().as_str())
 }
 
-/// Whether a compressed image channel carries depth, and so is the one to decode.
+/// What a decoded frame should be written back as, chosen by its pixel layout.
 ///
-/// Foxglove cannot draw jxl colour either, but colour is not worth decoding:
-/// rgb8 photo pixels do not re-compress the way 16-bit depth does, and since the
-/// recording is replaced in place the cost is permanent. Measured on a 4 s clip
-/// off dimpi5 with every stream in jxl, decoding all four took it from 205 MB to
-/// 430 MB; depth alone costs about 15%.
+/// Every option here is lossless, so this is only ever picking the smallest of
+/// the formats Foxglove can decode. Ratios are of the jxl payload each replaces,
+/// measured on frames off dimpi5 by `examples/recode_cost.rs`:
 ///
-/// The topic name is the only thing separating them — depth and colour both
-/// arrive as `format=jxl` — and it holds across all three namings a file can
-/// carry: `<prefix>/depth_image/compressed` today, `<prefix>/depth_image` before
-/// the suffix existed, and `<prefix>/depth/image_raw/compressed` from the ROS
-/// bags. Only a prefix is operator-editable, never the leaf.
-fn is_depth_topic(topic: &str) -> bool {
-    topic.contains("depth")
+/// | layout            | raw   | png   | webp  |
+/// |-------------------|-------|-------|-------|
+/// | rgb8 colour       | 3.90x | 1.60x | 1.16x |
+/// | mono8 infrared    | 2.65x | 1.05x | 1.17x |
+/// | mono16 depth      | 6.20x | 1.36x |  n/a  |
+///
+/// Depth takes raw despite being the dearest of the three. A 16-bit png would be
+/// smaller on disk but Foxglove hands compressed images to the browser's image
+/// decoder, which returns 8 bits per channel, and its depth colormap only runs on
+/// a raw `16UC1` image in the first place. Raw's 6.20x is of the payload and
+/// mostly comes back out in the mcap chunk's zstd, which eats flat 16-bit runs.
+///
+/// The layout, not the topic name, is what decides this: an operator can rename a
+/// topic prefix, and a stream that arrives in an unexpected layout should still
+/// land on a format that can hold it rather than on whatever its name implied.
+fn viewable_format(encoding: &str) -> ImageFormat {
+    match encoding {
+        "mono16" | "16UC1" => ImageFormat::Raw,
+        "rgb8" | "bgr8" | "rgba8" | "bgra8" => ImageFormat::Webp,
+        _ => ImageFormat::Png,
+    }
 }
 
 /// Reads the CompressedImage far enough to answer "is this jxl", then decodes it.
@@ -122,11 +133,11 @@ fn depth_encoding(encoding: &str) -> &str {
 /// which replaces the original only when every single frame decoded — the
 /// decode is exact, so the swap loses nothing, but a recording with even one
 /// undecodable frame is left untouched rather than silently thinned.
-pub fn depth_in_place(input: &Path, progress: &Arc<Progress>) -> Result<Report> {
+pub fn in_place(input: &Path, progress: &Arc<Progress>) -> Result<Report> {
     let mut name = input.file_name().unwrap_or_default().to_os_string();
     name.push(".converting");
     let temp = input.with_file_name(name);
-    let report = match depth_to_viewable(input, &temp, progress) {
+    let report = match to_viewable(input, &temp, progress) {
         Ok(report) => report,
         Err(error) => {
             let _ = std::fs::remove_file(&temp);
@@ -136,7 +147,7 @@ pub fn depth_in_place(input: &Path, progress: &Arc<Progress>) -> Result<Report> 
     if report.failed > 0 {
         let _ = std::fs::remove_file(&temp);
         anyhow::bail!(
-            "{} depth frames would not decode, so {} was left untouched",
+            "{} frames would not decode, so {} was left untouched",
             report.failed,
             input.display()
         );
@@ -145,14 +156,14 @@ pub fn depth_in_place(input: &Path, progress: &Arc<Progress>) -> Result<Report> 
         // Nothing changed, so swapping in the rewrite would only churn the
         // file's compression. This is also what a second run hits.
         let _ = std::fs::remove_file(&temp);
-        anyhow::bail!("no jxl depth in the file — nothing to convert");
+        anyhow::bail!("no jxl images in the file — nothing to convert");
     }
     std::fs::rename(&temp, input)
         .with_context(|| format!("could not replace {}", input.display()))?;
     Ok(report)
 }
 
-pub fn depth_to_viewable(input: &Path, output: &Path, progress: &Arc<Progress>) -> Result<Report> {
+pub fn to_viewable(input: &Path, output: &Path, progress: &Arc<Progress>) -> Result<Report> {
     let source = File::open(input).with_context(|| format!("could not open {}", input.display()))?;
     // Mapped rather than read: a long recording is larger than the Pi's memory,
     // and the pages behind an mcap are touched once and never again.
@@ -179,17 +190,31 @@ pub fn depth_to_viewable(input: &Path, output: &Path, progress: &Arc<Progress>) 
             .schema
             .as_ref()
             .filter(|schema| schema.name == crate::msgs::COMPRESSED_IMAGE_TYPE)
-            .filter(|_| is_depth_topic(&channel.topic))
             .and_then(|_| decoded_frame(&message.data));
 
         let rewritten = match decoded {
-            Some(Ok(image)) => {
-                report.decoded += 1;
-                Some(cdr::raw_image(&RawImage {
-                    encoding: depth_encoding(&image.encoding).to_string(),
-                    ..image
-                }))
-            }
+            Some(Ok(image)) => match viewable_format(&image.encoding) {
+                ImageFormat::Raw => {
+                    report.decoded += 1;
+                    Some(cdr::raw_image(&RawImage {
+                        encoding: depth_encoding(&image.encoding).to_string(),
+                        ..image
+                    }))
+                }
+                format => match compress(&image, format) {
+                    Some(encoded) => {
+                        report.decoded += 1;
+                        Some(cdr::compressed_image(&encoded))
+                    }
+                    // Only reachable if a layout reaches a format that cannot
+                    // hold it, which `viewable_format` exists to prevent. Failing
+                    // here leaves the recording untouched rather than thinning it.
+                    None => {
+                        report.failed += 1;
+                        continue;
+                    }
+                },
+            },
             Some(Err(_)) => {
                 // A frame that will not decode is dropped rather than written as
                 // broken pixels, and shows up in the report.
@@ -210,10 +235,17 @@ pub fn depth_to_viewable(input: &Path, output: &Path, progress: &Arc<Progress>) 
                         "ros2msg",
                         encoded.schema_text.as_bytes(),
                     )?,
-                    channel
-                        .topic
-                        .strip_suffix(COMPRESSED_SUFFIX)
-                        .unwrap_or(&channel.topic),
+                    // Depth comes out as a raw Image and so takes the plain topic
+                    // name a dimos graph expects. A stream that is still a
+                    // CompressedImage, just in a decodable codec, keeps its
+                    // suffix — the name describes the schema, not the codec.
+                    match encoded.schema_name == crate::msgs::IMAGE_TYPE {
+                        true => channel
+                            .topic
+                            .strip_suffix(COMPRESSED_SUFFIX)
+                            .unwrap_or(&channel.topic),
+                        false => channel.topic.as_str(),
+                    },
                 ),
                 None => {
                     let schema = channel

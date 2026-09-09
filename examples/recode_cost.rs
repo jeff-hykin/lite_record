@@ -26,6 +26,7 @@ struct Tally {
     frames: usize,
     jxl: usize,
     candidates: BTreeMap<&'static str, usize>,
+    nanos: BTreeMap<&'static str, u128>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -76,15 +77,18 @@ fn main() -> anyhow::Result<()> {
         for (name, format) in candidates {
             // `compress` returns None when the codec cannot hold the stream's
             // bit depth, which is the answer for jpeg and webp on 16-bit depth.
+            let start = std::time::Instant::now();
             let size = match format {
                 ImageFormat::Raw => image.data.len(),
                 _ => compress(&image, format).map_or(0, |out| out.data.len()),
             };
+            *tally.nanos.entry(name).or_default() += start.elapsed().as_nanos();
             *tally.candidates.entry(name).or_default() += size;
         }
     }
 
-    println!("\n{:38} {:>6} {:>9}  raw    png   webp   jpeg", "topic", "frames", "jxl KB/f");
+    println!("\nsize, as a ratio of the jxl payload it replaces");
+    println!("{:38} {:>6} {:>9}  raw    png   webp   jpeg", "topic", "frames", "jxl KB/f");
     for (topic, tally) in &tallies {
         print!(
             "{topic:38} {:>6} {:>9.1}",
@@ -95,6 +99,22 @@ fn main() -> anyhow::Result<()> {
             match tally.candidates.get(name).copied().unwrap_or(0) {
                 0 => print!("    —  "),
                 total => print!("  {:.2}x", total as f64 / tally.jxl as f64),
+            }
+        }
+        println!();
+    }
+
+    println!("\nencode time, ms per frame on this machine");
+    println!("{:38} {:>7} {:>7} {:>7} {:>7}", "topic", "raw", "png", "webp", "jpeg");
+    for (topic, tally) in &tallies {
+        print!("{topic:38}");
+        for (name, _) in candidates {
+            match tally.nanos.get(name).copied().unwrap_or(0) {
+                0 => print!("{:>7}", "—"),
+                total => print!(
+                    "{:>7.1}",
+                    total as f64 / tally.frames as f64 / 1_000_000.0
+                ),
             }
         }
         println!();

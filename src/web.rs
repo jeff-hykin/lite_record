@@ -36,7 +36,7 @@ const MONITOR_INTERVAL: Duration = Duration::from_millis(200);
 /// newest frame and a client that fell behind should skip to it.
 const PREVIEW_POLL: Duration = Duration::from_millis(20);
 
-/// A running or finished depth conversion. Only one is kept: the Pi is already
+/// A running or finished conversion. Only one is kept: the Pi is already
 /// thermally limited, so two at once would both finish later than two run back to
 /// back, and would make a recording running alongside them drop frames.
 struct Conversion {
@@ -517,25 +517,29 @@ const VIEWABLE_SUFFIX: &str = ".viewable.mcap";
 ///
 /// mcap cannot be edited in place — a message that changes size shifts every
 /// offset after it — so the conversion writes a whole second copy and renames it
-/// over the original, and the card has to hold both for a moment. Only the depth
-/// stream changes though, and while raw 16-bit depth is several times the bulk of
-/// the jxl it replaces, it also compresses far better, so most of the growth
-/// disappears back into mcap's zstd.
+/// over the original, and the card has to hold both for a moment.
 ///
-/// Measured on dimpi5, whole file in and whole file out: 435 MB grew 14.9% and
-/// 200 MB grew 9.3%. A third recording grew 2.7%, but its depth was a wall 2 mm
-/// inside the D435's minimum range and so 89% zeros — that number is what a
-/// near-empty depth stream costs, not what a recording costs. A quarter clears
-/// the real ones with room for a denser scene than either.
+/// Measured whole file in, whole file out, on recordings off dimpi5:
+///
+/// | recording                       | growth |
+/// |---------------------------------|--------|
+/// | 400 MB, all four streams in jxl | +25.8% |
+/// | 244 MB, all four streams in jxl | +21.2% |
+/// | 435 MB, only depth in jxl       | +14.9% |
+///
+/// A fourth grew 2.7%, but its depth was a wall 2 mm inside the D435's minimum
+/// range and so 89% zeros — that is what a near-empty depth stream costs, not
+/// what a recording costs. A third clears every real one with room for a denser
+/// scene, which is the direction these numbers move in.
 ///
 /// Being wrong is not destructive. Every write is `?`-propagated, so running out
 /// deletes the half-written copy and leaves the original untouched; the check
 /// only buys failing in a second rather than after hours of decoding.
-const OUTPUT_HEADROOM_PERCENT: u64 = 25;
+const OUTPUT_HEADROOM_PERCENT: u64 = 35;
 
-/// Decodes the jxl depth stream into raw pixels so Foxglove will draw it,
-/// replacing the file in place once every frame has decoded. Answers as soon as
-/// the job starts; `/api/convert` reports how far it has got.
+/// Rewrites every jxl stream into a format Foxglove can decode, replacing the
+/// file in place once every frame has come through. Answers as soon as the job
+/// starts; `/api/convert` reports how far it has got.
 async fn convert_recording(Path(name): Path<String>, State(state): State<AppState>) -> Response {
     let directory = state.hub.settings().record_dir;
     let source = match record::resolve(&directory, &name) {
@@ -584,7 +588,7 @@ async fn convert_recording(Path(name): Path<String>, State(state): State<AppStat
     // and holding a tokio runtime thread for minutes would stall the monitor.
     tokio::task::spawn_blocking(move || {
         let outcome =
-            convert::depth_in_place(&source, &running).map_err(|error| error.to_string());
+            convert::in_place(&source, &running).map_err(|error| error.to_string());
         if let Some(job) = slot.lock().unwrap().as_mut() {
             job.outcome = Some(outcome);
         }

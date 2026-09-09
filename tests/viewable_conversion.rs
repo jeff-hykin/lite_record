@@ -1,11 +1,11 @@
-//! Records a jxl depth stream the way the Pi does, then converts the finished
-//! file the way the web UI's button does, and checks the result is what Foxglove
-//! needs: raw `16UC1` pixels carrying the original samples, stamp and frame.
+//! Records the jxl streams the Pi does, then converts the finished file the way
+//! the web UI's button does, and checks every one of them came out in something
+//! Foxglove has a decoder for — without losing a pixel.
 //!
 //! The unit test in `image.rs` proves the decoder round-trips one buffer. This
-//! proves the whole file survives: that colour is left alone, that the depth
-//! channel is rewritten rather than duplicated, and that a converted file still
-//! reads back as an mcap.
+//! proves the whole file survives: that each stream lands on the format its pixel
+//! layout calls for, that a channel is rewritten rather than duplicated, and that
+//! a converted file still reads back as an mcap.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -54,6 +54,28 @@ fn read_raw_image(message: &[u8]) -> (String, u32, u32, String, Vec<u8>) {
     (frame_id, height, width, encoding, body[at..at + length].to_vec())
 }
 
+/// The `format` string and payload of a `sensor_msgs/CompressedImage`.
+fn read_compressed_image(message: &[u8]) -> (String, Vec<u8>) {
+    let mut reader = lite_record::cdr::CdrReader::new(message);
+    let _ = reader.header();
+    (reader.string(), reader.bytes().to_vec())
+}
+
+fn decode_webp(encoded: &[u8]) -> Vec<u8> {
+    let mut decoder = image_webp::WebPDecoder::new(std::io::Cursor::new(encoded)).unwrap();
+    let mut pixels = vec![0u8; decoder.output_buffer_size().unwrap()];
+    decoder.read_image(&mut pixels).unwrap();
+    pixels
+}
+
+fn decode_png(encoded: &[u8]) -> Vec<u8> {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(encoded)).read_info().unwrap();
+    let mut pixels = vec![0u8; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut pixels).unwrap();
+    pixels.truncate(info.buffer_size());
+    pixels
+}
+
 /// Every message in a file, keyed by topic, as (schema name, payloads).
 fn read_back(path: &std::path::Path) -> BTreeMap<String, (String, Vec<Vec<u8>>)> {
     let bytes = std::fs::read(path).unwrap();
@@ -76,16 +98,15 @@ fn read_back(path: &std::path::Path) -> BTreeMap<String, (String, Vec<Vec<u8>>)>
 }
 
 #[test]
-fn converting_a_recording_replaces_its_jxl_depth_with_pixels_foxglove_can_draw() {
+fn converting_a_recording_moves_every_jxl_stream_to_a_format_foxglove_can_draw() {
     let directory =
         std::env::temp_dir().join(format!("lite_record_convert_{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
 
     let mut settings = Settings {
         record_dir: directory.clone(),
-        // Colour in jxl too, as the rig actually records it. The conversion has
-        // to leave it alone: decoding every jxl stream rather than just depth
-        // doubled a real recording.
+        // Colour and infrared in jxl too, as the rig actually records them.
+        // Foxglove cannot draw any of the three, so all three have to move.
         color_format: ImageFormat::Jpegxl,
         depth_format: ImageFormat::Jpegxl,
         preview_enabled: false,
@@ -112,6 +133,20 @@ fn converting_a_recording_replaces_its_jxl_depth_with_pixels_foxglove_can_draw()
             data: (0..WIDTH * HEIGHT * 3).map(|index| ((index * 7) % 251) as u8).collect(),
         },
     });
+    let infrared: Vec<u8> = (0..WIDTH * HEIGHT).map(|index| ((index * 31) % 253) as u8).collect();
+    sink(Produced::Image {
+        stream: StreamId::InfraLeft,
+        topic: "/camera/infrared_left".to_owned(),
+        image: RawImage {
+            header: Header::new(STAMP, "camera_infra1_optical_frame"),
+            width: WIDTH,
+            height: HEIGHT,
+            step: WIDTH,
+            is_bigendian: 0,
+            encoding: "mono8".to_owned(),
+            data: infrared.clone(),
+        },
+    });
     sink(Produced::Image {
         stream: StreamId::Depth,
         topic: "/camera/depth_image".to_owned(),
@@ -135,13 +170,12 @@ fn converting_a_recording_replaces_its_jxl_depth_with_pixels_foxglove_can_draw()
         "depth did not record as jxl, so there is nothing to convert"
     );
 
-    let original_color = read_back(source)["/camera/color_image/compressed"].1.clone();
+    let color_pixels: Vec<u8> = (0..WIDTH * HEIGHT * 3).map(|index| ((index * 7) % 251) as u8).collect();
 
     let progress = Arc::new(convert::Progress::default());
-    let report = convert::depth_in_place(source, &progress).unwrap();
-    assert_eq!(report.decoded, 1);
+    let report = convert::in_place(source, &progress).unwrap();
+    assert_eq!(report.decoded, 3, "a jxl stream was left in a format Foxglove cannot draw");
     assert_eq!(report.failed, 0);
-    assert!(report.copied >= 1, "colour was not carried over");
     assert_eq!(
         report.bytes,
         std::fs::metadata(source).unwrap().len(),
@@ -176,23 +210,25 @@ fn converting_a_recording_replaces_its_jxl_depth_with_pixels_foxglove_can_draw()
         .collect();
     assert_eq!(recovered, depth_samples(), "conversion changed the depths");
 
-    // Colour is jxl as well, and must still come through as the bytes that were
-    // recorded: on its own topic, still compressed, byte for byte.
+    // Colour and infrared stay compressed — just in a codec with a decoder behind
+    // it — so they keep the `/compressed` name, which describes the schema.
     let (color_schema, color_payloads) = &channels["/camera/color_image/compressed"];
-    assert_eq!(
-        color_schema, "sensor_msgs/msg/CompressedImage",
-        "colour was decoded too, which doubles the file the conversion replaces"
-    );
-    assert_eq!(
-        color_payloads, &original_color,
-        "colour was rewritten instead of copied"
-    );
+    assert_eq!(color_schema, "sensor_msgs/msg/CompressedImage");
+    let (format, encoded) = read_compressed_image(&color_payloads[0]);
+    assert_eq!(format, "webp", "Foxglove has no jxl decoder");
+    assert_eq!(decode_webp(&encoded), color_pixels, "the webp lost colour pixels");
+
+    let (infra_schema, infra_payloads) = &channels["/camera/infrared_left/compressed"];
+    assert_eq!(infra_schema, "sensor_msgs/msg/CompressedImage");
+    let (format, encoded) = read_compressed_image(&infra_payloads[0]);
+    assert_eq!(format, "png", "Foxglove has no jxl decoder");
+    assert_eq!(decode_png(&encoded), infrared, "the png lost infrared pixels");
 
     // A second run finds no jxl left. It must refuse and leave the file alone,
     // because a "conversion" that re-compresses an already-raw file in place
     // would churn every recording someone taps twice.
     let before = std::fs::read(source).unwrap();
-    let error = convert::depth_in_place(source, &progress).unwrap_err();
+    let error = convert::in_place(source, &progress).unwrap_err();
     assert!(error.to_string().contains("nothing to convert"), "{error}");
     assert_eq!(std::fs::read(source).unwrap(), before, "a refused conversion changed the file");
 

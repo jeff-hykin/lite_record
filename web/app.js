@@ -1407,7 +1407,7 @@ const watchConversion = async () => {
             if (status.error) {
                 toast(status.error, true)
             } else if (status.report) {
-                toast(`${status.output}: ${status.report.decoded} depth frames decoded`)
+                toast(`${status.output}: ${status.report.decoded} frames re-encoded`)
             }
             refreshRecordings()
             return
@@ -1468,7 +1468,7 @@ const openFileSheet = (file) => {
         actions.append(download)
 
         if (!isConverted(file.name)) {
-            const convert = action("secondary", "Post process", "Decode the JPEG XL depth into raw 16-bit pixels Foxglove can draw. Replaces this file in place — exact, only if every frame decodes.")
+            const convert = action("secondary", "Post process", "Re-encode every JPEG XL stream into something Foxglove can draw: webp colour, png infrared, raw 16-bit depth. Lossless, and replaces this file in place — only if every frame decodes.")
             convert.addEventListener("click", async () => {
                 convert.disabled = true
                 try {
