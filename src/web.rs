@@ -519,12 +519,19 @@ const VIEWABLE_SUFFIX: &str = ".viewable.mcap";
 /// offset after it — so the conversion writes a whole second copy and renames it
 /// over the original, and the card has to hold both for a moment. Only the depth
 /// stream changes though, and while raw 16-bit depth is several times the bulk of
-/// the jxl it replaces, it also compresses far better, so almost all of the
-/// growth disappears back into mcap's zstd. Measured on a real recording whose
-/// depth was 40% of the file, the output came out 2.7% larger; a tenth covers
-/// even an all-depth recording. Running out anyway is not destructive: the
-/// half-written copy is deleted and the original is left untouched.
-const OUTPUT_HEADROOM_PERCENT: u64 = 10;
+/// the jxl it replaces, it also compresses far better, so most of the growth
+/// disappears back into mcap's zstd.
+///
+/// Measured on dimpi5, whole file in and whole file out: 435 MB grew 14.9% and
+/// 200 MB grew 9.3%. A third recording grew 2.7%, but its depth was a wall 2 mm
+/// inside the D435's minimum range and so 89% zeros — that number is what a
+/// near-empty depth stream costs, not what a recording costs. A quarter clears
+/// the real ones with room for a denser scene than either.
+///
+/// Being wrong is not destructive. Every write is `?`-propagated, so running out
+/// deletes the half-written copy and leaves the original untouched; the check
+/// only buys failing in a second rather than after hours of decoding.
+const OUTPUT_HEADROOM_PERCENT: u64 = 25;
 
 /// Decodes the jxl depth stream into raw pixels so Foxglove will draw it,
 /// replacing the file in place once every frame has decoded. Answers as soon as
