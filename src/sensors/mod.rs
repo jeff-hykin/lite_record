@@ -250,7 +250,9 @@ impl CameraConfig {
             height: 480,
             frame_rate: 30,
             imu_rate: default_imu_rate(),
-            emitter: true,
+            // Off by default: the projector's speckle blankets the IR pair and
+            // ruins stereo VO (grocery recording, 2026-09-09).
+            emitter: false,
             align_depth_to_color: false,
         }
     }
