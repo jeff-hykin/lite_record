@@ -9,6 +9,7 @@
 pub mod access;
 pub mod cdr;
 pub mod convert;
+pub mod distortion;
 pub mod hub;
 pub mod image;
 pub mod livox;

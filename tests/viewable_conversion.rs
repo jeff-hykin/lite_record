@@ -14,7 +14,7 @@ use std::time::Duration;
 use lite_record::convert;
 use lite_record::hub::{Hub, Settings};
 use lite_record::image::ImageFormat;
-use lite_record::msgs::{Header, RawImage};
+use lite_record::msgs::{CameraInfo, DistortionModel, Header, RawImage};
 use lite_record::sensors::{Produced, StreamId};
 
 const WIDTH: usize = 32;
@@ -286,6 +286,92 @@ fn reclaiming_frees_each_source_chunk_once_its_replacement_is_verified() {
             .collect();
         assert_eq!(recovered, noisy_depth(frame), "frame {frame} came back changed");
     }
+
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+/// The grocery-store recording's exact shape: colour already in webp, depth
+/// already raw, and the only thing wrong with the file is a camera_info whose
+/// model reads "unknown". Conversion must go ahead on the strength of the
+/// refit alone rather than bailing with "nothing to convert".
+#[test]
+fn a_recording_with_only_unknown_camera_infos_still_converts() {
+    let directory = std::env::temp_dir().join(format!("lite_record_refit_{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("refit.mcap");
+
+    // The D455 colour calibration as the recorder writes it: inverse
+    // Brown-Conrady coefficients under `distortion_model: "unknown"`.
+    let info = CameraInfo::pinhole(
+        Header::new(STAMP, "camera_color_optical_frame"),
+        1280,
+        720,
+        643.5430297851562,
+        642.5350341796875,
+        642.154296875,
+        363.13568115234375,
+        DistortionModel::Unknown,
+        vec![
+            -0.05730598792433739,
+            0.06331121921539307,
+            -0.0006074838456697762,
+            0.0005913236527703702,
+            -0.020124996080994606,
+        ],
+        0.0,
+    );
+    let encoded = lite_record::cdr::camera_info(&info);
+    const COPIES: u64 = 8;
+    {
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = mcap::WriteOptions::new()
+            .compression(Some(mcap::Compression::Zstd))
+            .profile("ros2")
+            .create(std::io::BufWriter::new(file))
+            .unwrap();
+        let schema = writer
+            .add_schema(encoded.schema_name, "ros2msg", encoded.schema_text.as_bytes())
+            .unwrap();
+        let channel = writer
+            .add_channel(schema, "/realsense/camera_info", "cdr", &BTreeMap::new())
+            .unwrap();
+        for sequence in 0..COPIES {
+            writer
+                .write_to_known_channel(
+                    &mcap::records::MessageHeader {
+                        channel_id: channel,
+                        sequence: sequence as u32,
+                        log_time: STAMP + sequence,
+                        publish_time: STAMP + sequence,
+                    },
+                    &encoded.data,
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    let progress = Arc::new(convert::Progress::default());
+    let report = convert::in_place(&path, &progress, convert::Reclaim::No).unwrap();
+    assert_eq!(report.refitted, COPIES);
+    assert_eq!(report.decoded, 0);
+    assert_eq!(report.failed, 0);
+
+    let channels = read_back(&path);
+    let (schema, payloads) = &channels["/realsense/camera_info"];
+    assert_eq!(schema, "sensor_msgs/msg/CameraInfo");
+    assert_eq!(payloads.len(), COPIES as usize);
+    let refit = lite_record::distortion::parse_camera_info(&payloads[0]);
+    assert_eq!(refit.distortion_model, "plumb_bob");
+    assert_eq!(refit.header, info.header);
+    assert_eq!(refit.intrinsics, info.intrinsics, "the refit must not touch K");
+    assert_eq!(refit.projection, info.projection, "the refit must not touch P");
+    assert_ne!(refit.distortion, info.distortion, "the coefficients were relabelled, not refitted");
+
+    // Run two: everything already reads plumb_bob, so there is nothing left to
+    // do and the file must be refused rather than churned.
+    let error = convert::in_place(&path, &progress, convert::Reclaim::No).unwrap_err();
+    assert!(error.to_string().contains("nothing to convert"), "{error}");
 
     std::fs::remove_dir_all(&directory).ok();
 }

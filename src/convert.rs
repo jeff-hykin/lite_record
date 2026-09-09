@@ -9,6 +9,11 @@
 //! decoder for, picked per pixel layout by [`viewable_format`]. All of them are
 //! lossless. The result is one file that is both the archive and the thing you
 //! look at, which is the point — a viewing copy would mean carrying two.
+//!
+//! The same pass also mends calibrations: a camera_info recorded with
+//! `distortion_model: "unknown"` — a RealSense inverse Brown-Conrady stream,
+//! which has no ROS name — blanks any image panel its topic is attached to, so
+//! it is refitted as genuine forward `plumb_bob` by [`crate::distortion`].
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -39,6 +44,9 @@ pub const COMPRESSED_SUFFIX: &str = "/compressed";
 pub struct Report {
     /// Frames re-encoded out of jxl into something Foxglove can decode.
     pub decoded: u64,
+    /// Camera infos rewritten from an "unknown" inverse Brown-Conrady
+    /// calibration to a fitted forward plumb_bob one.
+    pub refitted: u64,
     /// Messages copied through untouched.
     pub copied: u64,
     /// Frames whose decode failed. They are dropped, not written broken.
@@ -166,11 +174,11 @@ pub fn in_place(input: &Path, progress: &Arc<Progress>, reclaim: Reclaim) -> Res
             input.display()
         );
     }
-    if report.decoded == 0 {
+    if report.decoded == 0 && report.refitted == 0 {
         // Nothing changed, so swapping in the rewrite would only churn the
         // file's compression. This is also what a second run hits.
         discard(&temp);
-        anyhow::bail!("no jxl images in the file — nothing to convert");
+        anyhow::bail!("no jxl images or refittable camera infos — nothing to convert");
     }
     std::fs::rename(&temp, input)
         .with_context(|| format!("could not replace {}", input.display()))?;
@@ -186,6 +194,11 @@ struct Rewriter {
     /// sequence number. A decoded channel and a copied channel never share an
     /// id, so one map covers both.
     channels: HashMap<u16, (u16, u32)>,
+    /// One distortion fit per camera_info channel, keyed by the coefficients
+    /// it was made from — a calibration is constant over a recording, and a
+    /// stream carries tens of thousands of copies of it, none of which should
+    /// pay for the fit again. `None` remembers a fit that was rejected.
+    fits: HashMap<u16, (Vec<f64>, Option<[f64; 5]>)>,
     report: Report,
 }
 
@@ -201,51 +214,92 @@ impl Rewriter {
         Ok(Self {
             writer,
             channels: HashMap::new(),
+            fits: HashMap::new(),
             report: Report::default(),
+        })
+    }
+
+    /// The camera_info leg of the rewrite: an "unknown"-model calibration gets
+    /// its distortion refitted as forward plumb_bob. `None` — copy the message
+    /// through untouched — for every other model, and for a stream whose fit
+    /// did not reproduce the recorded mapping.
+    fn refit(&mut self, channel: u16, payload: &[u8]) -> Option<cdr::Encoded> {
+        let info = crate::distortion::parse_camera_info(payload);
+        if info.distortion_model != crate::msgs::DistortionModel::Unknown.as_str() {
+            return None;
+        }
+        let cached = self
+            .fits
+            .get(&channel)
+            .filter(|(source, _)| *source == info.distortion)
+            .map(|(_, fit)| *fit);
+        let fitted = cached.unwrap_or_else(|| {
+            let fit = crate::distortion::fit_forward_plumb_bob(&info);
+            self.fits.insert(channel, (info.distortion.clone(), fit));
+            fit
+        });
+        fitted.map(|coefficients| {
+            cdr::camera_info(&crate::msgs::CameraInfo {
+                distortion_model: crate::msgs::DistortionModel::PlumbBob.as_str().to_string(),
+                distortion: coefficients.to_vec(),
+                ..info
+            })
         })
     }
 
     fn write(&mut self, message: &mcap::Message) -> Result<()> {
         let channel = &message.channel;
-        let decoded = channel
-            .schema
-            .as_ref()
-            .filter(|schema| schema.name == crate::msgs::COMPRESSED_IMAGE_TYPE)
-            .and_then(|_| decoded_frame(&message.data));
+        let schema_name = channel.schema.as_ref().map(|schema| schema.name.as_str());
 
-        let rewritten = match decoded {
-            Some(Ok(image)) => match viewable_format(&image.encoding) {
-                ImageFormat::Raw => {
-                    self.report.decoded += 1;
-                    Some(cdr::raw_image(&RawImage {
-                        encoding: depth_encoding(&image.encoding).to_string(),
-                        ..image
-                    }))
-                }
-                format => match compress(&image, format) {
-                    Some(encoded) => {
+        let rewritten = if schema_name == Some(crate::msgs::COMPRESSED_IMAGE_TYPE) {
+            match decoded_frame(&message.data) {
+                Some(Ok(image)) => match viewable_format(&image.encoding) {
+                    ImageFormat::Raw => {
                         self.report.decoded += 1;
-                        Some(cdr::compressed_image(&encoded))
+                        Some(cdr::raw_image(&RawImage {
+                            encoding: depth_encoding(&image.encoding).to_string(),
+                            ..image
+                        }))
                     }
-                    // Only reachable if a layout reaches a format that cannot
-                    // hold it, which `viewable_format` exists to prevent. Failing
-                    // here leaves the recording untouched rather than thinning it.
-                    None => {
-                        self.report.failed += 1;
-                        return Ok(());
-                    }
+                    format => match compress(&image, format) {
+                        Some(encoded) => {
+                            self.report.decoded += 1;
+                            Some(cdr::compressed_image(&encoded))
+                        }
+                        // Only reachable if a layout reaches a format that cannot
+                        // hold it, which `viewable_format` exists to prevent. Failing
+                        // here leaves the recording untouched rather than thinning it.
+                        None => {
+                            self.report.failed += 1;
+                            return Ok(());
+                        }
+                    },
                 },
-            },
-            Some(Err(_)) => {
-                // A frame that will not decode is dropped rather than written as
-                // broken pixels, and shows up in the report.
-                self.report.failed += 1;
-                return Ok(());
+                Some(Err(_)) => {
+                    // A frame that will not decode is dropped rather than written as
+                    // broken pixels, and shows up in the report.
+                    self.report.failed += 1;
+                    return Ok(());
+                }
+                None => {
+                    self.report.copied += 1;
+                    None
+                }
             }
-            None => {
-                self.report.copied += 1;
-                None
+        } else if schema_name == Some(crate::msgs::CAMERA_INFO_TYPE) {
+            match self.refit(channel.id, &message.data) {
+                Some(encoded) => {
+                    self.report.refitted += 1;
+                    Some(encoded)
+                }
+                None => {
+                    self.report.copied += 1;
+                    None
+                }
             }
+        } else {
+            self.report.copied += 1;
+            None
         };
 
         if let std::collections::hash_map::Entry::Vacant(slot) = self.channels.entry(channel.id) {
@@ -306,7 +360,7 @@ impl Rewriter {
     }
 
     fn written(&self) -> u64 {
-        self.report.decoded + self.report.copied
+        self.report.decoded + self.report.refitted + self.report.copied
     }
 }
 
@@ -466,7 +520,7 @@ fn by_chunk(
     // only way to notice is to count. Better to refuse than to hand back a
     // recording that is quietly missing messages.
     if let Some(stats) = &summary.stats {
-        let seen = report.decoded + report.copied + report.failed;
+        let seen = report.decoded + report.refitted + report.copied + report.failed;
         if stats.message_count != 0 && stats.message_count != seen {
             anyhow::bail!(
                 "the index accounts for {} messages but the file says it holds {} — \
