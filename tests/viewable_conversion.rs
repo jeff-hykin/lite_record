@@ -117,6 +117,91 @@ fn noisy_depth(frame: usize) -> Vec<u16> {
         .collect()
 }
 
+/// A smooth full-size depth frame: 1.8 MB raw, and so compressible that the
+/// chunk it lands in is a few KB on the disk. That gap is the whole point —
+/// the verifier reads back a byte range far smaller than one record.
+fn smooth_depth(frame: usize) -> Vec<u16> {
+    (0..BIG_WIDE * BIG_TALL)
+        .map(|index| ((index / BIG_WIDE + index % BIG_WIDE + frame) / 4) as u16)
+        .collect()
+}
+
+const BIG_WIDE: usize = 1280;
+const BIG_TALL: usize = 720;
+
+#[test]
+fn a_frame_larger_than_its_compressed_chunk_still_verifies() {
+    let directory = std::env::temp_dir().join(format!("lite_record_big_{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+
+    let mut settings = Settings {
+        record_dir: directory.clone(),
+        depth_format: ImageFormat::Jpegxl,
+        preview_enabled: false,
+        ..Settings::default()
+    };
+    settings.livox.enabled = false;
+    settings.realsense.enabled = false;
+    settings.orbbec.enabled = false;
+
+    let hub = Hub::new(settings, directory.join("settings.json"));
+    let recorded = hub.start_recording(Some("big")).unwrap().path.unwrap();
+    let sink = hub.sink();
+    const FRAMES: usize = 4;
+    for frame in 0..FRAMES {
+        sink(Produced::Image {
+            stream: StreamId::Depth,
+            topic: "/camera/depth_image".to_owned(),
+            image: RawImage {
+                header: Header::new(STAMP + frame as u64, "camera_depth_optical_frame"),
+                width: BIG_WIDE,
+                height: BIG_TALL,
+                step: BIG_WIDE * 2,
+                is_bigendian: 0,
+                encoding: "16UC1".to_owned(),
+                data: smooth_depth(frame).iter().flat_map(|s| s.to_le_bytes()).collect(),
+            },
+        });
+    }
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(hub.stop_recording().unwrap().dropped, 0);
+
+    let source = std::path::Path::new(&recorded);
+    let output = directory.join("big_viewable.mcap");
+    let progress = Arc::new(convert::Progress::default());
+    let report = convert::to_viewable(source, &output, &progress, convert::Reclaim::No).unwrap();
+    assert_eq!(report.decoded, FRAMES as u64);
+    assert_eq!(report.failed, 0);
+
+    // The gap the test exists for: every output chunk is smaller on the disk
+    // than the single raw frame it holds.
+    let bytes = std::fs::read(&output).unwrap();
+    let summary = mcap::Summary::read(&bytes).unwrap().unwrap();
+    let raw_frame = (BIG_WIDE * BIG_TALL * 2) as u64;
+    assert!(
+        summary.chunk_indexes.iter().all(|chunk| chunk.chunk_length < raw_frame),
+        "the frames did not compress, so this would pass without the fix"
+    );
+    drop(bytes);
+
+    let channels = read_back(&output);
+    let (_, payloads) = &channels["/camera/depth_image"];
+    assert_eq!(payloads.len(), FRAMES);
+    for (frame, payload) in payloads.iter().enumerate() {
+        let (_, height, width, _, pixels) = read_raw_image(payload);
+        assert_eq!((width, height), (BIG_WIDE as u32, BIG_TALL as u32));
+        let recovered: Vec<u16> = pixels
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect();
+        assert_eq!(recovered, smooth_depth(frame), "frame {frame} came back changed");
+    }
+
+    std::fs::remove_dir_all(&directory).ok();
+}
+
 #[test]
 fn reclaiming_frees_each_source_chunk_once_its_replacement_is_verified() {
     let directory =

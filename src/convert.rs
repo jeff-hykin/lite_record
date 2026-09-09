@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use mcap::sans_io::linear_reader::{LinearReadEvent, LinearReader, LinearReaderOptions};
 use serde::Serialize;
 
 use crate::cdr::{self, CdrReader};
@@ -487,17 +488,38 @@ fn verify(output: &Path, from: u64, to: u64) -> Result<u64> {
         return Ok(0);
     }
     let file = File::open(output)?;
-    let mut bytes = vec![0; (to - from) as usize];
-    file.read_exact_at(&mut bytes, from)?;
 
-    // `LinearReader` walks into chunks rather than handing them back whole, so a
+    // The reader walks into chunks rather than handing them back whole, so a
     // message only turns up here if its chunk's zstd stream decompressed and
     // every record in it parsed — which is exactly what needs proving before the
     // source's copy is released.
+    //
+    // `read::LinearReader` cannot do this job: it caps record length at the
+    // length of the buffer it is handed, and a decompressed frame is routinely
+    // larger than the compressed chunk it came out of.
+    let mut reader = LinearReader::new_with_options(
+        LinearReaderOptions::default()
+            .with_skip_start_magic(true)
+            .with_skip_end_magic(true),
+    );
+    let mut cursor = from;
     let mut messages = 0;
-    for record in mcap::read::LinearReader::sans_magic(&bytes) {
-        if matches!(record?, mcap::records::Record::Message { .. }) {
-            messages += 1;
+    while let Some(event) = reader.next_event() {
+        match event? {
+            LinearReadEvent::ReadRequest(wanted) => {
+                let taking = wanted.min((to - cursor) as usize);
+                let read = file.read_at(&mut reader.insert(taking)[..taking], cursor)?;
+                reader.notify_read(read);
+                cursor += read as u64;
+            }
+            LinearReadEvent::Record { data, opcode } => {
+                if matches!(
+                    mcap::read::parse_record(opcode, data)?,
+                    mcap::records::Record::Message { .. }
+                ) {
+                    messages += 1;
+                }
+            }
         }
     }
     Ok(messages)
