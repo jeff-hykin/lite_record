@@ -5,9 +5,11 @@
 //! the depth panel comes up empty. There is no extension to install for it the
 //! way there was for RVL.
 //!
-//! So: decode each jxl frame and write it back as a raw `sensor_msgs/Image` with
-//! `16UC1`, which Foxglove renders natively with its depth colormap. Every other
-//! channel is copied through byte for byte.
+//! So: decode the jxl depth frames and write them back as raw `sensor_msgs/Image`
+//! with `16UC1`, which Foxglove renders natively with its depth colormap. Every
+//! other channel is copied through byte for byte, colour included — see
+//! [`is_depth_topic`] for why colour is left compressed even though Foxglove
+//! cannot draw it either.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -59,6 +61,23 @@ fn file_size(path: &Path) -> u64 {
 
 fn is_jxl(format: &str) -> bool {
     JXL_FORMATS.contains(&format.to_ascii_lowercase().as_str())
+}
+
+/// Whether a compressed image channel carries depth, and so is the one to decode.
+///
+/// Foxglove cannot draw jxl colour either, but colour is not worth decoding:
+/// rgb8 photo pixels do not re-compress the way 16-bit depth does, and since the
+/// recording is replaced in place the cost is permanent. Measured on a 4 s clip
+/// off dimpi5 with every stream in jxl, decoding all four took it from 205 MB to
+/// 430 MB; depth alone costs about 15%.
+///
+/// The topic name is the only thing separating them — depth and colour both
+/// arrive as `format=jxl` — and it holds across all three namings a file can
+/// carry: `<prefix>/depth_image/compressed` today, `<prefix>/depth_image` before
+/// the suffix existed, and `<prefix>/depth/image_raw/compressed` from the ROS
+/// bags. Only a prefix is operator-editable, never the leaf.
+fn is_depth_topic(topic: &str) -> bool {
+    topic.contains("depth")
 }
 
 /// Reads the CompressedImage far enough to answer "is this jxl", then decodes it.
@@ -160,6 +179,7 @@ pub fn depth_to_viewable(input: &Path, output: &Path, progress: &Arc<Progress>) 
             .schema
             .as_ref()
             .filter(|schema| schema.name == crate::msgs::COMPRESSED_IMAGE_TYPE)
+            .filter(|_| is_depth_topic(&channel.topic))
             .and_then(|_| decoded_frame(&message.data));
 
         let rewritten = match decoded {

@@ -83,7 +83,10 @@ fn converting_a_recording_replaces_its_jxl_depth_with_pixels_foxglove_can_draw()
 
     let mut settings = Settings {
         record_dir: directory.clone(),
-        color_format: ImageFormat::Jpeg,
+        // Colour in jxl too, as the rig actually records it. The conversion has
+        // to leave it alone: decoding every jxl stream rather than just depth
+        // doubled a real recording.
+        color_format: ImageFormat::Jpegxl,
         depth_format: ImageFormat::Jpegxl,
         preview_enabled: false,
         ..Settings::default()
@@ -173,9 +176,15 @@ fn converting_a_recording_replaces_its_jxl_depth_with_pixels_foxglove_can_draw()
         .collect();
     assert_eq!(recovered, depth_samples(), "conversion changed the depths");
 
-    // Colour is not jxl, so it must come through as the bytes that were recorded.
+    // Colour is jxl as well, and must still come through as the bytes that were
+    // recorded: on its own topic, still compressed, byte for byte.
+    let (color_schema, color_payloads) = &channels["/camera/color_image/compressed"];
     assert_eq!(
-        channels["/camera/color_image/compressed"].1, original_color,
+        color_schema, "sensor_msgs/msg/CompressedImage",
+        "colour was decoded too, which doubles the file the conversion replaces"
+    );
+    assert_eq!(
+        color_payloads, &original_color,
         "colour was rewritten instead of copied"
     );
 
