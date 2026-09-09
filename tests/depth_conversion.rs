@@ -127,12 +127,12 @@ fn converting_a_recording_replaces_its_jxl_depth_with_pixels_foxglove_can_draw()
 
     let source = std::path::Path::new(&recorded);
     assert_eq!(
-        read_back(source)["/camera/depth_image"].0,
+        read_back(source)["/camera/depth_image/compressed"].0,
         "sensor_msgs/msg/CompressedImage",
         "depth did not record as jxl, so there is nothing to convert"
     );
 
-    let original_color = read_back(source)["/camera/color_image"].1.clone();
+    let original_color = read_back(source)["/camera/color_image/compressed"].1.clone();
 
     let progress = Arc::new(convert::Progress::default());
     let report = convert::depth_in_place(source, &progress).unwrap();
@@ -156,6 +156,10 @@ fn converting_a_recording_replaces_its_jxl_depth_with_pixels_foxglove_can_draw()
     let (schema, payloads) = &channels["/camera/depth_image"];
     assert_eq!(schema, "sensor_msgs/msg/Image");
     assert_eq!(payloads.len(), 1, "the depth frame was duplicated, not replaced");
+    assert!(
+        !channels.contains_key("/camera/depth_image/compressed"),
+        "the decoded depth was added beside the jxl instead of taking over its name"
+    );
 
     let (frame_id, height, width, encoding, pixels) = read_raw_image(&payloads[0]);
     assert_eq!(frame_id, "camera_depth_optical_frame");
@@ -171,7 +175,7 @@ fn converting_a_recording_replaces_its_jxl_depth_with_pixels_foxglove_can_draw()
 
     // Colour is not jxl, so it must come through as the bytes that were recorded.
     assert_eq!(
-        channels["/camera/color_image"].1, original_color,
+        channels["/camera/color_image/compressed"].1, original_color,
         "colour was rewritten instead of copied"
     );
 

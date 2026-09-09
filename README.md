@@ -154,11 +154,13 @@ is 8-bit.
 One mcap, ROS2 CDR encoded with schemas, so it opens in Foxglove without a conversion step.
 
 Topics are named after the matching dimos module's outputs, so a recording drops into a
-dimos graph without a remapping table. dimos carries raw and compressed images on one
-output and tells them apart by message type, which is why neither word appears in a name.
+dimos graph without a remapping table.
 
 - `<prefix>/depth_image`, `/color_image`, `/infrared_left`, `/infrared_right` as
-  `sensor_msgs/Image`, or `CompressedImage` when a codec is chosen — one topic either way
+  `sensor_msgs/Image`, and the same names with a `/compressed` suffix as
+  `sensor_msgs/CompressedImage` when a codec is chosen. Post-processing decodes the
+  compressed depth and gives the result the bare `<prefix>/depth_image` name, so a
+  processed recording is the one that drops straight into a dimos graph
 - `<prefix>/camera_info` (colour) and `<prefix>/depth_camera_info`,
   `/infrared_left_camera_info`, `/infrared_right_camera_info` as `sensor_msgs/CameraInfo`,
   carrying the intrinsics read from the camera's own factory calibration. Published once

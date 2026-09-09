@@ -167,7 +167,7 @@ fn choosing_jpeg_and_png_rewrites_the_topics_schemas_and_payloads() {
     let channels = record_one_frame_each("jpeg_png", ImageFormat::Jpeg, ImageFormat::Png);
 
     let (schema, payloads) = channels
-        .get("/camera/color_image")
+        .get("/camera/color_image/compressed")
         .expect("colour is missing from the file");
     assert_eq!(schema, "sensor_msgs/msg/CompressedImage");
     let (format, data) = read_compressed_image(&payloads[0]);
@@ -178,7 +178,7 @@ fn choosing_jpeg_and_png_rewrites_the_topics_schemas_and_payloads() {
     assert!(data.len() < 32 * 24 * 3, "jpeg was not smaller than raw");
 
     let (schema, payloads) = channels
-        .get("/camera/depth_image")
+        .get("/camera/depth_image/compressed")
         .expect("depth is missing from the file");
     assert_eq!(schema, "sensor_msgs/msg/CompressedImage");
     let (format, data) = read_compressed_image(&payloads[0]);
@@ -207,7 +207,7 @@ fn choosing_jpeg_and_png_rewrites_the_topics_schemas_and_payloads() {
 fn webp_colour_survives_the_recording_pixel_for_pixel() {
     let channels = record_one_frame_each("webp", ImageFormat::Webp, ImageFormat::Png);
     let (_, payloads) = channels
-        .get("/camera/color_image")
+        .get("/camera/color_image/compressed")
         .expect("colour is missing from the file");
     let (format, data) = read_compressed_image(&payloads[0]);
     assert_eq!(format, "webp");
@@ -226,8 +226,8 @@ fn webp_colour_survives_the_recording_pixel_for_pixel() {
 fn a_codec_that_cannot_hold_depth_leaves_the_frame_raw_rather_than_truncating_it() {
     let channels = record_one_frame_each("lossy_depth", ImageFormat::Jpeg, ImageFormat::Jpeg);
 
-    // Raw and compressed share the topic, so the schema is what says whether
-    // the codec was applied or refused.
+    // A refused codec leaves the frame raw, so it lands on the bare topic
+    // rather than the `/compressed` one a codec would have produced.
     let (schema, payloads) = channels
         .get("/camera/depth_image")
         .expect("depth was dropped entirely instead of falling back to raw");
@@ -239,7 +239,7 @@ fn a_codec_that_cannot_hold_depth_leaves_the_frame_raw_rather_than_truncating_it
 
     // Colour still took the requested codec, so the fallback is per-stream.
     assert_eq!(
-        channels["/camera/color_image"].0,
+        channels["/camera/color_image/compressed"].0,
         "sensor_msgs/msg/CompressedImage"
     );
 }

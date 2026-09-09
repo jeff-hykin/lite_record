@@ -28,8 +28,9 @@ use crate::msgs::RawImage;
 const JXL_FORMATS: [&str; 2] = ["jxl", "jpegxl"];
 
 /// The suffix a compressed image topic carries, and which the decoded topic drops
-/// so the two can coexist in one file.
-const COMPRESSED_SUFFIX: &str = "/compressed";
+/// so the two can coexist in one file. Applied when recording, see
+/// [`crate::record`].
+pub const COMPRESSED_SUFFIX: &str = "/compressed";
 
 #[derive(Debug, Default, Serialize)]
 pub struct Report {

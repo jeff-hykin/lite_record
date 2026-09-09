@@ -34,6 +34,19 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 /// bursts keeps the per-message cost down without letting the flush slip.
 const BATCH_SIZE: usize = 256;
 
+/// The mcap channel a sample is written to. A compressed frame takes a
+/// `/compressed` suffix so that post-processing, which decodes depth to raw
+/// pixels, can hand the plain name to the stream a dimos graph expects. It also
+/// keeps the two schemas off one topic name, which a ROS consumer cannot make
+/// sense of.
+fn channel_topic(sample: &Sample) -> String {
+    if sample.encoded.schema_name == crate::msgs::COMPRESSED_IMAGE_TYPE {
+        format!("{}{}", sample.topic, crate::convert::COMPRESSED_SUFFIX)
+    } else {
+        sample.topic.clone()
+    }
+}
+
 pub struct Sample {
     pub topic: String,
     pub encoded: Encoded,
@@ -239,10 +252,10 @@ fn drain(
     counters: Arc<Counters>,
     tallies: Arc<Mutex<BTreeMap<String, TopicTally>>>,
 ) -> Result<()> {
-    // Keyed by topic *and* schema: an image topic carries CompressedImage
-    // normally and falls back to Image when the codec cannot hold the stream's
-    // bit depth, and an mcap channel binds to exactly one schema. Keying on the
-    // topic alone would file the fallback frames under the wrong schema.
+    // Keyed by source topic *and* schema: an image stream carries
+    // CompressedImage normally and falls back to Image when the codec cannot
+    // hold the stream's bit depth, and an mcap channel binds to exactly one
+    // schema. The two get different channel names, see `channel_topic`.
     let mut channels: HashMap<(String, &'static str), (u16, u32)> = HashMap::new();
     let mut schemas: HashMap<&'static str, u16> = HashMap::new();
     let mut written_since_flush = 0usize;
@@ -284,8 +297,12 @@ fn drain(
                             id
                         }
                     };
-                    let id =
-                        writer.add_channel(schema_id, &sample.topic, "cdr", &BTreeMap::new())?;
+                    let id = writer.add_channel(
+                        schema_id,
+                        &channel_topic(&sample),
+                        "cdr",
+                        &BTreeMap::new(),
+                    )?;
                     channels.insert(key.clone(), (id, 0));
                     id
                 }

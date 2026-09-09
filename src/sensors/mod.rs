@@ -93,9 +93,9 @@ impl StreamId {
     }
 
     /// The topic's last segment. These are the dimos module output names, so a
-    /// recording drops into a dimos graph without a remapping table. dimos
-    /// carries raw and compressed images on one output and tells them apart by
-    /// message type, which is why neither word appears here.
+    /// recording drops into a dimos graph without a remapping table. A frame
+    /// that goes to the card compressed is written one level below this, see
+    /// [`crate::record`].
     pub fn topic_leaf(self) -> &'static str {
         match self {
             StreamId::Depth => "depth_image",
