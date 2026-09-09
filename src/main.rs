@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use lite_record::hub::{Hub, Settings};
 use lite_record::sensors::SensorKind;
-use lite_record::{service, web};
+use lite_record::{convert, service, web};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,6 +41,21 @@ enum Command {
     /// same options, and start it now. Asks for sudo.
     #[command(name = "survive_reboot", alias = "survive-reboot")]
     SurviveReboot,
+
+    /// Rewrite a recording in place, moving every jxl stream into a format
+    /// Foxglove can decode. The same work the UI's Post process button does,
+    /// for a rig with no browser pointed at it.
+    #[command(name = "post_process", alias = "post-process")]
+    PostProcess {
+        recording: PathBuf,
+
+        /// Punch each source chunk out once its replacement has been verified,
+        /// so the card only has to hold the output rather than both files. This
+        /// destroys the original as it goes: an interrupted run leaves the
+        /// messages split across two files, and putting them back is manual.
+        #[arg(long)]
+        reclaim: bool,
+    },
 }
 
 impl Args {
@@ -81,6 +96,50 @@ fn absolute(path: &Path) -> PathBuf {
     })
 }
 
+/// A conversion of a large recording runs for hours, so this prints a line a
+/// minute rather than going silent and looking hung.
+fn post_process(recording: &Path, reclaim: bool) -> Result<()> {
+    let reclaim = match reclaim {
+        true => convert::Reclaim::AsItGoes,
+        false => convert::Reclaim::No,
+    };
+    let progress = Arc::new(convert::Progress::default());
+    let watched = Arc::clone(&progress);
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let stopping = Arc::clone(&running);
+    let started = std::time::Instant::now();
+    let ticker = std::thread::spawn(move || {
+        let mut seconds = 0;
+        while stopping.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            seconds += 1;
+            if seconds % 60 == 0 {
+                println!(
+                    "  {:>6}s  {} messages  {:.2} GB written",
+                    started.elapsed().as_secs(),
+                    watched.messages.load(std::sync::atomic::Ordering::Relaxed),
+                    watched.bytes.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+                );
+            }
+        }
+    });
+    let report = convert::in_place(recording, &progress, reclaim);
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = ticker.join();
+    let report = report?;
+    println!(
+        "{}: {} decoded, {} copied, {} failed, {:.2} GB, {:.2} GB reclaimed, {}s",
+        recording.display(),
+        report.decoded,
+        report.copied,
+        report.failed,
+        report.bytes as f64 / 1e9,
+        report.reclaimed as f64 / 1e9,
+        started.elapsed().as_secs(),
+    );
+    Ok(())
+}
+
 fn sensor_named(name: &str) -> Result<SensorKind> {
     match name.trim().to_ascii_lowercase().as_str() {
         "realsense" => Ok(SensorKind::Realsense),
@@ -104,10 +163,16 @@ async fn main() -> Result<()> {
             .unwrap_or_else(default_settings_file),
     );
 
-    if let Some(Command::SurviveReboot) = args.command {
-        let arguments = args.service_arguments(&record_dir, &settings_file);
-        let working_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-        return service::install(&arguments, &working_directory);
+    match args.command {
+        Some(Command::SurviveReboot) => {
+            let arguments = args.service_arguments(&record_dir, &settings_file);
+            let working_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+            return service::install(&arguments, &working_directory);
+        }
+        Some(Command::PostProcess { recording, reclaim }) => {
+            return post_process(&recording, reclaim);
+        }
+        None => {}
     }
 
     // The saved file wins on everything except the recording directory, which
