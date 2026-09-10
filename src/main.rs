@@ -74,6 +74,11 @@ enum Command {
         /// The Imu topic that goes with --lidar-topic.
         #[arg(long)]
         imu_topic: Option<String>,
+
+        /// Do everything except write: convert nothing, append nothing, but
+        /// print the tree, its problems, and the odometry the file would get.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Complete a recording's frame tree: correct the camera extrinsics an
@@ -174,6 +179,7 @@ fn post_process(
     urdf: Option<&Path>,
     lidar_topic: Option<&str>,
     imu_topic: Option<&str>,
+    dry_run: bool,
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let urdf = load_urdf(urdf)?;
@@ -192,7 +198,15 @@ fn post_process(
                 watched.bytes.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
             )
         },
-        || convert::in_place(recording, &progress, reclaim),
+        || match (dry_run, convert::needs_conversion(recording)) {
+            (true, Ok(true)) => {
+                println!("{}: would convert jxl / refit camera infos (dry run)", recording.display());
+                Err(convert::NothingToConvert.into())
+            }
+            (true, Ok(false)) => Err(convert::NothingToConvert.into()),
+            (true, Err(error)) => Err(error),
+            (false, _) => convert::in_place(recording, &progress, reclaim),
+        },
     );
     match converted {
         Ok(report) => println!(
@@ -268,9 +282,18 @@ fn post_process(
     };
     drop(mapped);
 
-    if plan.new_edges.is_empty() && estimate.is_none() {
+    if dry_run || (plan.new_edges.is_empty() && estimate.is_none()) {
         print!("{}", lite_record::fixup::describe(&plan, 0));
-        println!("nothing to append; {}s", started.elapsed().as_secs());
+        if dry_run {
+            println!(
+                "dry run: would append {} static edge(s) and {} odometry poses; {}s",
+                plan.new_edges.len(),
+                estimate.as_ref().map_or(0, |estimate| estimate.poses.len()),
+                started.elapsed().as_secs()
+            );
+        } else {
+            println!("nothing to append; {}s", started.elapsed().as_secs());
+        }
         return Ok(());
     }
     let mut appender = lite_record::mcap_append::Appender::open(recording)?;
@@ -337,7 +360,7 @@ async fn main() -> Result<()> {
             let working_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
             return service::install(&arguments, &working_directory);
         }
-        Some(Command::PostProcess { recording, reclaim, no_odom, urdf, lidar_topic, imu_topic }) => {
+        Some(Command::PostProcess { recording, reclaim, no_odom, urdf, lidar_topic, imu_topic, dry_run }) => {
             return post_process(
                 &recording,
                 reclaim,
@@ -345,6 +368,7 @@ async fn main() -> Result<()> {
                 urdf.as_deref(),
                 lidar_topic.as_deref(),
                 imu_topic.as_deref(),
+                dry_run,
             );
         }
         Some(Command::TfFixup { recording, urdf }) => {
