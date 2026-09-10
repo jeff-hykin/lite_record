@@ -46,45 +46,7 @@ enum Command {
     /// Foxglove can decode. The same work the UI's Post process button does,
     /// for a rig with no browser pointed at it.
     #[command(name = "post_process", alias = "post-process")]
-    PostProcess {
-        recording: PathBuf,
-
-        /// Punch each source chunk out once its replacement has been verified,
-        /// so the card only has to hold the output rather than both files. This
-        /// destroys the original as it goes: an interrupted run leaves the
-        /// messages split across two files, and putting them back is manual.
-        #[arg(long)]
-        reclaim: bool,
-
-        /// Skip the Point-LIO pass that appends /pointlio_odometry and the
-        /// odom -> rig edges on /tf.
-        #[arg(long)]
-        no_odom: bool,
-
-        /// A URDF whose joints join the sensors' own frame trees into one, the
-        /// same as running tf_fixup first.
-        #[arg(long)]
-        urdf: Option<PathBuf>,
-
-        /// The PointCloud2 topic to estimate odometry from. Found automatically
-        /// when there is only one lidar.
-        #[arg(long)]
-        lidar_topic: Option<String>,
-
-        /// The Imu topic that goes with --lidar-topic.
-        #[arg(long)]
-        imu_topic: Option<String>,
-
-        /// Do everything except write: convert nothing, append nothing, but
-        /// print the tree, its problems, and the odometry the file would get.
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Also write the estimated trajectory here in TUM format
-        /// (`time x y z qx qy qz qw`, sensor clock), for comparing runs.
-        #[arg(long)]
-        trajectory: Option<PathBuf>,
-    },
+    PostProcess(PostProcessArgs),
 
     /// Complete a recording's frame tree: correct the camera extrinsics an
     /// older recorder wrote backwards, add the URDF's joints, and append the
@@ -105,6 +67,47 @@ enum Command {
     /// Encode an image topic as an mp4 by piping its frames through ffmpeg.
     #[command(name = "to_video", alias = "to-video")]
     ToVideo(video::Options),
+}
+
+#[derive(clap::Args)]
+struct PostProcessArgs {
+    recording: PathBuf,
+
+    /// Punch each source chunk out once its replacement has been verified,
+    /// so the card only has to hold the output rather than both files. This
+    /// destroys the original as it goes: an interrupted run leaves the
+    /// messages split across two files, and putting them back is manual.
+    #[arg(long)]
+    reclaim: bool,
+
+    /// Skip the Point-LIO pass that appends /pointlio_odometry and the
+    /// odom -> rig edges on /tf.
+    #[arg(long)]
+    no_odom: bool,
+
+    /// A URDF whose joints join the sensors' own frame trees into one, the
+    /// same as running tf_fixup first.
+    #[arg(long)]
+    urdf: Option<PathBuf>,
+
+    /// The PointCloud2 topic to estimate odometry from. Found automatically
+    /// when there is only one lidar.
+    #[arg(long)]
+    lidar_topic: Option<String>,
+
+    /// The Imu topic that goes with --lidar-topic.
+    #[arg(long)]
+    imu_topic: Option<String>,
+
+    /// Do everything except write: convert nothing, append nothing, but
+    /// print the tree, its problems, and the odometry the file would get.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Also write the estimated trajectory here in TUM format
+    /// (`time x y z qx qy qz qw`, sensor clock), for comparing runs.
+    #[arg(long)]
+    trajectory: Option<PathBuf>,
 }
 
 impl Args {
@@ -177,18 +180,12 @@ fn load_urdf(path: Option<&Path>) -> Result<Option<lite_record::urdf::Urdf>> {
 /// The three stages that turn a fresh recording into one that is viewable,
 /// placed and localised: decode jxl (a rewrite, skipped when there is none),
 /// then complete the frame tree and estimate odometry (both appended).
-fn post_process(
-    recording: &Path,
-    reclaim: bool,
-    no_odom: bool,
-    urdf: Option<&Path>,
-    lidar_topic: Option<&str>,
-    imu_topic: Option<&str>,
-    dry_run: bool,
-    trajectory: Option<&Path>,
-) -> Result<()> {
+fn post_process(args: &PostProcessArgs) -> Result<()> {
+    let PostProcessArgs { recording, reclaim, no_odom, urdf, lidar_topic, imu_topic, dry_run, trajectory } = args;
+    let (recording, reclaim, no_odom, dry_run) = (recording.as_path(), *reclaim, *no_odom, *dry_run);
+    let (lidar_topic, imu_topic, trajectory) = (lidar_topic.as_deref(), imu_topic.as_deref(), trajectory.as_deref());
     let started = std::time::Instant::now();
-    let urdf = load_urdf(urdf)?;
+    let urdf = load_urdf(urdf.as_deref())?;
 
     let reclaim = match reclaim {
         true => convert::Reclaim::AsItGoes,
@@ -372,26 +369,8 @@ async fn main() -> Result<()> {
             let working_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
             return service::install(&arguments, &working_directory);
         }
-        Some(Command::PostProcess {
-            recording,
-            reclaim,
-            no_odom,
-            urdf,
-            lidar_topic,
-            imu_topic,
-            dry_run,
-            trajectory,
-        }) => {
-            return post_process(
-                &recording,
-                reclaim,
-                no_odom,
-                urdf.as_deref(),
-                lidar_topic.as_deref(),
-                imu_topic.as_deref(),
-                dry_run,
-                trajectory.as_deref(),
-            );
+        Some(Command::PostProcess(args)) => {
+            return post_process(&args);
         }
         Some(Command::TfFixup { recording, urdf }) => {
             return tf_fixup(&recording, urdf.as_deref());
