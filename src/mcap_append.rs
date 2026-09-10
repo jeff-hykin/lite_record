@@ -78,13 +78,8 @@ pub struct Appender {
     attachment_indexes: Vec<records::AttachmentIndex>,
     metadata_indexes: Vec<records::MetadataIndex>,
     statistics: Option<records::Statistics>,
-    /// Channels whose schema and channel records still have to be written
-    /// into the next chunk, so a linear reader meets them before their first
-    /// message.
-    undeclared: Vec<u16>,
     sequences: HashMap<u16, u32>,
     pending: Vec<Pending>,
-    pending_bytes: usize,
     appended: u64,
     appended_chunks: usize,
 }
@@ -153,10 +148,8 @@ impl Appender {
             attachment_indexes: summary.attachment_indexes,
             metadata_indexes: summary.metadata_indexes,
             statistics: summary.stats,
-            undeclared: Vec::new(),
             sequences,
             pending: Vec::new(),
-            pending_bytes: 0,
             appended: 0,
             appended_chunks: 0,
         })
@@ -235,19 +228,20 @@ impl Appender {
                 metadata: metadata.clone(),
             },
         );
-        self.undeclared.push(id);
         id
     }
 
-    /// Queues one message. Written out in chunks of roughly
-    /// `CHUNK_TARGET_BYTES`, each sorted by log time.
+    /// Queues one message. Everything queued is held until [`Appender::finish`]
+    /// and then written in log-time order, split into chunks of roughly
+    /// `CHUNK_TARGET_BYTES`; the things appended here — odometry, transforms —
+    /// are megabytes, and holding them is what lets the appended chunks be
+    /// ordered among themselves.
     pub fn write(&mut self, channel_id: u16, log_time: u64, data: Vec<u8>) -> Result<()> {
         if !self.channels.contains_key(&channel_id) {
             bail!("no channel {channel_id}");
         }
         let sequence = self.sequences.entry(channel_id).or_insert(0);
         *sequence = sequence.wrapping_add(1);
-        self.pending_bytes += data.len() + 22 + 9;
         self.pending.push(Pending {
             channel_id,
             sequence: *sequence,
@@ -255,23 +249,35 @@ impl Appender {
             publish_time: log_time,
             data,
         });
-        if self.pending_bytes >= CHUNK_TARGET_BYTES {
-            self.flush_chunk()?;
-        }
         Ok(())
+    }
+
+    fn flush_all(&mut self) -> Result<()> {
+        let mut messages = std::mem::take(&mut self.pending);
+        messages.sort_by_key(|message| message.log_time);
+        let mut chunk = Vec::new();
+        let mut chunk_bytes = 0;
+        for message in messages {
+            chunk_bytes += message.data.len() + 22 + 9;
+            chunk.push(message);
+            if chunk_bytes >= CHUNK_TARGET_BYTES {
+                self.flush_chunk(std::mem::take(&mut chunk))?;
+                chunk_bytes = 0;
+            }
+        }
+        self.flush_chunk(chunk)
     }
 
     pub fn appended(&self) -> u64 {
         self.appended
     }
 
-    fn flush_chunk(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
+    /// Writes `messages`, already in log-time order, as one chunk plus its
+    /// message indexes.
+    fn flush_chunk(&mut self, messages: Vec<Pending>) -> Result<()> {
+        if messages.is_empty() {
             return Ok(());
         }
-        let mut messages = std::mem::take(&mut self.pending);
-        self.pending_bytes = 0;
-        messages.sort_by_key(|message| message.log_time);
 
         // Every channel the chunk uses is declared inside it, ahead of its
         // first message, whether or not an earlier chunk declared it: a linear
@@ -291,7 +297,6 @@ impl Appender {
             }
             write_record(&mut body, op::CHANNEL, &channel_record(*channel_id, channel));
         }
-        self.undeclared.clear();
 
         let mut index_entries: BTreeMap<u16, Vec<(u64, u64)>> = BTreeMap::new();
         for message in &messages {
@@ -376,7 +381,7 @@ impl Appender {
     /// then reads the appended chunks back to prove they parse. Returns how
     /// many messages were appended.
     pub fn finish(mut self) -> Result<u64> {
-        self.flush_chunk()?;
+        self.flush_all()?;
         write_record(&mut self.file, op::DATA_END, &0u32.to_le_bytes());
 
         let summary_start = self.file.stream_position()?;

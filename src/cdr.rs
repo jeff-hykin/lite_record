@@ -2,7 +2,7 @@
 //! opens directly in Foxglove or `ros2 bag` without a translation step.
 
 use crate::msgs::{
-    CameraInfo, CompressedImage, Header, Imu, PointCloud2, RawImage, TransformStamped,
+    CameraInfo, CompressedImage, Header, Imu, Odometry, PointCloud2, RawImage, TransformStamped,
 };
 
 /// Concatenated ros2msg text, which is what `message_encoding: "cdr"` readers
@@ -658,5 +658,146 @@ mod tests {
                 encoded.schema_name
             );
         }
+    }
+}
+
+pub fn odometry(odometry: &Odometry) -> Encoded {
+    let mut writer = CdrWriter::with_capacity(800);
+    write_header(&mut writer, &odometry.header);
+    writer.string(&odometry.child_frame_id);
+    writer.f64_array(&odometry.position);
+    writer.f64_array(&odometry.orientation);
+    writer.f64_array(&[0.0; 36]);
+    writer.f64_array(&odometry.linear_velocity);
+    writer.f64_array(&odometry.angular_velocity);
+    writer.f64_array(&[0.0; 36]);
+    Encoded {
+        schema_name: crate::msgs::ODOMETRY_TYPE,
+        schema_text: format!(
+            "std_msgs/Header header\n\
+             string child_frame_id\n\
+             geometry_msgs/PoseWithCovariance pose\n\
+             geometry_msgs/TwistWithCovariance twist\n\n\
+             ================================================================================\n\
+             MSG: geometry_msgs/PoseWithCovariance\n\
+             geometry_msgs/Pose pose\n\
+             float64[36] covariance\n\n\
+             ================================================================================\n\
+             MSG: geometry_msgs/Pose\n\
+             geometry_msgs/Point position\n\
+             geometry_msgs/Quaternion orientation\n\n\
+             ================================================================================\n\
+             MSG: geometry_msgs/Point\n\
+             float64 x\n\
+             float64 y\n\
+             float64 z\n\n\
+             ================================================================================\n\
+             MSG: geometry_msgs/TwistWithCovariance\n\
+             geometry_msgs/Twist twist\n\
+             float64[36] covariance\n\n\
+             ================================================================================\n\
+             MSG: geometry_msgs/Twist\n\
+             geometry_msgs/Vector3 linear\n\
+             geometry_msgs/Vector3 angular\n\
+             {QUATERNION_MSG}{VECTOR3_MSG}{HEADER_MSG}\n{TIME_MSG}"
+        ),
+        data: writer.finish(),
+    }
+}
+
+/// Only the header, which is all that is needed to learn a stream's frame and
+/// stamp. `None` for a payload that is not little-endian CDR or is too short.
+pub fn decode_header(payload: &[u8]) -> Option<Header> {
+    if payload.len() < 4 || payload[..4] != [0x00, 0x01, 0x00, 0x00] {
+        return None;
+    }
+    CdrReader::new(payload).try_header()
+}
+
+pub fn decode_tf_message(payload: &[u8]) -> Option<Vec<TransformStamped>> {
+    if payload.len() < 8 || payload[..4] != [0x00, 0x01, 0x00, 0x00] {
+        return None;
+    }
+    let mut reader = CdrReader::new(payload);
+    let count = reader.u32() as usize;
+    let mut transforms = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let header = reader.try_header()?;
+        let child_frame_id = reader.try_string()?;
+        let translation = reader.try_f64_array()?;
+        let rotation = reader.try_f64_array()?;
+        transforms.push(TransformStamped {
+            header,
+            child_frame_id,
+            translation,
+            rotation,
+        });
+    }
+    Some(transforms)
+}
+
+pub fn decode_odometry(payload: &[u8]) -> Option<Odometry> {
+    if payload.len() < 8 || payload[..4] != [0x00, 0x01, 0x00, 0x00] {
+        return None;
+    }
+    let mut reader = CdrReader::new(payload);
+    let header = reader.try_header()?;
+    let child_frame_id = reader.try_string()?;
+    let position = reader.try_f64_array()?;
+    let orientation = reader.try_f64_array()?;
+    let _pose_covariance: [f64; 36] = reader.try_f64_array()?;
+    let linear_velocity = reader.try_f64_array()?;
+    let angular_velocity = reader.try_f64_array()?;
+    Some(Odometry {
+        header,
+        child_frame_id,
+        position,
+        orientation,
+        linear_velocity,
+        angular_velocity,
+    })
+}
+
+#[cfg(test)]
+mod odometry_and_tf_tests {
+    use super::*;
+
+    #[test]
+    fn an_odometry_message_round_trips_and_carries_its_schema() {
+        let original = Odometry {
+            header: Header::new(1_700_000_000_123_456_789, "odom"),
+            child_frame_id: "base_link".into(),
+            position: [1.0, -2.0, 0.5],
+            orientation: [0.0, 0.0, 0.7071067811865476, 0.7071067811865476],
+            linear_velocity: [0.3, 0.0, 0.0],
+            angular_velocity: [0.0, 0.0, 0.1],
+        };
+        let encoded = odometry(&original);
+        assert_eq!(encoded.schema_name, "nav_msgs/msg/Odometry");
+        assert!(encoded.schema_text.contains("MSG: geometry_msgs/TwistWithCovariance"));
+        // 4 + header (8 + 4 + 5 -> padded) + child + 7 f64 + 36 f64 + 6 f64 + 36 f64
+        assert_eq!(decode_odometry(&encoded.data).unwrap(), original);
+        assert_eq!(decode_header(&encoded.data).unwrap(), original.header);
+    }
+
+    #[test]
+    fn a_tf_message_round_trips_through_the_reader() {
+        let transforms = vec![
+            TransformStamped {
+                header: Header::new(5, "base_link"),
+                child_frame_id: "camera_link".into(),
+                translation: [0.1, 0.2, 0.3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
+            TransformStamped {
+                header: Header::new(5, "camera_link"),
+                child_frame_id: "camera_depth_optical_frame".into(),
+                translation: [0.0; 3],
+                rotation: [-0.5, 0.5, -0.5, 0.5],
+            },
+        ];
+        let encoded = tf_message(&transforms);
+        assert_eq!(decode_tf_message(&encoded.data).unwrap(), transforms);
+        assert!(decode_tf_message(&[0x00, 0x01, 0x00, 0x00, 9, 0, 0, 0, 1]).is_none());
     }
 }

@@ -8,6 +8,7 @@ pub const TF_TYPE: &str = "tf2_msgs/msg/TFMessage";
 pub const POINT_CLOUD2_TYPE: &str = "sensor_msgs/msg/PointCloud2";
 pub const IMU_TYPE: &str = "sensor_msgs/msg/Imu";
 pub const CAMERA_INFO_TYPE: &str = "sensor_msgs/msg/CameraInfo";
+pub const ODOMETRY_TYPE: &str = "nav_msgs/msg/Odometry";
 
 pub const NANOS_PER_SEC: u64 = 1_000_000_000;
 
@@ -211,6 +212,18 @@ impl Imu {
             linear_acceleration_covariance: [0.0; 9],
         }
     }
+}
+
+/// `nav_msgs/Odometry`: the pose of `child_frame_id` in `header.frame_id`,
+/// with the twist in the child frame. Covariances are written as zeros.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Odometry {
+    pub header: Header,
+    pub child_frame_id: String,
+    pub position: [f64; 3],
+    pub orientation: [f64; 4],
+    pub linear_velocity: [f64; 3],
+    pub angular_velocity: [f64; 3],
 }
 
 #[derive(Clone, Debug, PartialEq)]
