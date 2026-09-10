@@ -42,11 +42,16 @@ pub struct ChannelClock {
     /// The smallest `log_time - header_stamp` seen, in nanoseconds. Positive
     /// means the header stamps are behind the clock the file was logged on.
     pub offset_nanos: i64,
-    /// The largest, which for a healthy stream differs from the smallest only
-    /// by delivery jitter. A stream whose offset *moves* was written by a
-    /// recorder that failed to follow the host clock partway through, and no
-    /// single shift can put it right.
-    pub widest_nanos: i64,
+    /// The spread between the 1st and 99th percentile offset. For a healthy
+    /// stream that is delivery jitter. A stream whose offset *moves* was
+    /// written by a recorder that failed to follow the host clock partway
+    /// through, and no single shift can put it right.
+    ///
+    /// Percentiles rather than the extremes on purpose: a clock correction
+    /// that is adopted within a few samples leaves one or two frames behind,
+    /// and one frame in nine hundred should not condemn a stream that is
+    /// otherwise exactly on the clock.
+    pub spread_nanos: i64,
     pub messages: u64,
 }
 
@@ -59,11 +64,11 @@ impl ChannelClock {
     /// could account for, so the stream is not a constant distance from the
     /// file's clock and shifting it would only move the error around.
     pub fn moved(&self) -> bool {
-        self.widest_nanos - self.offset_nanos > TOLERANCE_NANOS
+        self.spread_nanos > TOLERANCE_NANOS
     }
 
     pub fn spread_seconds(&self) -> f64 {
-        (self.widest_nanos - self.offset_nanos) as f64 / 1e9
+        self.spread_nanos as f64 / 1e9
     }
 
     pub fn seconds(&self) -> f64 {
@@ -78,7 +83,9 @@ impl ChannelClock {
 /// its stamps are written by this program, on the log clock by construction.
 pub fn survey(mapped: &[u8]) -> Result<BTreeMap<u16, ChannelClock>> {
     let summary = mcap::Summary::read(mapped)?.context("the recording has no summary section")?;
-    let mut clocks: BTreeMap<u16, ChannelClock> = BTreeMap::new();
+    let _ = summary;
+    let mut topics: BTreeMap<u16, String> = BTreeMap::new();
+    let mut offsets: BTreeMap<u16, Vec<i64>> = BTreeMap::new();
     for message in mcap::MessageStream::new(mapped)? {
         let message = message?;
         if !repairable(&message.channel) {
@@ -87,18 +94,29 @@ pub fn survey(mapped: &[u8]) -> Result<BTreeMap<u16, ChannelClock>> {
         let Some(header) = crate::cdr::decode_header(&message.data) else {
             continue;
         };
-        let offset = message.log_time as i64 - header.stamp_nanos() as i64;
-        let entry = clocks.entry(message.channel.id).or_insert_with(|| ChannelClock {
-            topic: message.channel.topic.clone(),
-            offset_nanos: offset,
-            widest_nanos: offset,
-            messages: 0,
-        });
-        entry.offset_nanos = entry.offset_nanos.min(offset);
-        entry.widest_nanos = entry.widest_nanos.max(offset);
-        entry.messages += 1;
+        topics
+            .entry(message.channel.id)
+            .or_insert_with(|| message.channel.topic.clone());
+        offsets
+            .entry(message.channel.id)
+            .or_default()
+            .push(message.log_time as i64 - header.stamp_nanos() as i64);
     }
-    let _ = summary;
+
+    let mut clocks = BTreeMap::new();
+    for (id, mut seen) in offsets {
+        seen.sort_unstable();
+        let at = |fraction: f64| seen[((seen.len() - 1) as f64 * fraction).round() as usize];
+        clocks.insert(
+            id,
+            ChannelClock {
+                topic: topics.remove(&id).unwrap_or_default(),
+                offset_nanos: seen[0],
+                spread_nanos: at(0.99) - at(0.01),
+                messages: seen.len() as u64,
+            },
+        );
+    }
     Ok(clocks)
 }
 
@@ -151,7 +169,7 @@ pub fn describe(clocks: &BTreeMap<u16, ChannelClock>) -> String {
 
     let mut moved: Vec<&ChannelClock> = clocks.values().filter(|clock| clock.moved()).collect();
     if !moved.is_empty() {
-        moved.sort_by_key(|clock| std::cmp::Reverse(clock.widest_nanos - clock.offset_nanos));
+        moved.sort_by_key(|clock| std::cmp::Reverse(clock.spread_nanos));
         out.push_str(
             "warning: these streams drifted away from the file's clock while it was being \
              recorded, so no single shift can repair them — the recorder that wrote this did \
@@ -319,6 +337,50 @@ mod tests {
         let report = describe(&clocks);
         assert!(report.contains("drifted away from the file's clock"), "{report}");
         assert!(report.contains("moved 120.000 s"), "{report}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A clock correction that the recorder adopts within a few samples leaves
+    /// one frame behind. One frame in nine hundred is not a stream that
+    /// drifted, and condemning it would block the repair of a file that is
+    /// otherwise exactly on the clock — measured on the Pi, where a 120 s step
+    /// mid-recording cost exactly one colour frame.
+    #[test]
+    fn a_single_frame_left_behind_by_a_step_does_not_condemn_the_stream() {
+        let path = scratch("one_late");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = mcap::WriteOptions::new()
+            .compression(Some(mcap::Compression::Zstd))
+            .chunk_size(Some(4096))
+            .profile("ros2")
+            .create(BufWriter::new(file))
+            .unwrap();
+        let sample = crate::cdr::imu(&Imu::unoriented(Header::new(0, "x"), [0.0; 3], [0.0; 3]));
+        let schema = writer.add_schema(sample.schema_name, "ros2msg", sample.schema_text.as_bytes()).unwrap();
+        let channel = writer.add_channel(schema, "/realsense/color_image", "cdr", &Default::default()).unwrap();
+        let epoch = 1_700_000_000 * NANOS_PER_SEC;
+        for index in 0..900u64 {
+            let log_time = epoch + index * 33_000_000;
+            let stamp = match index == 450 {
+                true => log_time - 120 * NANOS_PER_SEC,
+                false => log_time,
+            };
+            let encoded = crate::cdr::imu(&Imu::unoriented(Header::new(stamp, "frame"), [0.0; 3], [0.0; 3]));
+            writer
+                .write_to_known_channel(
+                    &mcap::records::MessageHeader { channel_id: channel, sequence: index as u32, log_time, publish_time: log_time },
+                    &encoded.data,
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let clocks = survey(&bytes).unwrap();
+        let stream = clocks.values().next().unwrap();
+        assert!(!stream.moved(), "one late frame condemned the stream: {} s", stream.spread_seconds());
+        assert!(!stream.needs_shift(), "the stream is on the clock, {} s", stream.seconds());
+        assert_eq!(describe(&clocks), "");
         std::fs::remove_file(&path).ok();
     }
 
