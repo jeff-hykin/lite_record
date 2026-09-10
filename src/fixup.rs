@@ -218,7 +218,16 @@ pub fn plan(recording: &Recording, urdf: Option<&crate::urdf::Urdf>) -> Plan {
     // put that frame under a new root, and then it has two parents: the
     // odometry cannot be moved, so say so rather than let a tree that looks
     // connected hide it.
-    let warnings = recording
+    let mut warnings: Vec<String> = Vec::new();
+    if recording.inverted_tf_static {
+        warnings.push(
+            "/tf_static still holds the recorder's original edges, which point the SDK's way \
+             round; nothing can remove them from a finished file, but every /tf message here \
+             supersedes them for a consumer that keeps a history per frame"
+                .to_string(),
+        );
+    }
+    warnings.extend(recording
         .published
         .iter()
         .filter(|(parent, _)| MOVING_PARENTS.contains(&parent.as_str()))
@@ -230,8 +239,7 @@ pub fn plan(recording: &Recording, urdf: Option<&crate::urdf::Urdf>) -> Plan {
                      re-run post_process on a copy taken before the odometry was added"
                 )
             })
-        })
-        .collect();
+        }));
     Plan {
         tree,
         new_edges,
@@ -465,9 +473,12 @@ mod tests {
         assert!(recording.published.contains(&("odom".to_string(), "livox_link".to_string())));
         assert!(recording.tree.parent_of("livox_link").is_none(), "odometry is not a static edge");
         let plan = plan(&recording, Some(&rig_urdf()));
-        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
-        assert!(plan.warnings[0].contains("livox_link already carries odom -> livox_link odometry"));
-        assert!(plan.warnings[0].contains("now under base_link"));
+        let stale = plan
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("already carries odom -> livox_link odometry"))
+            .unwrap_or_else(|| panic!("{:?}", plan.warnings));
+        assert!(stale.contains("now under base_link"), "{stale}");
         std::fs::remove_file(&path).ok();
     }
 
