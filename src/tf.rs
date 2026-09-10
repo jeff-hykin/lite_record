@@ -85,6 +85,18 @@ impl Pose {
         }
     }
 
+    /// Whether two poses are the same rigid placement to within a tenth of a
+    /// millimetre and a thousandth of a degree. Exact equality is the wrong
+    /// test: a pose that has been through a quaternion and back does not
+    /// return bit-identical, and the negated quaternion is the same rotation.
+    pub fn matches(&self, other: &Pose) -> bool {
+        let moved = (0..3)
+            .map(|axis| (self.translation[axis] - other.translation[axis]).abs())
+            .fold(0.0, f64::max);
+        let dot: f64 = (0..4).map(|index| self.rotation[index] * other.rotation[index]).sum();
+        moved < 1e-4 && dot.abs() > 1.0 - 1e-9
+    }
+
     /// The pose as a tf edge.
     pub fn stamped(&self, stamp_nanos: u64, parent: &str, child: &str) -> TransformStamped {
         TransformStamped {

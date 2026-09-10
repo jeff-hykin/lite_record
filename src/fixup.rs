@@ -39,9 +39,12 @@ pub struct Recording {
     /// The static edges the file already carries, in tf semantics — an
     /// unmarked `/tf_static` has been inverted on the way in.
     pub tree: StaticTree,
-    /// `(parent, child)` pairs already published on `/tf`, which a fixup need
-    /// not publish again.
-    pub published: BTreeSet<(String, String)>,
+    /// What `/tf` already carries, keyed by `(parent, child)`. An edge is only
+    /// spared re-publishing if its value matches too — a urdf that moves a
+    /// sensor changes the value under a name that is already there, and the
+    /// later message is the only way to say so in a file nothing can be
+    /// removed from.
+    pub published: BTreeMap<(String, String), Pose>,
     /// Whether the `/tf_static` edges had to be inverted, i.e. were written by a
     /// recorder that copied the SDK extrinsics through unchanged.
     pub inverted_tf_static: bool,
@@ -99,10 +102,21 @@ pub fn inspect(mapped: &[u8]) -> Result<Recording> {
         .filter(|(_, chunk)| tf_channel.is_some_and(|id| chunk.message_index_offsets.contains_key(&id)))
         .map(|(index, _)| index)
         .collect();
-    // Static edges repeat identically, so the first and last chunk carrying
-    // `/tf` between them show every edge ever published on it — including
-    // those an earlier fixup appended at the end of the file.
-    let tf_chunks_to_read: BTreeSet<usize> = tf_chunks.first().into_iter().chain(tf_chunks.last()).copied().collect();
+    // Which chunks to sample `/tf` from. The recorder repeats its own edges
+    // identically, so one chunk covers all of those; every later fixup adds a
+    // chunk of its own at the end of the file, and each of those may carry a
+    // value that supersedes an earlier one. So: the first chunk, plus the
+    // appended run at the end, walked backwards until a chunk that holds sensor
+    // data as well — which is the recorder's own writing, already covered.
+    // Sampling only the first and last missed the appends in between, and a
+    // rerun then re-published edges the file already had.
+    let mut tf_chunks_to_read: BTreeSet<usize> = tf_chunks.first().into_iter().copied().collect();
+    for index in tf_chunks.iter().rev() {
+        tf_chunks_to_read.insert(*index);
+        if !is_appended(&chunks[*index]) {
+            break;
+        }
+    }
 
     for (index, chunk) in chunks.iter().enumerate() {
         let wants_headers = chunk.message_index_offsets.keys().any(|id| unresolved.contains(id));
@@ -149,9 +163,10 @@ pub fn inspect(mapped: &[u8]) -> Result<Recording> {
     }
     for transforms in &tf_samples {
         for edge in transforms {
-            recording
-                .published
-                .insert((edge.parent().to_string(), edge.child_frame_id.clone()));
+            recording.published.insert(
+                (edge.parent().to_string(), edge.child_frame_id.clone()),
+                Pose::from_transform(edge),
+            );
             if !MOVING_PARENTS.contains(&edge.parent()) {
                 recording
                     .tree
@@ -160,6 +175,14 @@ pub fn inspect(mapped: &[u8]) -> Result<Recording> {
         }
     }
     Ok(recording)
+}
+
+/// Whether a chunk looks like one an append wrote rather than the recorder:
+/// an appended chunk carries only transforms and odometry, where a recorder's
+/// chunk carries the sensor streams too. Getting this wrong only costs a chunk
+/// read, never correctness.
+fn is_appended(chunk: &mcap::records::ChunkIndex) -> bool {
+    chunk.message_index_offsets.len() <= 2
 }
 
 /// The completed tree and what it took to complete it.
@@ -206,10 +229,11 @@ pub fn plan(recording: &Recording, urdf: Option<&crate::urdf::Urdf>) -> Plan {
     }
     let new_edges = tree
         .edges()
-        .filter(|(parent, child, _)| {
-            !recording
-                .published
-                .contains(&((*parent).to_string(), (*child).to_string()))
+        .filter(|(parent, child, pose)| {
+            match recording.published.get(&((*parent).to_string(), (*child).to_string())) {
+                Some(published) => !published.matches(pose),
+                None => true,
+            }
         })
         .map(|(parent, child, pose)| (parent.to_string(), child.to_string(), *pose))
         .collect();
@@ -229,7 +253,7 @@ pub fn plan(recording: &Recording, urdf: Option<&crate::urdf::Urdf>) -> Plan {
     }
     warnings.extend(recording
         .published
-        .iter()
+        .keys()
         .filter(|(parent, _)| MOVING_PARENTS.contains(&parent.as_str()))
         .filter_map(|(parent, child)| {
             tree.parent_of(child).map(|new_parent| {
@@ -470,7 +494,7 @@ mod tests {
 
         let bytes = std::fs::read(&path).unwrap();
         let recording = inspect(&bytes).unwrap();
-        assert!(recording.published.contains(&("odom".to_string(), "livox_link".to_string())));
+        assert!(recording.published.contains_key(&("odom".to_string(), "livox_link".to_string())));
         assert!(recording.tree.parent_of("livox_link").is_none(), "odometry is not a static edge");
         let plan = plan(&recording, Some(&rig_urdf()));
         let stale = plan
@@ -479,6 +503,43 @@ mod tests {
             .find(|warning| warning.contains("already carries odom -> livox_link odometry"))
             .unwrap_or_else(|| panic!("{:?}", plan.warnings));
         assert!(stale.contains("now under base_link"), "{stale}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The case Jeff hit: a urdf corrects one joint on a recording that already
+    /// carries the old value. The pair is already published, so keying on names
+    /// alone would skip it and the file would keep the wrong camera for ever.
+    #[test]
+    fn a_urdf_that_changes_an_already_published_edge_republishes_it() {
+        let path = scratch("moved");
+        old_style_recording(&path);
+        let urdf = rig_urdf();
+        fix(&path, Some(&urdf)).unwrap();
+
+        let lowered = crate::urdf::parse(
+            r#"<robot name="rig">
+                <link name="base_link"/><link name="camera_link"/><link name="livox_link"/>
+                <joint name="cam" type="fixed"><parent link="base_link"/><child link="camera_link"/><origin xyz="0.1 0 -0.0303"/></joint>
+                <joint name="lidar" type="fixed"><parent link="base_link"/><child link="livox_link"/><origin xyz="0 0 0.2"/></joint>
+            </robot>"#,
+        )
+        .unwrap();
+        let (plan, appended) = fix(&path, Some(&lowered)).unwrap();
+        let moved: Vec<&str> = plan.new_edges.iter().map(|(_, child, _)| child.as_str()).collect();
+        assert_eq!(moved, vec!["camera_link"], "only the joint that changed is republished");
+        assert!(appended > 0);
+
+        // The file now ends with the corrected value, which is what a tf
+        // consumer keeping a history per frame will use.
+        let bytes = std::fs::read(&path).unwrap();
+        let recording = inspect(&bytes).unwrap();
+        let camera = recording.published[&("base_link".to_string(), "camera_link".to_string())];
+        assert!((camera.translation[2] + 0.0303).abs() < 1e-9, "{:?}", camera.translation);
+
+        // And a third run with the same urdf appends nothing.
+        let (plan, appended) = fix(&path, Some(&lowered)).unwrap();
+        assert!(plan.new_edges.is_empty());
+        assert_eq!(appended, 0);
         std::fs::remove_file(&path).ok();
     }
 
