@@ -29,6 +29,8 @@ use crate::tf::{Pose, StaticTree};
 
 pub const ODOMETRY_TOPIC: &str = "/pointlio_odometry";
 pub const ODOM_FRAME: &str = "odom";
+/// Metres per second, twice a brisk walk.
+pub const HANDHELD_MAX_VELOCITY: f64 = 3.0;
 
 /// The lidar and IMU topics to estimate from: the first PointCloud2 channel
 /// and the Imu channel that shares its prefix.
@@ -62,6 +64,9 @@ pub struct Estimate {
     /// The frame the lidar's clouds are stamped in.
     pub lidar_frame: String,
     pub path_length_metres: f64,
+    /// Scans the velocity cap rolled back. A handful is the guard doing its job;
+    /// a large share means the estimate is not to be trusted.
+    pub rejected_scans: usize,
     /// Lidar-in-IMU, from the estimator's configuration: the estimator tracks
     /// the IMU, the tree hangs off the lidar.
     lidar_in_imu: Pose,
@@ -88,7 +93,14 @@ pub fn estimate(
     imu_topic: &str,
     scans: &Arc<AtomicU64>,
 ) -> Result<Estimate> {
-    let config = Config::go2_mid360();
+    let mut config = Config::go2_mid360();
+    // A handheld rig never moves faster than a person walks. Without the cap a
+    // scan the filter cannot match sends the state off at metres per second and
+    // the rest of the recording is lost; with it that scan is rolled back and the
+    // next one gets another try. The x86 reference run of the grocery recording
+    // happened to survive its last 25 s without this, the arm64 run of the same
+    // bytes ran 240 m away — the estimate there is that marginal.
+    config.max_velocity = HANDHELD_MAX_VELOCITY;
     let lidar_frame = first_frame(mapped, lidar_topic)?
         .with_context(|| format!("no decodable message on {lidar_topic}"))?;
 
@@ -109,6 +121,7 @@ pub fn estimate(
     let rotation: [f64; 9] = std::array::from_fn(|index| config.lidar_to_imu_rot[(index / 3, index % 3)]);
     let translation = [config.lidar_to_imu_trans[0], config.lidar_to_imu_trans[1], config.lidar_to_imu_trans[2]];
     Ok(Estimate {
+        rejected_scans: lio.rejected_scans,
         poses: lio.trajectory,
         log_offset_seconds,
         lidar_frame,
@@ -200,6 +213,23 @@ pub fn append(appender: &mut Appender, estimate: &Estimate, tree: &StaticTree) -
     })
 }
 
+/// The IMU trajectory as TUM lines, on the sensor clock, the way
+/// `pointlio_rs`'s own tools write it.
+pub fn write_tum(estimate: &Estimate, path: &Path) -> Result<()> {
+    use std::io::Write;
+    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+    for sample in &estimate.poses {
+        let rotation: [f64; 9] = std::array::from_fn(|index| sample.rot[(index / 3, index % 3)]);
+        let [qx, qy, qz, qw] = crate::msgs::quaternion_from_matrix(rotation);
+        writeln!(
+            out,
+            "{:.6} {:.6} {:.6} {:.6} {:.7} {:.7} {:.7} {:.7}",
+            sample.time, sample.pos[0], sample.pos[1], sample.pos[2], qx, qy, qz, qw
+        )?;
+    }
+    Ok(())
+}
+
 /// Whether the recording already carries odometry, so a second run does not
 /// double it.
 pub fn already_present(path: &Path) -> Result<Option<u64>> {
@@ -239,6 +269,7 @@ mod tests {
             log_offset_seconds: 2005.0,
             lidar_frame: "livox_frame".into(),
             path_length_metres: 0.0,
+            rejected_scans: 0,
             lidar_in_imu: Pose::new([-0.011, -0.02329, 0.04412], [0.0, 0.0, 0.0, 1.0]),
         }
     }

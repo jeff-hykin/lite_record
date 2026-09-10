@@ -79,6 +79,11 @@ enum Command {
         /// print the tree, its problems, and the odometry the file would get.
         #[arg(long)]
         dry_run: bool,
+
+        /// Also write the estimated trajectory here in TUM format
+        /// (`time x y z qx qy qz qw`, sensor clock), for comparing runs.
+        #[arg(long)]
+        trajectory: Option<PathBuf>,
     },
 
     /// Complete a recording's frame tree: correct the camera extrinsics an
@@ -180,6 +185,7 @@ fn post_process(
     lidar_topic: Option<&str>,
     imu_topic: Option<&str>,
     dry_run: bool,
+    trajectory: Option<&Path>,
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let urdf = load_urdf(urdf)?;
@@ -271,11 +277,17 @@ fn post_process(
                     || lite_record::odometry::estimate(&mapped, &lidar, &imu, &scans),
                 )?;
                 println!(
-                    "  {} poses, {:.1} m of path, log clock {:+.3} s from the lidar's stamps",
+                    "  {} poses, {:.1} m of path, {} scans rejected by the {} m/s cap, log clock {:+.3} s from the lidar's stamps",
                     estimate.poses.len(),
                     estimate.path_length_metres,
+                    estimate.rejected_scans,
+                    lite_record::odometry::HANDHELD_MAX_VELOCITY,
                     estimate.log_offset_seconds
                 );
+                if let Some(path) = trajectory {
+                    lite_record::odometry::write_tum(&estimate, path)?;
+                    println!("  trajectory -> {}", path.display());
+                }
                 Some(estimate)
             }
         }
@@ -360,7 +372,16 @@ async fn main() -> Result<()> {
             let working_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
             return service::install(&arguments, &working_directory);
         }
-        Some(Command::PostProcess { recording, reclaim, no_odom, urdf, lidar_topic, imu_topic, dry_run }) => {
+        Some(Command::PostProcess {
+            recording,
+            reclaim,
+            no_odom,
+            urdf,
+            lidar_topic,
+            imu_topic,
+            dry_run,
+            trajectory,
+        }) => {
             return post_process(
                 &recording,
                 reclaim,
@@ -369,6 +390,7 @@ async fn main() -> Result<()> {
                 lidar_topic.as_deref(),
                 imu_topic.as_deref(),
                 dry_run,
+                trajectory.as_deref(),
             );
         }
         Some(Command::TfFixup { recording, urdf }) => {
