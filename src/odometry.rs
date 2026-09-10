@@ -29,8 +29,41 @@ use crate::tf::{Pose, StaticTree};
 
 pub const ODOMETRY_TOPIC: &str = "/pointlio_odometry";
 pub const ODOM_FRAME: &str = "odom";
+/// Channel metadata naming the geometry the odometry was computed under: the
+/// frame it describes, and where the lidar sat in that frame. A later run whose
+/// URDF disagrees is reading poses estimated for a different rig.
+pub const GEOMETRY_KEY: &str = "lite_record.odometry_geometry";
 /// Metres per second, twice a brisk walk.
 pub const HANDHELD_MAX_VELOCITY: f64 = 3.0;
+
+/// `<root frame> <x> <y> <z> <qx> <qy> <qz> <qw>`, the lidar's pose in the frame
+/// the odometry describes.
+fn geometry_marker(root: &str, lidar_in_root: &Pose) -> String {
+    let [x, y, z] = lidar_in_root.translation;
+    let [qx, qy, qz, qw] = lidar_in_root.rotation;
+    format!("{root} {x:.6} {y:.6} {z:.6} {qx:.6} {qy:.6} {qz:.6} {qw:.6}")
+}
+
+/// How far the recorded geometry is from `tree`'s, as metres and radians.
+/// `None` when the file carries no marker, which is every file written before
+/// this existed.
+pub fn geometry_drift(marker: &str, tree: &StaticTree, lidar_frame: &str) -> Option<(f64, f64)> {
+    let mut parts = marker.split_whitespace();
+    let root = parts.next()?;
+    let numbers: Vec<f64> = parts.filter_map(|part| part.parse().ok()).collect();
+    let recorded = Pose::new(
+        [*numbers.first()?, *numbers.get(1)?, *numbers.get(2)?],
+        [*numbers.get(3)?, *numbers.get(4)?, *numbers.get(5)?, *numbers.get(6)?],
+    );
+    let now = tree.pose_in(root, lidar_frame)?;
+    let metres = (0..3)
+        .map(|axis| (now.translation[axis] - recorded.translation[axis]).abs())
+        .fold(0.0, f64::max);
+    // The angle of the rotation that takes one orientation to the other.
+    let dot: f64 = (0..4).map(|index| now.rotation[index] * recorded.rotation[index]).sum();
+    let radians = 2.0 * dot.abs().clamp(0.0, 1.0).acos();
+    Some((metres, radians))
+}
 
 /// The estimator's settings for a rig somebody carries.
 ///
@@ -190,7 +223,9 @@ pub fn append(appender: &mut Appender, estimate: &Estimate, tree: &StaticTree) -
         angular_velocity: [0.0; 3],
     });
     let odometry_schema = appender.schema(ODOMETRY_TYPE, "ros2msg", sample_encoded.schema_text.as_bytes());
-    let odometry_channel = appender.channel(ODOMETRY_TOPIC, odometry_schema, "cdr", &channel_metadata(ODOMETRY_TOPIC));
+    let mut metadata = channel_metadata(ODOMETRY_TOPIC);
+    metadata.insert(GEOMETRY_KEY.to_string(), geometry_marker(&child_frame, &lidar_in_root));
+    let odometry_channel = appender.channel(ODOMETRY_TOPIC, odometry_schema, "cdr", &metadata);
     let tf_encoded = crate::cdr::tf_message(&[]);
     let tf_schema = appender.schema(tf_encoded.schema_name, "ros2msg", tf_encoded.schema_text.as_bytes());
     let tf_channel = appender.channel(TF_TOPIC, tf_schema, "cdr", &channel_metadata(TF_TOPIC));
@@ -240,22 +275,29 @@ pub fn write_tum(estimate: &Estimate, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Whether the recording already carries odometry, so a second run does not
-/// double it.
-pub fn already_present(path: &Path) -> Result<Option<u64>> {
+/// The odometry a recording already carries: how many messages, and the rig
+/// geometry it was computed under. `None` when there is none, so a second run
+/// does not double it.
+pub struct Existing {
+    pub messages: u64,
+    pub geometry: Option<String>,
+}
+
+pub fn already_present(path: &Path) -> Result<Option<Existing>> {
     let file = std::fs::File::open(path)?;
     let mapped = unsafe { memmap2::Mmap::map(&file)? };
     let summary = mcap::Summary::read(&mapped)?.context("no summary")?;
     let Some(channel) = summary.channels.values().find(|channel| channel.topic == ODOMETRY_TOPIC) else {
         return Ok(None);
     };
-    Ok(Some(
-        summary
+    Ok(Some(Existing {
+        messages: summary
             .stats
             .as_ref()
             .and_then(|stats| stats.channel_message_counts.get(&channel.id).copied())
             .unwrap_or(0),
-    ))
+        geometry: channel.metadata.get(GEOMETRY_KEY).cloned(),
+    }))
 }
 
 #[cfg(test)]
@@ -313,6 +355,10 @@ mod tests {
         appender.finish().unwrap();
         assert_eq!(appended.child_frame, "base_link");
         assert_eq!(appended.odometry_messages, 2);
+        let recorded = already_present(&path).unwrap().unwrap();
+        assert_eq!(recorded.messages, 2);
+        let (metres, radians) = geometry_drift(recorded.geometry.as_deref().unwrap(), &tree, "livox_frame").unwrap();
+        assert!(metres < 1e-6 && radians < 1e-6, "{metres} {radians}");
 
         let bytes = std::fs::read(&path).unwrap();
         let messages: Vec<_> = mcap::MessageStream::new(&bytes).unwrap().map(Result::unwrap).collect();
@@ -351,6 +397,35 @@ mod tests {
         // Everything else is still the Mid-360 tuning.
         assert_eq!(config.filter_size_map, Config::go2_mid360().filter_size_map);
         assert_eq!(config.lidar_to_imu_trans, Config::go2_mid360().lidar_to_imu_trans);
+    }
+
+    /// A recording keeps the geometry its odometry was computed under, so a
+    /// later urdf that moves the lidar can be told from one that does not.
+    #[test]
+    fn a_urdf_that_moves_the_lidar_shows_up_as_drift_against_the_recorded_geometry() {
+        let mut tree = StaticTree::new();
+        tree.insert("base_link", "livox_link", Pose::new([0.0, 0.0, 0.10], [0.0, 0.0, 0.0, 1.0]));
+        tree.insert("livox_link", "livox_frame", Pose::IDENTITY);
+        let marker = geometry_marker("base_link", &tree.pose_in("base_link", "livox_frame").unwrap());
+
+        let (metres, radians) = geometry_drift(&marker, &tree, "livox_frame").unwrap();
+        assert!(metres < 1e-6 && radians < 1e-6, "the same tree drifted: {metres} m {radians} rad");
+
+        // The real rig pitches the mount back 25 degrees and sits it higher.
+        let mut corrected = StaticTree::new();
+        let quarter = (0.436332_f64 / 2.0).sin();
+        corrected.insert(
+            "base_link",
+            "livox_link",
+            Pose::new([0.0, 0.029, 0.1356], [quarter, 0.0, 0.0, (0.436332_f64 / 2.0).cos()]),
+        );
+        corrected.insert("livox_link", "livox_frame", Pose::IDENTITY);
+        let (metres, radians) = geometry_drift(&marker, &corrected, "livox_frame").unwrap();
+        assert!(metres > 0.03, "{metres}");
+        assert!((radians.to_degrees() - 25.0).abs() < 0.5, "{}", radians.to_degrees());
+
+        assert!(geometry_drift("nonsense", &tree, "livox_frame").is_none());
+        assert!(geometry_drift(&marker, &tree, "no_such_frame").is_none());
     }
 
     #[test]

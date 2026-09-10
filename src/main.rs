@@ -245,8 +245,34 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
 
     let estimate = if no_odom {
         None
-    } else if let Some(count) = lite_record::odometry::already_present(recording)? {
-        println!("{} already carries {count} messages on {}; not estimating again", recording.display(), lite_record::odometry::ODOMETRY_TOPIC);
+    } else if let Some(existing) = lite_record::odometry::already_present(recording)? {
+        println!(
+            "{} already carries {} messages on {}; not estimating again",
+            recording.display(),
+            existing.messages,
+            lite_record::odometry::ODOMETRY_TOPIC
+        );
+        // Odometry describes the tree's root, computed with the lidar-to-root
+        // transform of the day it was written. A urdf that has since moved the
+        // lidar makes those poses describe a rig that does not exist, and
+        // nothing about the file looks wrong.
+        if let Some((metres, radians)) = existing.geometry.as_deref().and_then(|marker| {
+            let lidar = inspected
+                .frame_of_topic
+                .values()
+                .find(|frame| plan.tree.contains(frame) && frame.contains("livox"))
+                .or_else(|| inspected.frame_of_topic.values().next())?;
+            lite_record::odometry::geometry_drift(marker, &plan.tree, lidar)
+        }) {
+            if metres > 1e-3 || radians > 1e-3 {
+                println!(
+                    "warning: that odometry was estimated with the lidar {metres:.3} m and {:.2} deg \
+                     from where this urdf puts it, so it describes a different rig — re-estimate on \
+                     a copy that has no odometry yet",
+                    radians.to_degrees()
+                );
+            }
+        }
         None
     } else {
         let summary = mcap::Summary::read(&mapped)?.context("no summary")?;
