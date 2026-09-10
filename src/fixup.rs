@@ -70,7 +70,7 @@ pub fn inspect(mapped: &[u8]) -> Result<Recording> {
         .channels
         .values()
         .find(|channel| channel.topic == "/tf_static")
-        .map(|channel| (channel.id, channel.metadata.get(TRANSFORM_CONVENTION_KEY).is_some()));
+        .map(|channel| (channel.id, channel.metadata.contains_key(TRANSFORM_CONVENTION_KEY)));
     let tf_channel = summary.channels.values().find(|channel| channel.topic == TF_TOPIC).map(|channel| channel.id);
 
     let mut chunks = summary.chunk_indexes.clone();
@@ -128,7 +128,7 @@ pub fn inspect(mapped: &[u8]) -> Result<Recording> {
                 }
             }
         }
-        if unresolved.is_empty() && tf_static_edges.len() > 0 && tf_chunks_to_read.iter().all(|read| *read <= index) {
+        if unresolved.is_empty() && !tf_static_edges.is_empty() && tf_chunks_to_read.iter().all(|read| *read <= index) {
             break;
         }
     }
@@ -165,6 +165,9 @@ pub struct Plan {
     /// Recorded edges a URDF joint replaced, named so the operator can see it.
     pub overridden: Vec<String>,
     pub problems: Vec<TreeProblem>,
+    /// Things that are not wrong with the tree but will bite: chiefly odometry
+    /// already appended for a frame the URDF has since put under another.
+    pub warnings: Vec<String>,
 }
 
 /// Merges the URDF's joints over the recorded edges. A joint whose child the
@@ -205,11 +208,30 @@ pub fn plan(recording: &Recording, urdf: Option<&crate::urdf::Urdf>) -> Plan {
         .map(|(parent, child, pose)| (parent.to_string(), child.to_string(), *pose))
         .collect();
     let problems = tree.problems(&recording.data_frames());
+    // Odometry is appended as `odom -> <root>`. A URDF applied afterwards can
+    // put that frame under a new root, and then it has two parents: the
+    // odometry cannot be moved, so say so rather than let a tree that looks
+    // connected hide it.
+    let warnings = recording
+        .published
+        .iter()
+        .filter(|(parent, _)| MOVING_PARENTS.contains(&parent.as_str()))
+        .filter_map(|(parent, child)| {
+            tree.parent_of(child).map(|new_parent| {
+                format!(
+                    "{child} already carries {parent} -> {child} odometry but is now under {new_parent}; \
+                     the odometry was estimated before this urdf and describes the wrong frame — \
+                     re-run post_process on a copy taken before the odometry was added"
+                )
+            })
+        })
+        .collect();
     Plan {
         tree,
         new_edges,
         overridden,
         problems,
+        warnings,
     }
 }
 
@@ -277,6 +299,9 @@ pub fn describe(plan: &Plan, appended: u64) -> String {
     }
     for problem in &plan.problems {
         out.push_str(&format!("problem: {problem}\n"));
+    }
+    for warning in &plan.warnings {
+        out.push_str(&format!("warning: {warning}\n"));
     }
     out.push_str(&format!(
         "appended {appended} /tf messages carrying {} new edge(s)\n",
@@ -411,6 +436,32 @@ mod tests {
         assert_eq!(appended, 0);
         assert!(plan.new_edges.is_empty());
         assert_eq!(std::fs::read(&path).unwrap().len(), bytes.len());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn odometry_appended_before_a_urdf_rerooted_its_frame_is_called_out() {
+        let path = scratch("reroot");
+        old_style_recording(&path);
+        // No urdf yet: the lidar's own link is a root, and odometry gets hung off it.
+        let (first, _) = fix(&path, None).unwrap();
+        assert!(first.tree.roots().contains(&"livox_link".to_string()));
+        let mut appender = Appender::open(&path).unwrap();
+        let tf = crate::cdr::tf_message(&[]);
+        let schema = appender.schema(tf.schema_name, "ros2msg", tf.schema_text.as_bytes());
+        let channel = appender.channel(TF_TOPIC, schema, "cdr", &channel_metadata(TF_TOPIC));
+        let edge = Pose::new([1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]).stamped(2_000, "odom", "livox_link");
+        appender.write(channel, 2_000, crate::cdr::tf_message(&[edge]).data).unwrap();
+        appender.finish().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let recording = inspect(&bytes).unwrap();
+        assert!(recording.published.contains(&("odom".to_string(), "livox_link".to_string())));
+        assert!(recording.tree.parent_of("livox_link").is_none(), "odometry is not a static edge");
+        let plan = plan(&recording, Some(&rig_urdf()));
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("livox_link already carries odom -> livox_link odometry"));
+        assert!(plan.warnings[0].contains("now under base_link"));
         std::fs::remove_file(&path).ok();
     }
 

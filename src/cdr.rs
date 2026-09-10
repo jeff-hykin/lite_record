@@ -768,7 +768,7 @@ mod odometry_and_tf_tests {
             header: Header::new(1_700_000_000_123_456_789, "odom"),
             child_frame_id: "base_link".into(),
             position: [1.0, -2.0, 0.5],
-            orientation: [0.0, 0.0, 0.7071067811865476, 0.7071067811865476],
+            orientation: [0.0, 0.0, std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2],
             linear_velocity: [0.3, 0.0, 0.0],
             angular_velocity: [0.0, 0.0, 0.1],
         };

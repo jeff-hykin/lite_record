@@ -164,6 +164,40 @@ longer a whole recording. Nothing is released before its replacement is verified
 are lost, but if the job is interrupted they are split across the partial output and the untouched
 tail of the original, and putting them back together is a manual job.
 
+### The command line
+
+Everything the Post process button does, plus what it cannot, is one command that runs
+on any Mac or Linux box with the recording (`cargo build --release`, or a static
+`nix build .#linux-x86`):
+
+```
+lite_record post_process <file.mcap> [--urdf rig.urdf] [--no-odom] [--reclaim]
+```
+
+It runs three stages. The jxl decode above is the first and is skipped when there is
+nothing to decode. The other two **append** to the file rather than rewriting it — the
+summary is cut off, new chunks are written where it was, and a summary covering old and
+new is put back, so a 63 GB recording grows by the megabytes added and is never copied:
+
+- **Frame tree.** The sensors' own transforms are read (and inverted if an older recorder
+  wrote them in the SDK's direction), the URDF's joints are merged over them, and the
+  complete set is appended to `/tf` at 5 Hz across the recording. `lite_record tf_fixup
+  <file.mcap> --urdf rig.urdf` runs this stage alone, prints the tree and every problem
+  with it, and exits non-zero while the tree is still disconnected. Running it again
+  appends only edges that are not already there.
+- **Odometry.** Point-LIO (pure Rust, vendored) runs over the lidar and IMU and the
+  trajectory is appended as `/pointlio_odometry` and as `odom -> <root>` edges on `/tf`,
+  where `<root>` is the top of the tree the lidar hangs from. Give the URDF in the same
+  run or before: odometry describes the root at the time it is written and cannot be
+  re-rooted afterwards. The lidar's header stamps and the log clock can differ (the Pi's
+  clock stepping after the lidar's offset was taken); the odometry is stamped on the log
+  clock, like the cameras and the tf that places them, and the offset is printed.
+
+Two more take an mcap and produce something to look at: `lite_record heatmap` (a
+top-down density render of a cloud stream with the odometry path over it) and
+`lite_record to_video` (an image topic as mp4 through ffmpeg). `--help` on each lists
+the options.
+
 ### Why there is no H.264
 
 There is an `h264` cargo feature wired to `openh264`, but it is off by default and not
@@ -193,11 +227,15 @@ dimos graph without a remapping table.
 - `<prefix>/imu` as `sensor_msgs/Imu`
 - `<prefix>/lidar` as `sensor_msgs/PointCloud2`, with `x y z intensity tag line offset_time`
   — the per-point time offset the Mid-360 reports, so the cloud can be de-skewed
-- `/tf_static` as `tf2_msgs/TFMessage`, written once at the start of each recording. It
-  carries the uploaded URDF's joints plus one edge per sensor stream. An engaged RealSense
-  supplies those edges from its own factory extrinsics, which is the only place the
-  millimetre offsets between its imagers exist; a sensor that is configured but not open
-  falls back to identity edges, so the frames still exist.
+- `/tf` as `tf2_msgs/TFMessage`, the rig's static transforms repeated at 5 Hz for the whole
+  recording, re-stamped each time — the way dimos' `StaticTfPublisher` publishes them, since
+  dimos has no latched `/tf_static`. It carries the uploaded URDF's joints plus one edge per
+  sensor stream. An engaged RealSense supplies those edges from its own factory extrinsics,
+  which is the only place the millimetre offsets between its imagers exist, inverted from the
+  SDK's point-map direction into tf's child-pose-in-parent; a sensor that is configured but
+  not open falls back to identity edges, so the frames still exist. The channel is marked
+  `lite_record.transform_convention=child_pose_in_parent`; a recording without that mark
+  was written before the inversion and `post_process` corrects it.
 
 Writes are batched and done on their own thread. A saturated queue sheds frames and counts
 them rather than blocking the capture thread, and the count is what the monitor's drop

@@ -40,6 +40,19 @@ const JXL_FORMATS: [&str; 2] = ["jxl", "jpegxl"];
 /// [`crate::record`].
 pub const COMPRESSED_SUFFIX: &str = "/compressed";
 
+/// The recording is already in a form Foxglove can draw. Not a failure — the
+/// CLI treats it as "nothing to do here" and carries on to the other stages.
+#[derive(Debug)]
+pub struct NothingToConvert;
+
+impl std::fmt::Display for NothingToConvert {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "no jxl images or refittable camera infos — nothing to convert")
+    }
+}
+
+impl std::error::Error for NothingToConvert {}
+
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
     /// Frames re-encoded out of jxl into something Foxglove can decode.
@@ -47,6 +60,9 @@ pub struct Report {
     /// Camera infos rewritten from an "unknown" inverse Brown-Conrady
     /// calibration to a fitted forward plumb_bob one.
     pub refitted: u64,
+    /// `/tf_static` messages whose edges were written by an older recorder in
+    /// the SDK's point-map direction and have been inverted into tf poses.
+    pub inverted_transforms: u64,
     /// Messages copied through untouched.
     pub copied: u64,
     /// Frames whose decode failed. They are dropped, not written broken.
@@ -176,9 +192,11 @@ pub fn in_place(input: &Path, progress: &Arc<Progress>, reclaim: Reclaim) -> Res
     }
     if report.decoded == 0 && report.refitted == 0 {
         // Nothing changed, so swapping in the rewrite would only churn the
-        // file's compression. This is also what a second run hits.
+        // file's compression. This is also what a second run hits. A
+        // backwards `/tf_static` alone does not justify a rewrite either:
+        // `fixup` corrects that by appending, which costs nothing.
         discard(&temp);
-        anyhow::bail!("no jxl images or refittable camera infos — nothing to convert");
+        return Err(NothingToConvert.into());
     }
     std::fs::rename(&temp, input)
         .with_context(|| format!("could not replace {}", input.display()))?;
@@ -297,6 +315,30 @@ impl Rewriter {
                     None
                 }
             }
+        } else if schema_name == Some(crate::msgs::TF_TYPE)
+            && channel.topic == "/tf_static"
+            && !crate::fixup::is_marked(&channel.metadata)
+        {
+            match crate::cdr::decode_tf_message(&message.data) {
+                Some(transforms) => {
+                    let inverted: Vec<_> = transforms
+                        .iter()
+                        .map(|edge| {
+                            crate::tf::Pose::from_transform(edge).inverse().stamped(
+                                edge.header.stamp_nanos(),
+                                edge.parent(),
+                                &edge.child_frame_id,
+                            )
+                        })
+                        .collect();
+                    self.report.inverted_transforms += 1;
+                    Some(crate::cdr::tf_message(&inverted))
+                }
+                None => {
+                    self.report.copied += 1;
+                    None
+                }
+            }
         } else {
             self.report.copied += 1;
             None
@@ -334,9 +376,15 @@ impl Rewriter {
                     )
                 }
             };
+            // A `/tf_static` that has just been inverted is marked as such, so
+            // nothing downstream inverts it a second time.
+            let mut metadata = channel.metadata.clone();
+            if topic == "/tf_static" {
+                metadata.extend(crate::record::channel_metadata(crate::record::TF_TOPIC));
+            }
             let id =
                 self.writer
-                    .add_channel(schema_id, topic, &channel.message_encoding, &channel.metadata)?;
+                    .add_channel(schema_id, topic, &channel.message_encoding, &metadata)?;
             slot.insert((id, 0));
         }
 
@@ -360,7 +408,7 @@ impl Rewriter {
     }
 
     fn written(&self) -> u64 {
-        self.report.decoded + self.report.refitted + self.report.copied
+        self.report.decoded + self.report.refitted + self.report.inverted_transforms + self.report.copied
     }
 }
 
@@ -520,7 +568,7 @@ fn by_chunk(
     // only way to notice is to count. Better to refuse than to hand back a
     // recording that is quietly missing messages.
     if let Some(stats) = &summary.stats {
-        let seen = report.decoded + report.refitted + report.copied + report.failed;
+        let seen = report.decoded + report.refitted + report.inverted_transforms + report.copied + report.failed;
         if stats.message_count != 0 && stats.message_count != seen {
             anyhow::bail!(
                 "the index accounts for {} messages but the file says it holds {} — \

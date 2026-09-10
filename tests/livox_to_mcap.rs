@@ -132,8 +132,8 @@ fn captured_mid360_traffic_lands_in_an_mcap_that_reads_back() {
     assert_eq!(imu.1, 60);
 
     assert!(
-        channels.contains_key("/tf_static"),
-        "every recording must carry a tf_static channel, got {:?}",
+        channels.contains_key("/tf"),
+        "every recording must carry its static transforms on /tf, got {:?}",
         channels.keys().collect::<Vec<_>>()
     );
 

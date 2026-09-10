@@ -641,7 +641,7 @@ mod tests {
                         log_time: 1_000 + index as u64 * 100,
                         publish_time: 1_000 + index as u64 * 100,
                     },
-                    &vec![index as u8; 200],
+                    &[index as u8; 200],
                 )
                 .unwrap();
         }

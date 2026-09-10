@@ -55,6 +55,37 @@ enum Command {
         /// messages split across two files, and putting them back is manual.
         #[arg(long)]
         reclaim: bool,
+
+        /// Skip the Point-LIO pass that appends /pointlio_odometry and the
+        /// odom -> rig edges on /tf.
+        #[arg(long)]
+        no_odom: bool,
+
+        /// A URDF whose joints join the sensors' own frame trees into one, the
+        /// same as running tf_fixup first.
+        #[arg(long)]
+        urdf: Option<PathBuf>,
+
+        /// The PointCloud2 topic to estimate odometry from. Found automatically
+        /// when there is only one lidar.
+        #[arg(long)]
+        lidar_topic: Option<String>,
+
+        /// The Imu topic that goes with --lidar-topic.
+        #[arg(long)]
+        imu_topic: Option<String>,
+    },
+
+    /// Complete a recording's frame tree: correct the camera extrinsics an
+    /// older recorder wrote backwards, add the URDF's joints, and append the
+    /// result to /tf at 5 Hz. Prints the tree and exits non-zero if it is
+    /// still disconnected.
+    #[command(name = "tf_fixup", alias = "tf-fixup")]
+    TfFixup {
+        recording: PathBuf,
+
+        #[arg(long)]
+        urdf: Option<PathBuf>,
     },
 }
 
@@ -96,48 +127,176 @@ fn absolute(path: &Path) -> PathBuf {
     })
 }
 
-/// A conversion of a large recording runs for hours, so this prints a line a
-/// minute rather than going silent and looking hung.
-fn post_process(recording: &Path, reclaim: bool) -> Result<()> {
-    let reclaim = match reclaim {
-        true => convert::Reclaim::AsItGoes,
-        false => convert::Reclaim::No,
-    };
-    let progress = Arc::new(convert::Progress::default());
-    let watched = Arc::clone(&progress);
+/// Runs `work` while printing `describe()` once a minute, so a stage that runs
+/// for an hour on a large recording never looks hung.
+fn with_ticker<T>(describe: impl Fn() -> String + Send + 'static, work: impl FnOnce() -> T) -> T {
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let stopping = Arc::clone(&running);
-    let started = std::time::Instant::now();
     let ticker = std::thread::spawn(move || {
         let mut seconds = 0;
         while stopping.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_secs(1));
             seconds += 1;
             if seconds % 60 == 0 {
-                println!(
-                    "  {:>6}s  {} messages  {:.2} GB written",
-                    started.elapsed().as_secs(),
-                    watched.messages.load(std::sync::atomic::Ordering::Relaxed),
-                    watched.bytes.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
-                );
+                println!("  {:>6}s  {}", seconds, describe());
             }
         }
     });
-    let report = convert::in_place(recording, &progress, reclaim);
+    let result = work();
     running.store(false, std::sync::atomic::Ordering::Relaxed);
     let _ = ticker.join();
-    let report = report?;
-    println!(
-        "{}: {} decoded, {} refitted, {} copied, {} failed, {:.2} GB, {:.2} GB reclaimed, {}s",
-        recording.display(),
-        report.decoded,
-        report.refitted,
-        report.copied,
-        report.failed,
-        report.bytes as f64 / 1e9,
-        report.reclaimed as f64 / 1e9,
-        started.elapsed().as_secs(),
+    result
+}
+
+fn load_urdf(path: Option<&Path>) -> Result<Option<lite_record::urdf::Urdf>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let xml = std::fs::read_to_string(path).with_context(|| format!("could not read {}", path.display()))?;
+    Ok(Some(lite_record::urdf::parse(&xml).with_context(|| format!("{} is not a urdf", path.display()))?))
+}
+
+/// The three stages that turn a fresh recording into one that is viewable,
+/// placed and localised: decode jxl (a rewrite, skipped when there is none),
+/// then complete the frame tree and estimate odometry (both appended).
+fn post_process(
+    recording: &Path,
+    reclaim: bool,
+    no_odom: bool,
+    urdf: Option<&Path>,
+    lidar_topic: Option<&str>,
+    imu_topic: Option<&str>,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    let urdf = load_urdf(urdf)?;
+
+    let reclaim = match reclaim {
+        true => convert::Reclaim::AsItGoes,
+        false => convert::Reclaim::No,
+    };
+    let progress = Arc::new(convert::Progress::default());
+    let watched = Arc::clone(&progress);
+    let converted = with_ticker(
+        move || {
+            format!(
+                "{} messages  {:.2} GB written",
+                watched.messages.load(std::sync::atomic::Ordering::Relaxed),
+                watched.bytes.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+            )
+        },
+        || convert::in_place(recording, &progress, reclaim),
     );
+    match converted {
+        Ok(report) => println!(
+            "{}: {} decoded, {} refitted, {} transforms inverted, {} copied, {} failed, {:.2} GB, {:.2} GB reclaimed, {}s",
+            recording.display(),
+            report.decoded,
+            report.refitted,
+            report.inverted_transforms,
+            report.copied,
+            report.failed,
+            report.bytes as f64 / 1e9,
+            report.reclaimed as f64 / 1e9,
+            started.elapsed().as_secs(),
+        ),
+        Err(error) if error.downcast_ref::<convert::NothingToConvert>().is_some() => {
+            println!("{}: already viewable, nothing to convert", recording.display());
+        }
+        Err(error) => return Err(error),
+    }
+
+    // The frame tree first, since the odometry describes its root.
+    let file = std::fs::File::open(recording)?;
+    let mapped = unsafe { memmap2::Mmap::map(&file)? };
+    let inspected = lite_record::fixup::inspect(&mapped)?;
+    let plan = lite_record::fixup::plan(&inspected, urdf.as_ref());
+    if !no_odom && urdf.is_none() && plan.tree.roots().len() > 1 {
+        println!(
+            "note: the frame tree has {} roots and no --urdf was given, so the odometry will describe \
+             the lidar's own link; pass --urdf now if the rig has one, since odometry cannot be re-rooted later",
+            plan.tree.roots().len()
+        );
+    }
+
+    let estimate = if no_odom {
+        None
+    } else if let Some(count) = lite_record::odometry::already_present(recording)? {
+        println!("{} already carries {count} messages on {}; not estimating again", recording.display(), lite_record::odometry::ODOMETRY_TOPIC);
+        None
+    } else {
+        let summary = mcap::Summary::read(&mapped)?.context("no summary")?;
+        let found = lite_record::odometry::find_lidar_and_imu(&summary);
+        // Either topic given on the command line replaces the found one.
+        let topics = found
+            .map(|(lidar, imu)| {
+                (
+                    lidar_topic.map_or(lidar, str::to_string),
+                    imu_topic.map_or(imu, str::to_string),
+                )
+            })
+            .or_else(|| Some((lidar_topic?.to_string(), imu_topic?.to_string())));
+        match topics {
+            None => {
+                println!("no lidar + imu pair in the recording, so no odometry to estimate");
+                None
+            }
+            Some((lidar, imu)) => {
+                println!("estimating odometry from {lidar} + {imu} (this takes a while)");
+                let scans = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let watched = Arc::clone(&scans);
+                let estimate = with_ticker(
+                    move || format!("{} scans", watched.load(std::sync::atomic::Ordering::Relaxed)),
+                    || lite_record::odometry::estimate(&mapped, &lidar, &imu, &scans),
+                )?;
+                println!(
+                    "  {} poses, {:.1} m of path, log clock {:+.3} s from the lidar's stamps",
+                    estimate.poses.len(),
+                    estimate.path_length_metres,
+                    estimate.log_offset_seconds
+                );
+                Some(estimate)
+            }
+        }
+    };
+    drop(mapped);
+
+    if plan.new_edges.is_empty() && estimate.is_none() {
+        print!("{}", lite_record::fixup::describe(&plan, 0));
+        println!("nothing to append; {}s", started.elapsed().as_secs());
+        return Ok(());
+    }
+    let mut appender = lite_record::mcap_append::Appender::open(recording)?;
+    let static_messages = lite_record::fixup::append_static_transforms(
+        &mut appender,
+        &plan.new_edges,
+        inspected.start_nanos,
+        inspected.end_nanos,
+    )?;
+    let appended = match &estimate {
+        Some(estimate) => Some(lite_record::odometry::append(&mut appender, estimate, &plan.tree)?),
+        None => None,
+    };
+    let total = appender.finish()?;
+    print!("{}", lite_record::fixup::describe(&plan, static_messages));
+    if let Some(appended) = appended {
+        println!(
+            "appended {} {} messages (odom -> {}) and as many /tf edges",
+            appended.odometry_messages,
+            lite_record::odometry::ODOMETRY_TOPIC,
+            appended.child_frame
+        );
+    }
+    println!("{total} messages appended to {}; {}s", recording.display(), started.elapsed().as_secs());
+    Ok(())
+}
+
+fn tf_fixup(recording: &Path, urdf: Option<&Path>) -> Result<()> {
+    let urdf = load_urdf(urdf)?;
+    let (plan, appended) = lite_record::fixup::fix(recording, urdf.as_ref())?;
+    print!("{}", lite_record::fixup::describe(&plan, appended));
+    if !plan.problems.is_empty() {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -170,8 +329,18 @@ async fn main() -> Result<()> {
             let working_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
             return service::install(&arguments, &working_directory);
         }
-        Some(Command::PostProcess { recording, reclaim }) => {
-            return post_process(&recording, reclaim);
+        Some(Command::PostProcess { recording, reclaim, no_odom, urdf, lidar_topic, imu_topic }) => {
+            return post_process(
+                &recording,
+                reclaim,
+                no_odom,
+                urdf.as_deref(),
+                lidar_topic.as_deref(),
+                imu_topic.as_deref(),
+            );
+        }
+        Some(Command::TfFixup { recording, urdf }) => {
+            return tf_fixup(&recording, urdf.as_deref());
         }
         None => {}
     }
