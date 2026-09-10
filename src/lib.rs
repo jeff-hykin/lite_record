@@ -14,6 +14,7 @@ pub mod hub;
 pub mod image;
 pub mod livox;
 pub mod livox_command;
+pub mod mcap_append;
 pub mod msgs;
 pub mod privileged;
 pub mod record;
