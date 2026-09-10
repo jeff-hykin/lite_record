@@ -42,12 +42,28 @@ pub struct ChannelClock {
     /// The smallest `log_time - header_stamp` seen, in nanoseconds. Positive
     /// means the header stamps are behind the clock the file was logged on.
     pub offset_nanos: i64,
+    /// The largest, which for a healthy stream differs from the smallest only
+    /// by delivery jitter. A stream whose offset *moves* was written by a
+    /// recorder that failed to follow the host clock partway through, and no
+    /// single shift can put it right.
+    pub widest_nanos: i64,
     pub messages: u64,
 }
 
 impl ChannelClock {
     pub fn needs_shift(&self) -> bool {
-        self.offset_nanos.abs() > TOLERANCE_NANOS
+        self.offset_nanos.abs() > TOLERANCE_NANOS && !self.moved()
+    }
+
+    /// The offset changed during the recording by more than delivery jitter
+    /// could account for, so the stream is not a constant distance from the
+    /// file's clock and shifting it would only move the error around.
+    pub fn moved(&self) -> bool {
+        self.widest_nanos - self.offset_nanos > TOLERANCE_NANOS
+    }
+
+    pub fn spread_seconds(&self) -> f64 {
+        (self.widest_nanos - self.offset_nanos) as f64 / 1e9
     }
 
     pub fn seconds(&self) -> f64 {
@@ -75,9 +91,11 @@ pub fn survey(mapped: &[u8]) -> Result<BTreeMap<u16, ChannelClock>> {
         let entry = clocks.entry(message.channel.id).or_insert_with(|| ChannelClock {
             topic: message.channel.topic.clone(),
             offset_nanos: offset,
+            widest_nanos: offset,
             messages: 0,
         });
         entry.offset_nanos = entry.offset_nanos.min(offset);
+        entry.widest_nanos = entry.widest_nanos.max(offset);
         entry.messages += 1;
     }
     let _ = summary;
@@ -129,12 +147,32 @@ pub fn shift_header(payload: &mut [u8], offset_nanos: i64) -> bool {
 
 /// The lines `post_process` prints about a recording's clocks.
 pub fn describe(clocks: &BTreeMap<u16, ChannelClock>) -> String {
+    let mut out = String::new();
+
+    let mut moved: Vec<&ChannelClock> = clocks.values().filter(|clock| clock.moved()).collect();
+    if !moved.is_empty() {
+        moved.sort_by_key(|clock| std::cmp::Reverse(clock.widest_nanos - clock.offset_nanos));
+        out.push_str(
+            "warning: these streams drifted away from the file's clock while it was being \
+             recorded, so no single shift can repair them — the recorder that wrote this did \
+             not follow the host clock:\n",
+        );
+        for clock in moved {
+            out.push_str(&format!(
+                "  {:<40} moved {:.3} s during the recording ({} messages)\n",
+                clock.topic,
+                clock.spread_seconds(),
+                clock.messages
+            ));
+        }
+    }
+
     let mut split: Vec<&ChannelClock> = clocks.values().filter(|clock| clock.needs_shift()).collect();
     if split.is_empty() {
-        return String::new();
+        return out;
     }
     split.sort_by_key(|clock| std::cmp::Reverse(clock.offset_nanos));
-    let mut out = String::from(
+    out.push_str(
         "warning: this recording was written on more than one clock, so a viewer cannot place \
          the streams against each other:\n",
     );
@@ -232,6 +270,55 @@ mod tests {
         assert!(report.contains("/livox/imu"), "{report}");
         assert!(report.contains("2005.000 s behind"), "{report}");
         assert!(!report.contains("/camera/imu"), "{report}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The case a minimum alone is blind to: the clock moves partway through,
+    /// so the smallest offset still looks healthy while half the stream is
+    /// seconds out. Shifting by one number cannot fix that, and saying nothing
+    /// would be worse than saying so.
+    #[test]
+    fn a_stream_that_steps_partway_through_is_reported_and_not_shifted() {
+        let path = scratch("stepped");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = mcap::WriteOptions::new()
+            .compression(Some(mcap::Compression::Zstd))
+            .chunk_size(Some(4096))
+            .profile("ros2")
+            .create(BufWriter::new(file))
+            .unwrap();
+        let sample = crate::cdr::imu(&Imu::unoriented(Header::new(0, "x"), [0.0; 3], [0.0; 3]));
+        let schema = writer.add_schema(sample.schema_name, "ros2msg", sample.schema_text.as_bytes()).unwrap();
+        let channel = writer.add_channel(schema, "/livox/imu", "cdr", &Default::default()).unwrap();
+        let epoch = 1_700_000_000 * NANOS_PER_SEC;
+        let step = 120 * NANOS_PER_SEC;
+        for index in 0..40u64 {
+            let log_time = epoch + index * 5_000_000;
+            // Halfway through, the host clock jumps and the stream does not
+            // follow it, so its stamps fall behind from there on.
+            let stamp = match index < 20 {
+                true => log_time,
+                false => log_time - step,
+            };
+            let encoded = crate::cdr::imu(&Imu::unoriented(Header::new(stamp, "frame"), [0.0; 3], [0.0; 3]));
+            writer
+                .write_to_known_channel(
+                    &mcap::records::MessageHeader { channel_id: channel, sequence: index as u32, log_time, publish_time: log_time },
+                    &encoded.data,
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let clocks = survey(&bytes).unwrap();
+        let stream = clocks.values().next().unwrap();
+        assert!(stream.moved(), "a 120 s step went unnoticed");
+        assert!((stream.spread_seconds() - 120.0).abs() < 0.01);
+        assert!(!stream.needs_shift(), "a stepped stream must not be shifted by one number");
+        let report = describe(&clocks);
+        assert!(report.contains("drifted away from the file's clock"), "{report}");
+        assert!(report.contains("moved 120.000 s"), "{report}");
         std::fs::remove_file(&path).ok();
     }
 
