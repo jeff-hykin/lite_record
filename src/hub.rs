@@ -1643,7 +1643,13 @@ mod tests {
         hub.update_settings(settings).unwrap();
 
         hub.start_recording(Some("tf.mcap")).unwrap();
-        std::thread::sleep(Duration::from_millis(650));
+        // Three copies at 5 Hz take 400 ms on an idle machine; a loaded one
+        // schedules the repeater late, so wait for the count, not the clock.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while hub.recording_status().messages < 3 {
+            assert!(Instant::now() < deadline, "the static transforms were not repeated");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let status = hub.stop_recording().unwrap();
         assert!(status.messages >= 3, "{}", status.messages);
 

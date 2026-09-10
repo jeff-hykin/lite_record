@@ -110,12 +110,12 @@ pub fn inspect(mapped: &[u8]) -> Result<Recording> {
             let message = message?;
             let id = message.channel.id;
             if tf_static_channel.is_some_and(|(static_id, _)| static_id == id) {
-                if let Some(transforms) = crate::cdr::decode_tf_message(&message.data).ok() {
+                if let Ok(transforms) = crate::cdr::decode_tf_message(&message.data) {
                     tf_static_edges.extend(transforms);
                 }
             } else if tf_channel == Some(id) {
                 if wants_tf && !took_tf_sample {
-                    if let Some(transforms) = crate::cdr::decode_tf_message(&message.data).ok() {
+                    if let Ok(transforms) = crate::cdr::decode_tf_message(&message.data) {
                         tf_samples.push(transforms);
                         took_tf_sample = true;
                     }
