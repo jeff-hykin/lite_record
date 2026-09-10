@@ -8,6 +8,7 @@
 
 pub mod access;
 pub mod cdr;
+pub mod clock;
 pub mod convert;
 pub mod distortion;
 pub mod fixup;
@@ -21,6 +22,7 @@ pub mod msgs;
 pub mod odometry;
 pub mod privileged;
 pub mod record;
+pub mod restamp;
 pub mod rvl;
 pub mod sensors;
 pub mod service;

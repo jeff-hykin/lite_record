@@ -169,7 +169,7 @@ fn a_frame_larger_than_its_compressed_chunk_still_verifies() {
     let source = std::path::Path::new(&recorded);
     let output = directory.join("big_viewable.mcap");
     let progress = Arc::new(convert::Progress::default());
-    let report = convert::to_viewable(source, &output, &progress, convert::Reclaim::No).unwrap();
+    let report = convert::to_viewable(source, &output, &progress, convert::Reclaim::No, &Default::default()).unwrap();
     assert_eq!(report.decoded, FRAMES as u64);
     assert_eq!(report.failed, 0);
 
@@ -254,7 +254,7 @@ fn reclaiming_frees_each_source_chunk_once_its_replacement_is_verified() {
     let output = directory.join("reclaimed.mcap");
     let progress = Arc::new(convert::Progress::default());
     let report =
-        convert::to_viewable(source, &output, &progress, convert::Reclaim::AsItGoes).unwrap();
+        convert::to_viewable(source, &output, &progress, convert::Reclaim::AsItGoes, &Default::default()).unwrap();
 
     assert_eq!(report.decoded, FRAMES as u64);
     assert_eq!(report.failed, 0);
@@ -352,7 +352,7 @@ fn a_recording_with_only_unknown_camera_infos_still_converts() {
     }
 
     let progress = Arc::new(convert::Progress::default());
-    let report = convert::in_place(&path, &progress, convert::Reclaim::No).unwrap();
+    let report = convert::in_place(&path, &progress, convert::Reclaim::No, &Default::default()).unwrap();
     assert_eq!(report.refitted, COPIES);
     assert_eq!(report.decoded, 0);
     assert_eq!(report.failed, 0);
@@ -370,7 +370,7 @@ fn a_recording_with_only_unknown_camera_infos_still_converts() {
 
     // Run two: everything already reads plumb_bob, so there is nothing left to
     // do and the file must be refused rather than churned.
-    let error = convert::in_place(&path, &progress, convert::Reclaim::No).unwrap_err();
+    let error = convert::in_place(&path, &progress, convert::Reclaim::No, &Default::default()).unwrap_err();
     assert!(error.to_string().contains("nothing to convert"), "{error}");
 
     std::fs::remove_dir_all(&directory).ok();
@@ -452,7 +452,7 @@ fn converting_a_recording_moves_every_jxl_stream_to_a_format_foxglove_can_draw()
     let color_pixels: Vec<u8> = (0..WIDTH * HEIGHT * 3).map(|index| ((index * 7) % 251) as u8).collect();
 
     let progress = Arc::new(convert::Progress::default());
-    let report = convert::in_place(source, &progress, convert::Reclaim::No).unwrap();
+    let report = convert::in_place(source, &progress, convert::Reclaim::No, &Default::default()).unwrap();
     assert_eq!(report.decoded, 3, "a jxl stream was left in a format Foxglove cannot draw");
     assert_eq!(report.failed, 0);
     assert_eq!(
@@ -507,7 +507,7 @@ fn converting_a_recording_moves_every_jxl_stream_to_a_format_foxglove_can_draw()
     // because a "conversion" that re-compresses an already-raw file in place
     // would churn every recording someone taps twice.
     let before = std::fs::read(source).unwrap();
-    let error = convert::in_place(source, &progress, convert::Reclaim::No).unwrap_err();
+    let error = convert::in_place(source, &progress, convert::Reclaim::No, &Default::default()).unwrap_err();
     assert!(error.to_string().contains("nothing to convert"), "{error}");
     assert_eq!(std::fs::read(source).unwrap(), before, "a refused conversion changed the file");
 

@@ -108,6 +108,12 @@ struct PostProcessArgs {
     /// (`time x y z qx qy qz qw`, sensor clock), for comparing runs.
     #[arg(long)]
     trajectory: Option<PathBuf>,
+
+    /// Shift any stream whose header stamps sit on a different clock from the
+    /// rest of the file onto the file's clock, keeping the device's own
+    /// spacing. A split clock is reported either way; this repairs it.
+    #[arg(long)]
+    fix_clocks: bool,
 }
 
 impl Args {
@@ -181,8 +187,22 @@ fn load_urdf(path: Option<&Path>) -> Result<Option<lite_record::urdf::Urdf>> {
 /// placed and localised: decode jxl (a rewrite, skipped when there is none),
 /// then complete the frame tree and estimate odometry (both appended).
 fn post_process(args: &PostProcessArgs) -> Result<()> {
-    let PostProcessArgs { recording, reclaim, no_odom, urdf, lidar_topic, imu_topic, dry_run, trajectory } = args;
+    let PostProcessArgs {
+        recording, reclaim, no_odom, urdf, lidar_topic, imu_topic, dry_run, trajectory, fix_clocks,
+    } = args;
     let (recording, reclaim, no_odom, dry_run) = (recording.as_path(), *reclaim, *no_odom, *dry_run);
+    // Surveyed before anything is written, so the report describes the file as
+    // it was handed over rather than as this run leaves it.
+    let clocks = lite_record::restamp::survey_path(recording)?;
+    print!("{}", lite_record::restamp::describe(&clocks));
+    let shifts: std::collections::BTreeMap<u16, i64> = match *fix_clocks && !dry_run {
+        true => clocks
+            .iter()
+            .filter(|(_, clock)| clock.needs_shift())
+            .map(|(id, clock)| (*id, clock.offset_nanos))
+            .collect(),
+        false => Default::default(),
+    };
     let (lidar_topic, imu_topic, trajectory) = (lidar_topic.as_deref(), imu_topic.as_deref(), trajectory.as_deref());
     let started = std::time::Instant::now();
     let urdf = load_urdf(urdf.as_deref())?;
@@ -208,15 +228,16 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
             }
             (true, Ok(false)) => Err(convert::NothingToConvert.into()),
             (true, Err(error)) => Err(error),
-            (false, _) => convert::in_place(recording, &progress, reclaim),
+            (false, _) => convert::in_place(recording, &progress, reclaim, &shifts),
         },
     );
     match converted {
         Ok(report) => println!(
-            "{}: {} decoded, {} refitted, {} transforms inverted, {} copied, {} failed, {:.2} GB, {:.2} GB reclaimed, {}s",
+            "{}: {} decoded, {} refitted, {} restamped, {} transforms inverted, {} copied, {} failed, {:.2} GB, {:.2} GB reclaimed, {}s",
             recording.display(),
             report.decoded,
             report.refitted,
+            report.restamped,
             report.inverted_transforms,
             report.copied,
             report.failed,

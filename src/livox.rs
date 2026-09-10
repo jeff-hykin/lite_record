@@ -287,9 +287,11 @@ pub struct FrameAccumulator {
     points: Vec<Point>,
     frame_start: Option<u64>,
     line_counter: u64,
-    /// Offset added to lidar-local stamps to put them on the host clock.
-    clock_offset_nanos: i64,
-    clock_locked: bool,
+    /// Puts the lidar's free-running hardware clock onto the host's. Held as
+    /// an estimate that keeps following the host, not a constant: see
+    /// [`crate::clock`] for what a locked offset did to a real recording.
+    /// `None` once the lidar reports an already-absolute time source.
+    clock: Option<crate::clock::HostClock>,
     /// Voxel edge length in metres, applied just before packing. Zero keeps
     /// every point. Thinning here rather than after packing avoids unpacking a
     /// cloud that was only just assembled.
@@ -304,8 +306,7 @@ impl FrameAccumulator {
             points: Vec::with_capacity(32_768),
             frame_start: None,
             line_counter: 0,
-            clock_offset_nanos: 0,
-            clock_locked: false,
+            clock: Some(crate::clock::HostClock::default()),
             voxel_leaf_size: 0.0,
         }
     }
@@ -315,30 +316,39 @@ impl FrameAccumulator {
         self
     }
 
-    /// Pins the lidar's free-running clock to the host clock using the first
-    /// packet seen. Without this every stamp in the file is an arbitrary number
-    /// of seconds since the lidar booted.
-    fn lock_clock(&mut self, lidar_nanos: u64, host_nanos: u64, source: TimeSource) {
-        if self.clock_locked {
+    /// Offers the packet's own stamp to the clock estimate. A lidar that is
+    /// already on an absolute time source (gPTP, GPS PPS) needs no estimate at
+    /// all and its stamps pass through untouched.
+    fn observe_clock(&mut self, lidar_nanos: u64, host_nanos: u64, source: TimeSource) {
+        if source.is_absolute() {
+            self.clock = None;
             return;
         }
-        self.clock_locked = true;
-        self.clock_offset_nanos = if source.is_absolute() {
-            0
-        } else {
-            host_nanos as i64 - lidar_nanos as i64
-        };
+        if let Some(clock) = self.clock.as_mut() {
+            clock.map(lidar_nanos, host_nanos);
+        }
     }
 
     fn to_host_nanos(&self, lidar_nanos: u64) -> u64 {
-        (lidar_nanos as i64 + self.clock_offset_nanos).max(0) as u64
+        match self.clock.as_ref() {
+            Some(clock) => clock.epoch_for(lidar_nanos),
+            None => lidar_nanos,
+        }
+    }
+
+    /// The offset currently added to a lidar stamp, for the cloud packer.
+    fn clock_offset_nanos(&self) -> i64 {
+        match self.clock.as_ref() {
+            Some(clock) => clock.offset_nanos(),
+            None => 0,
+        }
     }
 
     /// Feeds one datagram in. Returns a cloud whenever a frame boundary is
     /// crossed. `host_nanos` is the wall clock at receipt.
     pub fn push_packet(&mut self, packet: &[u8], host_nanos: u64) -> Result<Option<PointCloud2>> {
         let header = PacketHeader::parse(packet)?;
-        self.lock_clock(header.timestamp, host_nanos, header.time_source);
+        self.observe_clock(header.timestamp, host_nanos, header.time_source);
         let decoded = decode_packet(packet, self.line_counter)?;
         let Decoded::Points(points) = decoded else {
             return Ok(None);
@@ -358,7 +368,7 @@ impl FrameAccumulator {
     /// Decodes an IMU datagram onto the same re-based clock.
     pub fn push_imu(&mut self, packet: &[u8], host_nanos: u64, frame_id: &str) -> Result<Imu> {
         let header = PacketHeader::parse(packet)?;
-        self.lock_clock(header.timestamp, host_nanos, header.time_source);
+        self.observe_clock(header.timestamp, host_nanos, header.time_source);
         let Decoded::Imu(sample) = decode_packet(packet, 0)? else {
             bail!("expected an imu packet");
         };
@@ -381,7 +391,7 @@ impl FrameAccumulator {
         } else {
             points
         };
-        Some(build_cloud(&points, base, &self.frame_id, self.clock_offset_nanos))
+        Some(build_cloud(&points, base, &self.frame_id, self.clock_offset_nanos()))
     }
 
     pub fn pending_points(&self) -> usize {
@@ -665,6 +675,48 @@ mod tests {
         assert!(
             cloud.header.stamp_nanos() > 1_600_000_000 * NANOS_PER_SEC,
             "lidar-local time leaked into the header instead of host time"
+        );
+    }
+
+    /// The bug behind the grocery recording. The Pi has no clock across a power
+    /// cycle, so it boots wrong and NTP steps it once the network is up. The
+    /// lidar's own clock keeps running regardless, and the offset between the
+    /// two has to follow the step: locking it on the first packet left every
+    /// stamp in that file 2005 s behind the cameras beside it.
+    #[test]
+    fn a_host_clock_corrected_by_ntp_mid_recording_is_followed() {
+        let packets = point_packets();
+        let truth = 1_700_000_000_000_000_000u64;
+        let boot_error = 2_005_000_000_000u64;
+
+        let mut accumulator = FrameAccumulator::new(10.0, "livox_frame");
+        let mut clouds = Vec::new();
+        for (index, (_, packet)) in packets.iter().enumerate() {
+            // The host clock is half an hour slow for the first frame's worth
+            // of packets, then NTP corrects it.
+            let arrival = match index < 208 {
+                true => truth - boot_error + index as u64 * 480_000,
+                false => truth + index as u64 * 480_000,
+            };
+            if let Some(cloud) = accumulator.push_packet(packet, arrival).unwrap() {
+                clouds.push(cloud);
+            }
+        }
+        // Replay the same capture again, on the corrected clock, so there are
+        // packets after the step for the estimate to work from.
+        for (index, (_, packet)) in packets.iter().enumerate() {
+            let arrival = truth + (packets.len() + index) as u64 * 480_000;
+            if let Some(cloud) = accumulator.push_packet(packet, arrival).unwrap() {
+                clouds.push(cloud);
+            }
+        }
+        clouds.extend(accumulator.flush());
+
+        let last = clouds.last().expect("no cloud came out").header.stamp_nanos();
+        let behind = truth.saturating_sub(last) as f64 / NANOS_PER_SEC as f64;
+        assert!(
+            behind < 1.0,
+            "the stamp is {behind:.1} s behind the corrected host clock — the offset was locked",
         );
     }
 

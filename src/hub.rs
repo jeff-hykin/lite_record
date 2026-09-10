@@ -881,8 +881,17 @@ impl Hub {
         // frames it needs to place everything else, and keep going at 5 Hz so a
         // consumer joining mid-file (or dimos, which has no latched tf) sees them.
         recorder.repeat_transforms(transforms);
+        // Re-stamped, not replayed as announced. A camera announces its
+        // intrinsics when it opens, which on a Pi is at boot, before NTP has
+        // corrected a clock that has no battery behind it. Keeping that stamp
+        // put the calibration 2055 s before the images it belongs to in the
+        // grocery recording. The content is what matters here; the stamp only
+        // says when this file learned it.
+        let announced_at = record::now_nanos();
         for (topic, info) in &intrinsics {
-            recorder.offer(topic, crate::cdr::camera_info(info));
+            let mut info = info.clone();
+            info.header = crate::msgs::Header::new(announced_at, info.header.frame_id);
+            recorder.offer(topic, crate::cdr::camera_info(&info));
         }
         *self.shed_baseline.lock().unwrap() = self.pipeline_dropped.lock().unwrap().clone();
         let status = recorder.status();
@@ -1731,6 +1740,57 @@ mod tests {
             topics.iter().any(|t| t == "/realsense/camera_info"),
             "got {topics:?}"
         );
+        std::fs::remove_dir_all(&directory).ok();
+        std::fs::remove_file(hub.settings_file()).ok();
+    }
+
+    /// The calibration a camera announced at boot must not carry a boot-time
+    /// stamp into a file recorded later — on a Pi that stamp predates NTP's
+    /// correction and lands thousands of seconds before the images.
+    #[test]
+    fn a_replayed_camera_info_is_stamped_when_the_recording_started() {
+        let hub = scratch_hub();
+        let directory =
+            std::env::temp_dir().join(format!("lite_record_stamp_{}", record::now_nanos()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut settings = hub.settings();
+        settings.record_dir = directory.clone();
+        hub.update_settings(settings).unwrap();
+
+        // Announced with a stamp half an hour in the past, the way a camera
+        // opened before the clock was corrected would have.
+        let announced = record::now_nanos() - 2_005 * crate::msgs::NANOS_PER_SEC;
+        hub.sink()(Produced::CameraInfo {
+            topic: "/realsense/camera_info".into(),
+            info: Box::new(CameraInfo::pinhole(
+                crate::msgs::Header::new(announced, "camera_color_optical_frame"),
+                640, 480, 600.0, 600.0, 320.0, 240.0,
+                crate::msgs::DistortionModel::PlumbBob, vec![0.0; 5], 0.0,
+            )),
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while hub.latest_intrinsics.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the announcement never arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let started = record::now_nanos();
+        hub.start_recording(Some("stamp.mcap")).unwrap();
+        hub.stop_recording().unwrap();
+
+        let bytes = std::fs::read(directory.join("stamp.mcap")).unwrap();
+        let info = mcap::MessageStream::new(&bytes)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|message| message.channel.topic == "/realsense/camera_info")
+            .expect("no camera_info in the file");
+        let stamp = crate::cdr::decode_header(&info.data).unwrap().stamp_nanos();
+        assert!(
+            stamp >= started,
+            "the calibration kept its announce stamp, {} s before the recording",
+            (started - stamp) as f64 / crate::msgs::NANOS_PER_SEC as f64
+        );
+        assert!(stamp < started + 60 * crate::msgs::NANOS_PER_SEC);
         std::fs::remove_dir_all(&directory).ok();
         std::fs::remove_file(hub.settings_file()).ok();
     }

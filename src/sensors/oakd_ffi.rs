@@ -23,7 +23,7 @@ use anyhow::{anyhow, Result};
 use super::super::{Backend, BackendStatus, CameraConfig, Naming, Produced, Sink, StreamId};
 use super::{
     body_transforms, camera_info, nearest_imu_rate, ros_encoding, shim_stream_index, socket_for,
-    BodyExtrinsic, OakCameraModel, SteadyToEpoch, StreamCalibration, StrictlyIncreasing, CAM_A,
+    BodyExtrinsic, OakCameraModel, StreamCalibration, StrictlyIncreasing, CAM_A,
     CAM_B, CAM_C,
 };
 use crate::msgs::{Header, Imu, RawImage, TransformStamped};
@@ -336,9 +336,11 @@ impl OakdBackend {
         let imu_rate = nearest_imu_rate(self.config.imu_rate);
         let device = Arc::new(Device::open(&self.config, imu_rate)?);
 
-        // Both readings as close together as the host allows: their separation
-        // is the whole error in every header stamp this session produces.
-        let clock = SteadyToEpoch::sample(unsafe { lr_oak_steady_now_nanos() }, crate::record::now_nanos());
+        // Sampled per frame rather than once for the session. The device's own
+        // stamp is what carries the spacing, but the offset onto the host clock
+        // has to keep following it — a Pi's clock is corrected by NTP some way
+        // into a run, and an offset taken before that leaves every later stamp
+        // behind. See `crate::clock`.
 
         let transforms = self.read_body_transforms(&device, crate::record::now_nanos());
 
@@ -353,7 +355,7 @@ impl OakdBackend {
             let mut pump = Pump {
                 naming: self.config.naming.clone(),
                 sink: Arc::clone(&sink),
-                clock,
+                clock: crate::clock::HostClock::default(),
                 stamps: StrictlyIncreasing::default(),
                 stream,
                 announced: false,
@@ -452,7 +454,7 @@ impl OakdBackend {
 struct Pump {
     naming: Naming,
     sink: Sink,
-    clock: SteadyToEpoch,
+    clock: crate::clock::HostClock,
     stamps: StrictlyIncreasing,
     stream: StreamId,
     announced: bool,
@@ -487,6 +489,12 @@ impl Pump {
         // The device's own stamp for the sample, offset onto the epoch. Not the
         // moment it arrived here: that would carry this thread's scheduling
         // latency into the recording.
+        let steady_now = unsafe { lr_oak_steady_now_nanos() };
+        let host_now = crate::record::now_nanos();
+        // The device stamp is on the same steady clock this reads, so the
+        // estimate is offered the pair as it stands right now and the sample's
+        // own stamp is what gets mapped.
+        self.clock.map(steady_now, host_now);
         let stamp_nanos = self
             .stamps
             .next(self.clock.epoch_for(sample.device_stamp_nanos));

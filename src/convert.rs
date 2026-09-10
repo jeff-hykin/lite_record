@@ -15,7 +15,7 @@
 //! which has no ROS name — blanks any image panel its topic is attached to, so
 //! it is refitted as genuine forward `plumb_bob` by [`crate::distortion`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::BufWriter;
 use std::os::unix::fs::{FileExt, MetadataExt};
@@ -63,6 +63,8 @@ pub struct Report {
     /// `/tf_static` messages whose edges were written by an older recorder in
     /// the SDK's point-map direction and have been inverted into tf poses.
     pub inverted_transforms: u64,
+    /// Messages whose header stamp was moved onto the file's clock.
+    pub restamped: u64,
     /// Messages copied through untouched.
     pub copied: u64,
     /// Frames whose decode failed. They are dropped, not written broken.
@@ -162,7 +164,12 @@ fn depth_encoding(encoding: &str) -> &str {
 /// which replaces the original only when every single frame decoded — the
 /// decode is exact, so the swap loses nothing, but a recording with even one
 /// undecodable frame is left untouched rather than silently thinned.
-pub fn in_place(input: &Path, progress: &Arc<Progress>, reclaim: Reclaim) -> Result<Report> {
+pub fn in_place(
+    input: &Path,
+    progress: &Arc<Progress>,
+    reclaim: Reclaim,
+    shifts: &BTreeMap<u16, i64>,
+) -> Result<Report> {
     let mut name = input.file_name().unwrap_or_default().to_os_string();
     name.push(".converting");
     let temp = input.with_file_name(name);
@@ -175,10 +182,10 @@ pub fn in_place(input: &Path, progress: &Arc<Progress>, reclaim: Reclaim) -> Res
             let _ = std::fs::remove_file(temp);
         }
     };
-    if !needs_conversion(input)? {
+    if shifts.is_empty() && !needs_conversion(input)? {
         return Err(NothingToConvert.into());
     }
-    let report = match to_viewable(input, &temp, progress, reclaim) {
+    let report = match to_viewable(input, &temp, progress, reclaim, shifts) {
         Ok(report) => report,
         Err(error) => {
             discard(&temp);
@@ -193,7 +200,7 @@ pub fn in_place(input: &Path, progress: &Arc<Progress>, reclaim: Reclaim) -> Res
             input.display()
         );
     }
-    if report.decoded == 0 && report.refitted == 0 {
+    if report.decoded == 0 && report.refitted == 0 && report.restamped == 0 {
         // Nothing changed, so swapping in the rewrite would only churn the
         // file's compression. This is also what a second run hits. A
         // backwards `/tf_static` alone does not justify a rewrite either:
@@ -275,11 +282,14 @@ struct Rewriter {
     /// stream carries tens of thousands of copies of it, none of which should
     /// pay for the fit again. `None` remembers a fit that was rejected.
     fits: HashMap<u16, (Vec<f64>, Option<[f64; 5]>)>,
+    /// Per source channel, the nanoseconds to add to every header stamp so the
+    /// stream lands on the clock the file was logged on. See `crate::restamp`.
+    shifts: BTreeMap<u16, i64>,
     report: Report,
 }
 
 impl Rewriter {
-    fn new(output: &Path) -> Result<Self> {
+    fn new(output: &Path, shifts: &BTreeMap<u16, i64>) -> Result<Self> {
         let destination = File::create(output)
             .with_context(|| format!("could not create {}", output.display()))?;
         let writer = mcap::WriteOptions::new()
@@ -291,6 +301,7 @@ impl Rewriter {
             writer,
             channels: HashMap::new(),
             fits: HashMap::new(),
+            shifts: shifts.clone(),
             report: Report::default(),
         })
     }
@@ -453,6 +464,16 @@ impl Rewriter {
         let payload = rewritten
             .as_ref()
             .map_or(message.data.as_ref(), |encoded| encoded.data.as_slice());
+        // The stamp is moved last, so it applies whether the payload was
+        // re-encoded on the way through or copied untouched.
+        let shifted = self.shifts.get(&channel.id).map(|offset| {
+            let mut moved = payload.to_vec();
+            if crate::restamp::shift_header(&mut moved, *offset) {
+                self.report.restamped += 1;
+            }
+            moved
+        });
+        let payload = shifted.as_deref().unwrap_or(payload);
         self.writer.write_to_known_channel(
             &mcap::records::MessageHeader {
                 channel_id,
@@ -485,6 +506,7 @@ pub fn to_viewable(
     output: &Path,
     progress: &Arc<Progress>,
     reclaim: Reclaim,
+    shifts: &BTreeMap<u16, i64>,
 ) -> Result<Report> {
     // Write access only when we intend to punch: a plain conversion should not
     // be able to touch the source even by accident.
@@ -504,19 +526,24 @@ pub fn to_viewable(
     // reading it straight through.
     let summary = mcap::Summary::read(&mapped).ok().flatten();
     match summary.filter(|summary| !summary.chunk_indexes.is_empty()) {
-        Some(summary) => by_chunk(&mapped, &source, &summary, output, progress, reclaim),
+        Some(summary) => by_chunk(&mapped, &source, &summary, output, progress, reclaim, shifts),
         None if reclaim == Reclaim::AsItGoes => anyhow::bail!(
             "{} has no chunk index, so it cannot be converted a chunk at a time — \
              run it through mcap_recover first",
             input.display()
         ),
-        None => whole_file(&mapped, output, progress),
+        None => whole_file(&mapped, output, progress, shifts),
     }
 }
 
 /// The straight-through walk, for a file whose index is missing.
-fn whole_file(mapped: &[u8], output: &Path, progress: &Arc<Progress>) -> Result<Report> {
-    let mut rewriter = Rewriter::new(output)?;
+fn whole_file(
+    mapped: &[u8],
+    output: &Path,
+    progress: &Arc<Progress>,
+    shifts: &BTreeMap<u16, i64>,
+) -> Result<Report> {
+    let mut rewriter = Rewriter::new(output, shifts)?;
     for message in mcap::MessageStream::new(mapped)? {
         rewriter.write(&message?)?;
         progress.messages.store(rewriter.written(), Ordering::Relaxed);
@@ -559,6 +586,7 @@ fn by_chunk(
     output: &Path,
     progress: &Arc<Progress>,
     reclaim: Reclaim,
+    shifts: &BTreeMap<u16, i64>,
 ) -> Result<Report> {
     if !summary.attachment_indexes.is_empty() || !summary.metadata_indexes.is_empty() {
         anyhow::bail!(
@@ -573,7 +601,7 @@ fn by_chunk(
     chunks.sort_by_key(|chunk| chunk.chunk_start_offset);
 
     let block = source.metadata().map(|data| data.blksize()).unwrap_or(4096);
-    let mut rewriter = Rewriter::new(output)?;
+    let mut rewriter = Rewriter::new(output, shifts)?;
     // The header and the leading magic go out now, so that every range measured
     // from here on starts on a record boundary and can be parsed on its own.
     rewriter.writer.flush()?;

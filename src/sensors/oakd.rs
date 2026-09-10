@@ -165,40 +165,6 @@ pub fn camera_info(
     )
 }
 
-/// Turns a depthai timestamp into the epoch nanoseconds a ROS header carries.
-///
-/// `dai::Buffer::getTimestamp()` returns a `steady_clock` time point: the
-/// camera's own timestamp for the frame, already translated onto the host's
-/// monotonic clock by depthai's XLink clock synchronisation. It is therefore a
-/// sensor time, not an arrival time, but it is not an epoch and cannot be
-/// written into a header as it stands.
-///
-/// The offset between the two host clocks is sampled once, when streaming
-/// starts, and then held. Re-sampling it per frame would be more accurate
-/// against wall-clock but would fold the system clock's own corrections — NTP
-/// slew, a step from a settling RTC — into the spacing between consecutive
-/// headers, which is precisely the sensor timing this exists to preserve. A
-/// fixed offset means every interval between headers is the camera's, and only
-/// the absolute placement of the whole run can drift.
-#[derive(Debug, Clone, Copy)]
-pub struct SteadyToEpoch {
-    offset_nanos: i128,
-}
-
-impl SteadyToEpoch {
-    /// Both readings must be taken as close together as the host allows: their
-    /// separation is the whole error in the result.
-    pub fn sample(steady_nanos: u64, epoch_nanos: u64) -> Self {
-        SteadyToEpoch {
-            offset_nanos: epoch_nanos as i128 - steady_nanos as i128,
-        }
-    }
-
-    pub fn epoch_for(&self, steady_nanos: u64) -> u64 {
-        (steady_nanos as i128 + self.offset_nanos).max(0) as u64
-    }
-}
-
 /// Holds one stream's header stamps strictly increasing.
 ///
 /// A fixed offset preserves whatever order the device produced, so this is not
@@ -474,28 +440,6 @@ mod tests {
         // 3.75 cm, which is 37.5 mm and not 3.75 m — and on the far side, since
         // the SDK's point map runs the other way from a tf pose.
         assert!((color.translation[0] + 0.0375).abs() < 1e-12, "{:?}", color.translation);
-    }
-
-    #[test]
-    fn a_device_stamp_keeps_its_own_spacing_after_being_offset_onto_the_epoch() {
-        // The host booted 12 s ago; the wall clock says 2024-ish.
-        let clock = SteadyToEpoch::sample(12_000_000_000, 1_700_000_000_000_000_000);
-        let first = clock.epoch_for(12_100_000_000);
-        let second = clock.epoch_for(12_133_333_333);
-        assert_eq!(first, 1_700_000_000_100_000_000);
-        // 33.333333 ms apart on the device is 33.333333 ms apart in the header.
-        assert_eq!(second - first, 33_333_333);
-    }
-
-    #[test]
-    fn the_offset_survives_a_steady_clock_larger_than_the_wall_clock() {
-        // Nothing says the monotonic clock starts at zero; on some hosts it is
-        // an uptime counter that has already passed the epoch value in tests.
-        let clock = SteadyToEpoch::sample(2_000_000_000_000_000_000, 1_700_000_000_000_000_000);
-        assert_eq!(
-            clock.epoch_for(2_000_000_001_000_000_000),
-            1_700_000_001_000_000_000
-        );
     }
 
     #[test]

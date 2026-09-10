@@ -620,8 +620,20 @@ async fn convert_recording(
         false => convert::Reclaim::No,
     };
     tokio::task::spawn_blocking(move || {
-        let outcome =
-            convert::in_place(&source, &running, reclaim).map_err(|error| error.to_string());
+        // The button repairs a split clock as well as decoding jxl: a recording
+        // whose streams disagree cannot be drawn at all, and the operator
+        // pressing this has no other way to fix it. See `crate::restamp`.
+        let shifts = crate::restamp::survey_path(&source)
+            .map(|clocks| {
+                clocks
+                    .iter()
+                    .filter(|(_, clock)| clock.needs_shift())
+                    .map(|(id, clock)| (*id, clock.offset_nanos))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let outcome = convert::in_place(&source, &running, reclaim, &shifts)
+            .map_err(|error| error.to_string());
         if let Some(job) = slot.lock().unwrap().as_mut() {
             job.outcome = Some(outcome);
         }
