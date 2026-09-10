@@ -53,11 +53,11 @@ pub struct Options {
     pub extent: Option<String>,
 
     /// Drop points below this world z, in metres.
-    #[arg(long)]
+    #[arg(long, allow_negative_numbers = true)]
     pub min_height: Option<f64>,
 
     /// Drop points above this world z, in metres.
-    #[arg(long)]
+    #[arg(long, allow_negative_numbers = true)]
     pub max_height: Option<f64>,
 
     /// Use every Nth lidar scan.

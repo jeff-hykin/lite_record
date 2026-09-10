@@ -175,6 +175,9 @@ pub fn in_place(input: &Path, progress: &Arc<Progress>, reclaim: Reclaim) -> Res
             let _ = std::fs::remove_file(temp);
         }
     };
+    if !needs_conversion(input)? {
+        return Err(NothingToConvert.into());
+    }
     let report = match to_viewable(input, &temp, progress, reclaim) {
         Ok(report) => report,
         Err(error) => {
@@ -201,6 +204,61 @@ pub fn in_place(input: &Path, progress: &Arc<Progress>, reclaim: Reclaim) -> Res
     std::fs::rename(&temp, input)
         .with_context(|| format!("could not replace {}", input.display()))?;
     Ok(report)
+}
+
+/// Whether a rewrite would change anything: a jxl frame on any CompressedImage
+/// channel, or an "unknown"-model calibration on any CameraInfo channel. Read
+/// from the first message of each such channel rather than by walking the
+/// file, so a second run — or a run that only wants the appended stages —
+/// answers in a moment instead of rewriting 63 GB to find out nothing changed.
+/// A file with no index is assumed to need it; the walk will find out.
+pub fn needs_conversion(input: &Path) -> Result<bool> {
+    let source = File::open(input).with_context(|| format!("could not open {}", input.display()))?;
+    let mapped = unsafe { memmap2::Mmap::map(&source) }
+        .with_context(|| format!("could not map {}", input.display()))?;
+    let Some(summary) = mcap::Summary::read(&mapped).ok().flatten() else {
+        return Ok(true);
+    };
+    let mut wanted: std::collections::BTreeSet<u16> = summary
+        .channels
+        .values()
+        .filter(|channel| {
+            channel.schema.as_ref().is_some_and(|schema| {
+                schema.name == crate::msgs::COMPRESSED_IMAGE_TYPE
+                    || schema.name == crate::msgs::CAMERA_INFO_TYPE
+            })
+        })
+        .map(|channel| channel.id)
+        .collect();
+    let mut chunks = summary.chunk_indexes.clone();
+    chunks.sort_by_key(|chunk| chunk.chunk_start_offset);
+    for chunk in &chunks {
+        if !chunk.message_index_offsets.keys().any(|id| wanted.contains(id)) {
+            continue;
+        }
+        for message in summary.stream_chunk(&mapped, chunk)? {
+            let message = message?;
+            if !wanted.remove(&message.channel.id) {
+                continue;
+            }
+            let schema_name = message.channel.schema.as_ref().map(|schema| schema.name.as_str());
+            if schema_name == Some(crate::msgs::COMPRESSED_IMAGE_TYPE) {
+                let mut reader = CdrReader::new(&message.data);
+                let _ = reader.try_header();
+                if reader.try_string().is_some_and(|format| is_jxl(&format)) {
+                    return Ok(true);
+                }
+            } else if crate::distortion::parse_camera_info(&message.data).distortion_model
+                == crate::msgs::DistortionModel::Unknown.as_str()
+            {
+                return Ok(true);
+            }
+        }
+        if wanted.is_empty() {
+            break;
+        }
+    }
+    Ok(false)
 }
 
 /// The output file and the bookkeeping that maps each source channel onto its

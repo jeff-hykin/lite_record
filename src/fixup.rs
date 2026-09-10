@@ -50,9 +50,15 @@ pub struct Recording {
 }
 
 impl Recording {
-    /// Every frame that data is stamped in, once each.
+    /// Every frame that data is stamped in, once each. The moving frames are
+    /// left out: odometry stamped in `odom` is placed by its own edge, not by
+    /// the static tree.
     pub fn data_frames(&self) -> Vec<String> {
-        let unique: BTreeSet<&String> = self.frame_of_topic.values().collect();
+        let unique: BTreeSet<&String> = self
+            .frame_of_topic
+            .values()
+            .filter(|frame| !MOVING_PARENTS.contains(&frame.as_str()))
+            .collect();
         unique.into_iter().cloned().collect()
     }
 }
