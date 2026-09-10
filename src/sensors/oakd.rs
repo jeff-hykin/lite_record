@@ -261,12 +261,15 @@ pub fn body_transforms(
     root.header = Header::new(stamp_nanos, naming.root_frame_id());
     let mut transforms = vec![root];
     for extrinsic in extrinsics {
-        transforms.push(crate::msgs::TransformStamped {
-            header: Header::new(stamp_nanos, parent.clone()),
-            child_frame_id: naming.frame_id(extrinsic.child),
-            translation: extrinsic.translation_centimetres.map(metres_from_centimetres),
-            rotation: crate::msgs::quaternion_from_matrix(extrinsic.rotation),
-        });
+        // depthai's `getCameraExtrinsics(from, to)` is the point map from one
+        // imager to the other, the same direction librealsense uses, so the tf
+        // pose of the child is its inverse. See the RealSense `BodyExtrinsic`.
+        let pose = crate::tf::Pose::from_matrix(
+            extrinsic.rotation,
+            extrinsic.translation_centimetres.map(metres_from_centimetres),
+        )
+        .inverse();
+        transforms.push(pose.stamped(stamp_nanos, &parent, &naming.frame_id(extrinsic.child)));
     }
     transforms
 }
@@ -468,8 +471,9 @@ mod tests {
         let color = &transforms[1];
         assert_eq!(color.header.frame_id, "oakd_infra1_optical_frame");
         assert_eq!(color.child_frame_id, "oakd_color_optical_frame");
-        // 3.75 cm, which is 37.5 mm and not 3.75 m.
-        assert!((color.translation[0] - 0.0375).abs() < 1e-12);
+        // 3.75 cm, which is 37.5 mm and not 3.75 m — and on the far side, since
+        // the SDK's point map runs the other way from a tf pose.
+        assert!((color.translation[0] + 0.0375).abs() < 1e-12, "{:?}", color.translation);
     }
 
     #[test]

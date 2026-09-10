@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -20,6 +20,7 @@ use mcap::{WriteOptions, Writer};
 use serde::{Deserialize, Serialize};
 
 use crate::cdr::Encoded;
+use crate::msgs::TransformStamped;
 
 /// Deep enough to ride out a disk hiccup, shallow enough that a genuinely
 /// overloaded machine sheds frames instead of growing an unbounded backlog and
@@ -51,6 +52,31 @@ pub struct Sample {
     pub topic: String,
     pub encoded: Encoded,
     pub log_time: u64,
+}
+
+/// Where the rig's static transforms go. Not `/tf_static`: dimos has no
+/// latched topic, so it re-publishes static transforms on the ordinary tf
+/// stream (`StaticTfPublisher`) and a recording is expected to look the same.
+pub const TF_TOPIC: &str = "/tf";
+
+/// How often the static transforms are repeated, mirroring dimos.
+pub const STATIC_TRANSFORM_HZ: f64 = 5.0;
+
+/// Channel metadata stamped on `/tf` saying which way its edges point. A file
+/// without it was written before the camera extrinsics were inverted into tf
+/// semantics, and post-processing flips them; see `sensors::realsense::BodyExtrinsic`.
+pub const TRANSFORM_CONVENTION_KEY: &str = "lite_record.transform_convention";
+pub const TRANSFORM_CONVENTION_VALUE: &str = "child_pose_in_parent";
+
+pub fn channel_metadata(topic: &str) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::new();
+    if topic == TF_TOPIC {
+        metadata.insert(
+            TRANSFORM_CONVENTION_KEY.to_string(),
+            TRANSFORM_CONVENTION_VALUE.to_string(),
+        );
+    }
+    metadata
 }
 
 /// Chunk compression for the mcap file. Zstd at level 1 is the default: on real
@@ -138,6 +164,11 @@ pub struct Recorder {
     tallies: Arc<Mutex<BTreeMap<String, TopicTally>>>,
     sender: Option<SyncSender<Sample>>,
     worker: Option<JoinHandle<Result<()>>>,
+    /// Raised at finish so the repeater threads stop offering; they hold their
+    /// own sender clone, and the writer only sees the channel close once every
+    /// clone is gone.
+    stopping: Arc<AtomicBool>,
+    repeaters: Vec<JoinHandle<()>>,
 }
 
 impl Recorder {
@@ -172,7 +203,64 @@ impl Recorder {
             tallies,
             sender: Some(sender),
             worker: Some(worker),
+            stopping: Arc::new(AtomicBool::new(false)),
+            repeaters: Vec::new(),
         })
+    }
+
+    /// Writes `transforms` to `/tf` now and again every `1 / STATIC_TRANSFORM_HZ`
+    /// seconds, re-stamped each time, until the recording finishes. The first
+    /// copy is written on the caller's thread so it lands before anything the
+    /// caller offers next.
+    pub fn repeat_transforms(&mut self, transforms: Vec<TransformStamped>) {
+        if transforms.is_empty() {
+            return;
+        }
+        self.offer(TF_TOPIC, crate::cdr::tf_message(&transforms));
+        let Some(sender) = self.sender.clone() else {
+            return;
+        };
+        let stopping = Arc::clone(&self.stopping);
+        let counters = Arc::clone(&self.counters);
+        let tallies = Arc::clone(&self.tallies);
+        let period = Duration::from_secs_f64(1.0 / STATIC_TRANSFORM_HZ);
+        let handle = std::thread::Builder::new()
+            .name("static-tf".into())
+            .spawn(move || {
+                let mut transforms = transforms;
+                while !stopping.load(Ordering::Relaxed) {
+                    std::thread::sleep(period);
+                    if stopping.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let now = now_nanos();
+                    for transform in &mut transforms {
+                        transform.header = crate::msgs::Header::new(now, transform.header.frame_id.clone());
+                    }
+                    let sample = Sample {
+                        topic: TF_TOPIC.to_string(),
+                        encoded: crate::cdr::tf_message(&transforms),
+                        log_time: now,
+                    };
+                    match sender.try_send(sample) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            counters.dropped.fetch_add(1, Ordering::Relaxed);
+                            tallies.lock().unwrap().entry(TF_TOPIC.to_string()).or_default().dropped += 1;
+                        }
+                        Err(TrySendError::Disconnected(_)) => break,
+                    }
+                }
+            })
+            .expect("failed to spawn static-tf thread");
+        self.repeaters.push(handle);
+    }
+
+    fn stop_repeaters(&mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        for handle in self.repeaters.drain(..) {
+            let _ = handle.join();
+        }
     }
 
     /// Never blocks. Returns false when the message was shed.
@@ -224,6 +312,7 @@ impl Recorder {
     /// Flushes the queue and closes the file. The tally is read after the join,
     /// since the queued tail is still being written until then.
     pub fn finish(mut self) -> Result<RecordingStatus> {
+        self.stop_repeaters();
         drop(self.sender.take());
         if let Some(worker) = self.worker.take() {
             worker
@@ -239,6 +328,7 @@ impl Recorder {
 
 impl Drop for Recorder {
     fn drop(&mut self) {
+        self.stop_repeaters();
         drop(self.sender.take());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -297,11 +387,12 @@ fn drain(
                             id
                         }
                     };
+                    let topic = channel_topic(&sample);
                     let id = writer.add_channel(
                         schema_id,
-                        &channel_topic(&sample),
+                        &topic,
                         "cdr",
-                        &BTreeMap::new(),
+                        &channel_metadata(&topic),
                     )?;
                     channels.insert(key.clone(), (id, 0));
                     id

@@ -49,6 +49,7 @@
                             ./tests
                             ./web
                             ./examples
+                            ./vendor
                         ];
                     };
 

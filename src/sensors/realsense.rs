@@ -134,6 +134,12 @@ pub fn rs2_stream_for(stream: StreamId) -> Option<(i32, i32)> {
 /// come from the unit's own factory calibration. Publishing them means a
 /// recording is self-contained: colour pixels can be placed against depth
 /// without the calibration file.
+///
+/// Held exactly as the SDK reports it: `rs2_get_extrinsics(depth, child)` is the
+/// map that takes a point *in the depth frame* to the child's frame. A tf edge
+/// is the opposite relation — the child's pose in the parent — so
+/// [`body_transforms`] inverts each one. Written raw, the D455's right imager
+/// landed 95 mm on the wrong side and stereo VO ran off at metres per second.
 pub struct BodyExtrinsic {
     pub child: StreamId,
     pub rotation: [f64; 9],
@@ -152,12 +158,8 @@ pub fn body_transforms(
     )];
     transforms[0].header = Header::new(stamp_nanos, naming.root_frame_id());
     for extrinsic in extrinsics {
-        transforms.push(crate::msgs::TransformStamped {
-            header: Header::new(stamp_nanos, parent.clone()),
-            child_frame_id: naming.frame_id(extrinsic.child),
-            translation: extrinsic.translation,
-            rotation: crate::msgs::quaternion_from_matrix(extrinsic.rotation),
-        });
+        let pose = crate::tf::Pose::from_matrix(extrinsic.rotation, extrinsic.translation).inverse();
+        transforms.push(pose.stamped(stamp_nanos, &parent, &naming.frame_id(extrinsic.child)));
     }
     transforms
 }
@@ -342,7 +344,11 @@ mod tests {
         assert_eq!(rs2_stream_for(StreamId::Imu), None);
     }
 
-    /// The real depth-to-colour extrinsic from the D435IF on Alfred.
+    /// The real depth-to-infra2 extrinsic from the D455 in the grocery-store
+    /// recording. librealsense reports the map from left-imager points to
+    /// right-imager points, whose translation is -95 mm; the right imager's tf
+    /// pose is +95 mm, because it physically sits along +x of the left one
+    /// (the D455's 95 mm baseline).
     #[test]
     fn factory_extrinsics_become_tf_edges_under_the_camera_root() {
         let naming = Naming::for_kind(super::super::SensorKind::Realsense);
@@ -350,15 +356,9 @@ mod tests {
             &naming,
             5,
             &[BodyExtrinsic {
-                child: StreamId::Color,
-                rotation: [
-                    0.9999404, -0.0089, 0.0063, 0.0089, 0.9999, -0.0021, -0.0063, 0.0022, 0.99998,
-                ],
-                translation: [
-                    0.0146514037624002,
-                    -0.000171391482581384,
-                    0.000417986128013581,
-                ],
+                child: StreamId::InfraRight,
+                rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                translation: [-0.09486, 0.0, 0.0],
             }],
         );
         assert_eq!(transforms.len(), 2);
@@ -366,11 +366,43 @@ mod tests {
         assert_eq!(transforms[0].header.frame_id, "camera_link");
         assert_eq!(transforms[0].child_frame_id, "camera_depth_optical_frame");
 
-        let color = &transforms[1];
-        assert_eq!(color.header.frame_id, "camera_depth_optical_frame");
-        assert_eq!(color.child_frame_id, "camera_color_optical_frame");
-        // ~14.65 mm to the right, which is the physical spacing on a D435.
-        assert!((color.translation[0] - 0.0146514037624002).abs() < 1e-12);
+        let right = &transforms[1];
+        assert_eq!(right.header.frame_id, "camera_depth_optical_frame");
+        assert_eq!(right.child_frame_id, "camera_infra2_optical_frame");
+        assert!((right.translation[0] - 0.09486).abs() < 1e-12, "{:?}", right.translation);
+        assert_eq!(right.rotation, [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    /// With a rotation in play the inverse is `R^T` and `-R^T t`, not just a
+    /// sign flip: the D435IF's depth-to-colour extrinsic from Alfred.
+    #[test]
+    fn a_rotated_extrinsic_is_inverted_not_merely_negated() {
+        let naming = Naming::for_kind(super::super::SensorKind::Realsense);
+        let rotation = [
+            0.9999404, -0.0089, 0.0063, 0.0089, 0.9999, -0.0021, -0.0063, 0.0022, 0.99998,
+        ];
+        let translation = [0.0146514037624002, -0.000171391482581384, 0.000417986128013581];
+        let transforms = body_transforms(
+            &naming,
+            5,
+            &[BodyExtrinsic {
+                child: StreamId::Color,
+                rotation,
+                translation,
+            }],
+        );
+        let color = crate::tf::Pose::from_transform(&transforms[1]);
+        // Mapping a point through the SDK extrinsic and then through the tf
+        // pose must land back where it started.
+        let sdk = crate::tf::Pose::from_matrix(rotation, translation);
+        let round_trip = color.apply(sdk.apply([0.5, -0.2, 2.0]));
+        assert!(
+            round_trip
+                .iter()
+                .zip([0.5, -0.2, 2.0])
+                .all(|(got, want)| (got - want).abs() < 1e-9),
+            "{round_trip:?}"
+        );
         let norm: f64 = color.rotation.iter().map(|v| v * v).sum();
         assert!((norm - 1.0).abs() < 1e-6);
     }

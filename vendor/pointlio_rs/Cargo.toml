@@ -1,0 +1,22 @@
+[package]
+name = "pointlio_rs"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust translation of Point-LIO (point-wise iterated-EKF LiDAR-inertial odometry), no ROS."
+license = "BSD-2-Clause"
+
+[lib]
+name = "pointlio_rs"
+path = "src/lib.rs"
+
+[dependencies]
+nalgebra = "0.33"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+rayon = "1"
+log = "0.4"
+mcap = { version = "0.25", default-features = false, features = ["lz4", "zstd"] }
+memmap2 = "0.9"
+
+[dev-dependencies]
+approx = "0.5"

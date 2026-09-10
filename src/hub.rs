@@ -875,13 +875,12 @@ impl Hub {
             Some(name) => record::resolve(&settings.record_dir, name)?,
             None => settings.record_dir.join(record::default_name()),
         };
-        let recorder = Recorder::start(&file_name, settings.compression)?;
+        let mut recorder = Recorder::start(&file_name, settings.compression)?;
 
-        // tf_static goes in first so a reader that stops early still has the
-        // frames it needs to place everything else.
-        if !transforms.is_empty() {
-            recorder.offer("/tf_static", crate::cdr::tf_message(&transforms));
-        }
+        // The transforms go in first so a reader that stops early still has the
+        // frames it needs to place everything else, and keep going at 5 Hz so a
+        // consumer joining mid-file (or dimos, which has no latched tf) sees them.
+        recorder.repeat_transforms(transforms);
         for (topic, info) in &intrinsics {
             recorder.offer(topic, crate::cdr::camera_info(info));
         }
@@ -1623,7 +1622,7 @@ mod tests {
     }
 
     #[test]
-    fn a_recording_opens_with_tf_static_before_any_sensor_data() {
+    fn a_recording_opens_with_tf_before_any_sensor_data_and_repeats_it() {
         let hub = scratch_hub();
         let directory =
             std::env::temp_dir().join(format!("lite_record_tf_{}", record::now_nanos()));
@@ -1644,20 +1643,34 @@ mod tests {
         hub.update_settings(settings).unwrap();
 
         hub.start_recording(Some("tf.mcap")).unwrap();
+        std::thread::sleep(Duration::from_millis(650));
         let status = hub.stop_recording().unwrap();
-        assert!(status.messages >= 1);
+        assert!(status.messages >= 3, "{}", status.messages);
 
         let bytes = std::fs::read(directory.join("tf.mcap")).unwrap();
-        let first = mcap::MessageStream::new(&bytes)
+        let messages: Vec<_> = mcap::MessageStream::new(&bytes)
             .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
-        assert_eq!(first.channel.topic, "/tf_static");
+            .map(|message| message.unwrap())
+            .collect();
+        let first = &messages[0];
+        assert_eq!(first.channel.topic, record::TF_TOPIC);
         assert_eq!(
             first.channel.schema.as_ref().unwrap().name,
             "tf2_msgs/msg/TFMessage"
         );
+        assert_eq!(
+            first.channel.metadata.get(record::TRANSFORM_CONVENTION_KEY).map(String::as_str),
+            Some(record::TRANSFORM_CONVENTION_VALUE)
+        );
+        // Repeated at 5 Hz with fresh stamps, the way dimos publishes them.
+        let tf_stamps: Vec<u64> = messages
+            .iter()
+            .filter(|message| message.channel.topic == record::TF_TOPIC)
+            .map(|message| message.log_time)
+            .collect();
+        assert!(tf_stamps.len() >= 3, "{tf_stamps:?}");
+        assert!(tf_stamps.windows(2).all(|pair| pair[1] > pair[0]), "{tf_stamps:?}");
+        assert!(!messages.iter().any(|message| message.channel.topic == "/tf_static"));
         std::fs::remove_dir_all(&directory).ok();
         std::fs::remove_file(hub.settings_file()).ok();
     }

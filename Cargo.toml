@@ -40,6 +40,8 @@ mcap = { version = "0.25.0", default-features = false, features = ["lz4", "zstd"
 # Pi's memory. Mapping lets the kernel page it in and drop it again.
 memmap2 = "0.9"
 png = "0.18.1"
+# Point-LIO, run over a recording after the fact. See vendor/pointlio_rs/README.md.
+pointlio_rs = { path = "vendor/pointlio_rs" }
 quick-xml = "0.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -58,6 +60,8 @@ tokio = { version = "1", features = [
 # Only for `ReaderStream`, which is what lets a recording be sent without the
 # Pi holding a gigabyte of it in memory first.
 tokio-util = { version = "0.7", default-features = false, features = ["io"] }
+# Appending to a finished recording writes its own chunk records.
+zstd = "0.13"
 zune-core = "0.5.3"
 zune-jpeg = "0.5"
 
