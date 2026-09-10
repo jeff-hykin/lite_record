@@ -114,6 +114,13 @@ struct PostProcessArgs {
     /// spacing. A split clock is reported either way; this repairs it.
     #[arg(long)]
     fix_clocks: bool,
+
+    /// Rewrite a `/tf_static` an older recorder wrote in the SDK's direction.
+    /// The appended `/tf` already supersedes it for anything that keeps a
+    /// history per frame, so this is only worth the rewrite for a consumer
+    /// that reads `/tf_static` on its own.
+    #[arg(long)]
+    fix_static_tf: bool,
 }
 
 impl Args {
@@ -189,6 +196,7 @@ fn load_urdf(path: Option<&Path>) -> Result<Option<lite_record::urdf::Urdf>> {
 fn post_process(args: &PostProcessArgs) -> Result<()> {
     let PostProcessArgs {
         recording, reclaim, no_odom, urdf, lidar_topic, imu_topic, dry_run, trajectory, fix_clocks,
+        fix_static_tf,
     } = args;
     let (recording, reclaim, no_odom, dry_run) = (recording.as_path(), *reclaim, *no_odom, *dry_run);
     // Surveyed before anything is written, so the report describes the file as
@@ -221,13 +229,14 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
                 watched.bytes.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
             )
         },
-        || match (dry_run, convert::needs_conversion(recording)) {
+        || match (dry_run, convert::needs_conversion(recording).map(|needed| needed || *fix_static_tf)) {
             (true, Ok(true)) => {
                 println!("{}: would convert jxl / refit camera infos (dry run)", recording.display());
                 Err(convert::NothingToConvert.into())
             }
             (true, Ok(false)) => Err(convert::NothingToConvert.into()),
             (true, Err(error)) => Err(error),
+            (false, Ok(false)) if shifts.is_empty() => Err(convert::NothingToConvert.into()),
             (false, _) => convert::in_place(recording, &progress, reclaim, &shifts),
         },
     );

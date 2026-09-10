@@ -806,6 +806,10 @@ impl Hub {
             .and_then(|xml| urdf::parse(xml).ok())
             .map(|parsed| parsed.static_transforms(stamp_nanos))
             .unwrap_or_default();
+        let placed_by_urdf: std::collections::BTreeSet<String> = transforms
+            .iter()
+            .map(|transform| transform.child_frame_id.clone())
+            .collect();
 
         let backends = self.backends.lock().unwrap();
         // A sensor counts if it is configured on *or* currently engaged. `--engage`
@@ -841,8 +845,18 @@ impl Hub {
                 continue;
             }
             for stream in streams {
-                let mut edge =
-                    TransformStamped::identity(&naming.root_frame_id(), &naming.frame_id(stream));
+                // Only where nothing better is known. The identity is a
+                // placeholder for a sensor that reports no extrinsics of its
+                // own, and a URDF that places the frame is the operator saying
+                // where it actually is — publishing both would put the same
+                // child under two parents in one message. A Mid-360's point
+                // origin sits 47 mm above the seat it bolts to, so the
+                // placeholder is wrong by that much until a URDF says so.
+                let child = naming.frame_id(stream);
+                if placed_by_urdf.contains(&child) {
+                    continue;
+                }
+                let mut edge = TransformStamped::identity(&naming.root_frame_id(), &child);
                 edge.header = crate::msgs::Header::new(stamp_nanos, naming.root_frame_id());
                 transforms.push(edge);
             }
@@ -1829,6 +1843,43 @@ mod tests {
     /// `--engage` opens a device without writing the settings file, so a sensor
     /// can be streaming while its `enabled` flag is still false. Gating on that
     /// flag shipped recordings from a live camera with no `/tf_static` at all.
+    /// A URDF that states where a sensor's own frame really is must not be
+    /// shadowed by the identity placeholder. The Mid-360's point origin is
+    /// 47 mm above the seat it bolts to, and publishing both would give
+    /// livox_frame two parents in a single message.
+    #[test]
+    fn a_frame_the_urdf_places_does_not_also_get_an_identity_placeholder() {
+        let hub = scratch_hub();
+        let mut settings = hub.settings();
+        settings.livox.enabled = true;
+        settings.urdf_xml = Some(
+            r#"<robot name="rig">
+                <link name="base_link"/><link name="livox_link"/><link name="livox_frame"/>
+                <joint name="mount" type="fixed"><parent link="base_link"/><child link="livox_link"/></joint>
+                <joint name="origin" type="fixed">
+                    <parent link="livox_link"/><child link="livox_frame"/>
+                    <origin xyz="0 0 0.047"/>
+                </joint>
+            </robot>"#
+                .into(),
+        );
+        hub.update_settings(settings).unwrap();
+
+        let transforms = hub.static_transforms(1);
+        let placements: Vec<&TransformStamped> = transforms
+            .iter()
+            .filter(|transform| transform.child_frame_id == "livox_frame")
+            .collect();
+        assert_eq!(placements.len(), 1, "livox_frame was published twice: {placements:?}");
+        assert_eq!(placements[0].translation[2], 0.047, "the placeholder won");
+        // A frame the urdf says nothing about still gets its placeholder.
+        assert!(
+            transforms.iter().any(|transform| transform.child_frame_id == "livox_imu_frame"),
+            "an unplaced frame lost its fallback"
+        );
+        std::fs::remove_file(hub.settings_file()).ok();
+    }
+
     #[test]
     fn an_engaged_sensor_gets_transforms_even_with_its_setting_off() {
         let hub = scratch_hub();

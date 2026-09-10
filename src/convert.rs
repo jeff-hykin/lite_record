@@ -182,7 +182,7 @@ pub fn in_place(
             let _ = std::fs::remove_file(temp);
         }
     };
-    if shifts.is_empty() && !needs_conversion(input)? {
+    if shifts.is_empty() && !needs_conversion(input)? && !has_uninverted_transforms(input)? {
         return Err(NothingToConvert.into());
     }
     let report = match to_viewable(input, &temp, progress, reclaim, shifts) {
@@ -266,6 +266,20 @@ pub fn needs_conversion(input: &Path) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// Whether the recording carries a `/tf_static` an older recorder wrote in the
+/// SDK's direction, which a rewrite is the only way to correct.
+pub fn has_uninverted_transforms(input: &Path) -> Result<bool> {
+    let source = File::open(input)?;
+    let mapped = unsafe { memmap2::Mmap::map(&source)? };
+    let Some(summary) = mcap::Summary::read(&mapped).ok().flatten() else {
+        return Ok(false);
+    };
+    Ok(summary
+        .channels
+        .values()
+        .any(|channel| channel.topic == "/tf_static" && !crate::fixup::is_marked(&channel.metadata)))
 }
 
 /// The output file and the bookkeeping that maps each source channel onto its
