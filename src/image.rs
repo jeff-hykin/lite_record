@@ -519,7 +519,7 @@ pub fn decode_jpegxl(data: &[u8]) -> Result<RawImage> {
     }
 }
 
-fn decode_jpeg(data: &[u8]) -> Result<RawImage> {
+pub fn decode_jpeg(data: &[u8]) -> Result<RawImage> {
     let mut decoder = zune_jpeg::JpegDecoder::new(Cursor::new(data));
     let pixels = decoder
         .decode()
@@ -533,7 +533,7 @@ fn decode_jpeg(data: &[u8]) -> Result<RawImage> {
     Ok(decoded_image(width, height, encoding, pixels))
 }
 
-fn decode_png(data: &[u8]) -> Result<RawImage> {
+pub fn decode_png(data: &[u8]) -> Result<RawImage> {
     let mut decoder = png::Decoder::new(Cursor::new(data));
     // Turns a palette or a sub-byte bit depth into plain 8-bit samples, so the
     // match below only has to cover the layouts the raw path already knows.
@@ -565,6 +565,21 @@ fn decode_png(data: &[u8]) -> Result<RawImage> {
         encoding,
         pixels,
     ))
+}
+
+/// Undoes [`to_webp`]. The decoder always hands back three or four channels, so
+/// a greyscale frame comes out as `rgb8`.
+pub fn decode_webp(data: &[u8]) -> Result<RawImage> {
+    let mut decoder = image_webp::WebPDecoder::new(Cursor::new(data))
+        .map_err(|error| anyhow!("webp decode failed: {error}"))?;
+    let (width, height) = decoder.dimensions();
+    let size = decoder.output_buffer_size().context("webp dimensions overflow a buffer")?;
+    let mut pixels = vec![0u8; size];
+    decoder
+        .read_image(&mut pixels)
+        .map_err(|error| anyhow!("webp decode failed: {error}"))?;
+    let encoding = if decoder.has_alpha() { "rgba8" } else { "rgb8" };
+    Ok(decoded_image(width as usize, height as usize, encoding, pixels))
 }
 
 fn decoded_image(width: usize, height: usize, encoding: &str, data: Vec<u8>) -> RawImage {

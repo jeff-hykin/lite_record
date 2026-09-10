@@ -278,7 +278,7 @@ mod tests {
         let odometry: Vec<Odometry> = messages
             .iter()
             .filter(|message| message.channel.topic == ODOMETRY_TOPIC)
-            .map(|message| crate::cdr::decode_odometry(&message.data).unwrap())
+            .map(|message| crate::cdr::decode_odometry_message(&message.data).unwrap())
             .collect();
         assert_eq!(odometry.len(), 2);
         assert_eq!(odometry[0].header.frame_id, "odom");

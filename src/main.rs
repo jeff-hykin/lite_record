@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use lite_record::hub::{Hub, Settings};
 use lite_record::sensors::SensorKind;
-use lite_record::{convert, service, web};
+use lite_record::{convert, heatmap, service, video, web};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -87,6 +87,14 @@ enum Command {
         #[arg(long)]
         urdf: Option<PathBuf>,
     },
+
+    /// Top-down density render of a point cloud topic with the odometry path
+    /// drawn over it, blue at the start and red at the end.
+    Heatmap(heatmap::Options),
+
+    /// Encode an image topic as an mp4 by piping its frames through ffmpeg.
+    #[command(name = "to_video", alias = "to-video")]
+    ToVideo(video::Options),
 }
 
 impl Args {
@@ -342,6 +350,8 @@ async fn main() -> Result<()> {
         Some(Command::TfFixup { recording, urdf }) => {
             return tf_fixup(&recording, urdf.as_deref());
         }
+        Some(Command::Heatmap(options)) => return heatmap::run(&options),
+        Some(Command::ToVideo(options)) => return video::run(&options),
         None => {}
     }
 

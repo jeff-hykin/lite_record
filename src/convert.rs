@@ -319,7 +319,7 @@ impl Rewriter {
             && channel.topic == "/tf_static"
             && !crate::fixup::is_marked(&channel.metadata)
         {
-            match crate::cdr::decode_tf_message(&message.data) {
+            match crate::cdr::decode_tf_message(&message.data).ok() {
                 Some(transforms) => {
                     let inverted: Vec<_> = transforms
                         .iter()

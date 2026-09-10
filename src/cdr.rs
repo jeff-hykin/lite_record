@@ -661,18 +661,149 @@ mod tests {
     }
 }
 
-pub fn odometry(odometry: &Odometry) -> Encoded {
-    let mut writer = CdrWriter::with_capacity(800);
-    write_header(&mut writer, &odometry.header);
-    writer.string(&odometry.child_frame_id);
-    writer.f64_array(&odometry.position);
-    writer.f64_array(&odometry.orientation);
+// --- readers for the tools that consume a recording -------------------------
+// `crate::heatmap` and `crate::video` read streams that other systems produce
+// (Point-LIO odometry, RTAB-Map tf), so unlike the writers above these have
+// to cope with bytes this program did not make.
+
+/// The pose part of a `nav_msgs/Odometry` or `geometry_msgs/PoseStamped`; the
+/// covariance and twist are skipped because nothing here draws them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pose {
+    pub header: Header,
+    pub position: [f64; 3],
+    pub orientation: [f64; 4],
+}
+
+/// A `sensor_msgs/PointCloud2` whose payload still borrows the message, so a
+/// scan can be skimmed for xyz without copying its bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CloudView<'a> {
+    pub header: Header,
+    pub height: u32,
+    pub width: u32,
+    pub fields: Vec<crate::msgs::PointField>,
+    pub is_bigendian: bool,
+    pub point_step: u32,
+    pub data: &'a [u8],
+}
+
+impl<'a> CdrReader<'a> {
+    /// `new` asserts, which is right for bytes this program wrote and wrong for
+    /// a stream off disk. Byte 1 of the encapsulation header is the endianness.
+    pub fn little_endian(data: &'a [u8]) -> anyhow::Result<Self> {
+        anyhow::ensure!(data.len() >= 4, "message is shorter than a CDR header");
+        anyhow::ensure!(
+            data[1] & 1 == 1,
+            "message is big-endian CDR, which this recorder never writes and these tools do not read"
+        );
+        Ok(CdrReader { data, offset: 4 })
+    }
+
+    pub fn try_u8(&mut self) -> Option<u8> {
+        (self.remaining() >= 1).then(|| self.u8())
+    }
+
+    pub fn try_u32(&mut self) -> Option<u32> {
+        self.align(4);
+        (self.remaining() >= 4).then(|| self.u32())
+    }
+
+    /// A `uint8[]` without the copy `bytes` makes.
+    pub fn try_borrowed_bytes(&mut self) -> Option<&'a [u8]> {
+        let length = self.try_u32()? as usize;
+        let slice = self.data.get(self.offset..self.offset + length)?;
+        self.offset += length;
+        Some(slice)
+    }
+}
+
+fn truncated(what: &str) -> anyhow::Error {
+    anyhow::anyhow!("{what} is truncated")
+}
+
+pub fn decode_point_cloud2(data: &[u8]) -> anyhow::Result<CloudView<'_>> {
+    let mut reader = CdrReader::little_endian(data)?;
+    let short = || truncated("PointCloud2");
+    let header = reader.try_header().ok_or_else(short)?;
+    let height = reader.try_u32().ok_or_else(short)?;
+    let width = reader.try_u32().ok_or_else(short)?;
+    let field_count = reader.try_u32().ok_or_else(short)?;
+    let mut fields = Vec::with_capacity(field_count.min(64) as usize);
+    for _ in 0..field_count {
+        fields.push(crate::msgs::PointField {
+            name: reader.try_string().ok_or_else(short)?,
+            offset: reader.try_u32().ok_or_else(short)?,
+            datatype: reader.try_u8().ok_or_else(short)?,
+            count: reader.try_u32().ok_or_else(short)?,
+        });
+    }
+    let is_bigendian = reader.try_u8().ok_or_else(short)? != 0;
+    let point_step = reader.try_u32().ok_or_else(short)?;
+    reader.try_u32().ok_or_else(short)?; // row_step
+    let data = reader.try_borrowed_bytes().ok_or_else(short)?;
+    Ok(CloudView {
+        header,
+        height,
+        width,
+        fields,
+        is_bigendian,
+        point_step,
+        data,
+    })
+}
+
+pub fn decode_pose_stamped(data: &[u8]) -> anyhow::Result<Pose> {
+    let mut reader = CdrReader::little_endian(data)?;
+    let short = || truncated("PoseStamped");
+    Ok(Pose {
+        header: reader.try_header().ok_or_else(short)?,
+        position: reader.try_f64_array().ok_or_else(short)?,
+        orientation: reader.try_f64_array().ok_or_else(short)?,
+    })
+}
+
+pub fn decode_odometry(data: &[u8]) -> anyhow::Result<Pose> {
+    let mut reader = CdrReader::little_endian(data)?;
+    let short = || truncated("Odometry");
+    let header = reader.try_header().ok_or_else(short)?;
+    reader.try_string().ok_or_else(short)?; // child_frame_id
+    Ok(Pose {
+        header,
+        position: reader.try_f64_array().ok_or_else(short)?,
+        orientation: reader.try_f64_array().ok_or_else(short)?,
+    })
+}
+
+pub fn decode_tf_message(data: &[u8]) -> anyhow::Result<Vec<TransformStamped>> {
+    let mut reader = CdrReader::little_endian(data)?;
+    let short = || truncated("TFMessage");
+    let count = reader.try_u32().ok_or_else(short)?;
+    let mut transforms = Vec::with_capacity(count.min(256) as usize);
+    for _ in 0..count {
+        transforms.push(TransformStamped {
+            header: reader.try_header().ok_or_else(short)?,
+            child_frame_id: reader.try_string().ok_or_else(short)?,
+            translation: reader.try_f64_array().ok_or_else(short)?,
+            rotation: reader.try_f64_array().ok_or_else(short)?,
+        });
+    }
+    Ok(transforms)
+}
+
+/// Writers for the two pose messages, so a test recording can carry the
+/// streams the tools read. The covariances and twist go out as zeros.
+pub fn odometry_pose(pose: &Pose, child_frame_id: &str) -> Encoded {
+    let mut writer = CdrWriter::with_capacity(720);
+    write_header(&mut writer, &pose.header);
+    writer.string(child_frame_id);
+    writer.f64_array(&pose.position);
+    writer.f64_array(&pose.orientation);
     writer.f64_array(&[0.0; 36]);
-    writer.f64_array(&odometry.linear_velocity);
-    writer.f64_array(&odometry.angular_velocity);
+    writer.f64_array(&[0.0; 6]);
     writer.f64_array(&[0.0; 36]);
     Encoded {
-        schema_name: crate::msgs::ODOMETRY_TYPE,
+        schema_name: "nav_msgs/msg/Odometry",
         schema_text: format!(
             "std_msgs/Header header\n\
              string child_frame_id\n\
@@ -699,8 +830,146 @@ pub fn odometry(odometry: &Odometry) -> Encoded {
              MSG: geometry_msgs/Twist\n\
              geometry_msgs/Vector3 linear\n\
              geometry_msgs/Vector3 angular\n\
-             {QUATERNION_MSG}{VECTOR3_MSG}{HEADER_MSG}\n{TIME_MSG}"
+             {VECTOR3_MSG}{QUATERNION_MSG}{HEADER_MSG}\n{TIME_MSG}"
         ),
+        data: writer.finish(),
+    }
+}
+
+pub fn pose_stamped(pose: &Pose) -> Encoded {
+    let mut writer = CdrWriter::with_capacity(96);
+    write_header(&mut writer, &pose.header);
+    writer.f64_array(&pose.position);
+    writer.f64_array(&pose.orientation);
+    Encoded {
+        schema_name: "geometry_msgs/msg/PoseStamped",
+        schema_text: format!(
+            "std_msgs/Header header\n\
+             geometry_msgs/Pose pose\n\n\
+             ================================================================================\n\
+             MSG: geometry_msgs/Pose\n\
+             geometry_msgs/Point position\n\
+             geometry_msgs/Quaternion orientation\n\n\
+             ================================================================================\n\
+             MSG: geometry_msgs/Point\n\
+             float64 x\n\
+             float64 y\n\
+             float64 z\n\
+             {QUATERNION_MSG}{HEADER_MSG}\n{TIME_MSG}"
+        ),
+        data: writer.finish(),
+    }
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+    use crate::msgs::{PointField, POINT_FIELD_FLOAT32};
+
+    fn a_pose() -> Pose {
+        Pose {
+            header: Header::new(9_000_000_500, "odom"),
+            position: [1.5, -2.0, 0.25],
+            orientation: [0.0, 0.0, std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2],
+        }
+    }
+
+    #[test]
+    fn odometry_decodes_the_pose_and_ignores_the_covariance_and_twist() {
+        let encoded = odometry_pose(&a_pose(), "base_link");
+        // Body: header 12 + "odom\0" 5 = 17, padded to 20; "base_link\0" 4 + 10 = 34,
+        // padded to 40; then 7 + 36 + 6 + 36 doubles.
+        assert_eq!(encoded.data.len(), 4 + 40 + 85 * 8);
+        assert_eq!(decode_odometry(&encoded.data).unwrap(), a_pose());
+    }
+
+    #[test]
+    fn pose_stamped_decodes_the_pose() {
+        let encoded = pose_stamped(&a_pose());
+        assert_eq!(decode_pose_stamped(&encoded.data).unwrap(), a_pose());
+    }
+
+    #[test]
+    fn a_tf_message_decodes_every_transform_it_was_written_with() {
+        let transforms = vec![
+            TransformStamped::identity("odom", "base_link"),
+            TransformStamped {
+                header: Header::new(4_000_000_000, "base_link"),
+                child_frame_id: "livox_frame".into(),
+                translation: [0.1, 0.2, 0.3],
+                rotation: [0.0, 1.0, 0.0, 0.0],
+            },
+        ];
+        let encoded = tf_message(&transforms);
+        assert_eq!(decode_tf_message(&encoded.data).unwrap(), transforms);
+        assert!(decode_tf_message(&encoded.data[..encoded.data.len() - 3]).is_err());
+    }
+
+    #[test]
+    fn a_point_cloud_view_borrows_its_payload_and_keeps_the_field_offsets() {
+        let cloud = crate::msgs::PointCloud2 {
+            header: Header::new(5_000_000_000, "livox_frame"),
+            height: 1,
+            width: 2,
+            fields: ["x", "y", "z"]
+                .iter()
+                .enumerate()
+                .map(|(index, name)| PointField {
+                    name: name.to_string(),
+                    offset: index as u32 * 4,
+                    datatype: POINT_FIELD_FLOAT32,
+                    count: 1,
+                })
+                .collect(),
+            is_bigendian: false,
+            point_step: 16,
+            row_step: 32,
+            data: (0..32u8).collect(),
+            is_dense: true,
+        };
+        let encoded = point_cloud2(&cloud);
+        let view = decode_point_cloud2(&encoded.data).unwrap();
+        assert_eq!(view.header, cloud.header);
+        assert_eq!(view.width, 2);
+        assert_eq!(view.fields, cloud.fields);
+        assert_eq!(view.point_step, 16);
+        assert_eq!(view.data, &cloud.data[..]);
+        assert!(!view.is_bigendian);
+        assert!(decode_point_cloud2(&encoded.data[..40]).is_err());
+    }
+
+    #[test]
+    fn big_endian_cdr_is_refused_with_a_reason() {
+        let mut encoded = pose_stamped(&a_pose()).data;
+        encoded[1] = 0x00;
+        let error = decode_pose_stamped(&encoded).unwrap_err().to_string();
+        assert!(error.contains("big-endian"), "{error}");
+    }
+}
+
+/// The full `nav_msgs/Odometry`, as the post-processor writes it. Covariances
+/// go out as zeros.
+pub fn odometry(odometry: &Odometry) -> Encoded {
+    let mut writer = CdrWriter::with_capacity(800);
+    write_header(&mut writer, &odometry.header);
+    writer.string(&odometry.child_frame_id);
+    writer.f64_array(&odometry.position);
+    writer.f64_array(&odometry.orientation);
+    writer.f64_array(&[0.0; 36]);
+    writer.f64_array(&odometry.linear_velocity);
+    writer.f64_array(&odometry.angular_velocity);
+    writer.f64_array(&[0.0; 36]);
+    Encoded {
+        schema_name: crate::msgs::ODOMETRY_TYPE,
+        schema_text: odometry_pose(
+            &Pose {
+                header: Header::default(),
+                position: [0.0; 3],
+                orientation: [0.0, 0.0, 0.0, 1.0],
+            },
+            "",
+        )
+        .schema_text,
         data: writer.finish(),
     }
 }
@@ -714,29 +983,9 @@ pub fn decode_header(payload: &[u8]) -> Option<Header> {
     CdrReader::new(payload).try_header()
 }
 
-pub fn decode_tf_message(payload: &[u8]) -> Option<Vec<TransformStamped>> {
-    if payload.len() < 8 || payload[..4] != [0x00, 0x01, 0x00, 0x00] {
-        return None;
-    }
-    let mut reader = CdrReader::new(payload);
-    let count = reader.u32() as usize;
-    let mut transforms = Vec::with_capacity(count.min(1024));
-    for _ in 0..count {
-        let header = reader.try_header()?;
-        let child_frame_id = reader.try_string()?;
-        let translation = reader.try_f64_array()?;
-        let rotation = reader.try_f64_array()?;
-        transforms.push(TransformStamped {
-            header,
-            child_frame_id,
-            translation,
-            rotation,
-        });
-    }
-    Some(transforms)
-}
-
-pub fn decode_odometry(payload: &[u8]) -> Option<Odometry> {
+/// The whole `nav_msgs/Odometry`, twist included; `decode_odometry` above
+/// stops at the pose because the drawing tools need no more.
+pub fn decode_odometry_message(payload: &[u8]) -> Option<Odometry> {
     if payload.len() < 8 || payload[..4] != [0x00, 0x01, 0x00, 0x00] {
         return None;
     }
@@ -759,7 +1008,7 @@ pub fn decode_odometry(payload: &[u8]) -> Option<Odometry> {
 }
 
 #[cfg(test)]
-mod odometry_and_tf_tests {
+mod odometry_message_tests {
     use super::*;
 
     #[test]
@@ -775,29 +1024,11 @@ mod odometry_and_tf_tests {
         let encoded = odometry(&original);
         assert_eq!(encoded.schema_name, "nav_msgs/msg/Odometry");
         assert!(encoded.schema_text.contains("MSG: geometry_msgs/TwistWithCovariance"));
-        // 4 + header (8 + 4 + 5 -> padded) + child + 7 f64 + 36 f64 + 6 f64 + 36 f64
-        assert_eq!(decode_odometry(&encoded.data).unwrap(), original);
+        assert_eq!(decode_odometry_message(&encoded.data).unwrap(), original);
         assert_eq!(decode_header(&encoded.data).unwrap(), original.header);
-    }
-
-    #[test]
-    fn a_tf_message_round_trips_through_the_reader() {
-        let transforms = vec![
-            TransformStamped {
-                header: Header::new(5, "base_link"),
-                child_frame_id: "camera_link".into(),
-                translation: [0.1, 0.2, 0.3],
-                rotation: [0.0, 0.0, 0.0, 1.0],
-            },
-            TransformStamped {
-                header: Header::new(5, "camera_link"),
-                child_frame_id: "camera_depth_optical_frame".into(),
-                translation: [0.0; 3],
-                rotation: [-0.5, 0.5, -0.5, 0.5],
-            },
-        ];
-        let encoded = tf_message(&transforms);
-        assert_eq!(decode_tf_message(&encoded.data).unwrap(), transforms);
-        assert!(decode_tf_message(&[0x00, 0x01, 0x00, 0x00, 9, 0, 0, 0, 1]).is_none());
+        // The pose-only reader agrees with the full one.
+        let pose = decode_odometry(&encoded.data).unwrap();
+        assert_eq!(pose.position, original.position);
+        assert_eq!(pose.header, original.header);
     }
 }
