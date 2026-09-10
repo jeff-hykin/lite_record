@@ -32,6 +32,23 @@ pub const ODOM_FRAME: &str = "odom";
 /// Metres per second, twice a brisk walk.
 pub const HANDHELD_MAX_VELOCITY: f64 = 3.0;
 
+/// The estimator's settings for a rig somebody carries.
+///
+/// The one departure from the Mid-360 defaults is the velocity cap, and it
+/// matters more than it looks. A scan the filter cannot match sends the state
+/// off at metres per second and every pose after it is lost; the cap rolls that
+/// scan back and lets the next one try again. Point-LIO ships it disabled.
+/// Measured on the grocery recording: uncapped, x86 and aarch64 agree to under a
+/// micron for 648 s and then split at a single decision, the aarch64 run ending
+/// 240 m away with a 537 m path against the x86 run's 307 m. Capped, they agree
+/// — 304.9 m, one scan rolled back, final pose within 2 cm.
+pub fn handheld_config() -> Config {
+    Config {
+        max_velocity: HANDHELD_MAX_VELOCITY,
+        ..Config::go2_mid360()
+    }
+}
+
 /// The lidar and IMU topics to estimate from: the first PointCloud2 channel
 /// and the Imu channel that shares its prefix.
 pub fn find_lidar_and_imu(summary: &mcap::Summary) -> Option<(String, String)> {
@@ -93,14 +110,7 @@ pub fn estimate(
     imu_topic: &str,
     scans: &Arc<AtomicU64>,
 ) -> Result<Estimate> {
-    let mut config = Config::go2_mid360();
-    // A handheld rig never moves faster than a person walks. Without the cap a
-    // scan the filter cannot match sends the state off at metres per second and
-    // the rest of the recording is lost; with it that scan is rolled back and the
-    // next one gets another try. The x86 reference run of the grocery recording
-    // happened to survive its last 25 s without this, the arm64 run of the same
-    // bytes ran 240 m away — the estimate there is that marginal.
-    config.max_velocity = HANDHELD_MAX_VELOCITY;
+    let config = handheld_config();
     let lidar_frame = first_frame(mapped, lidar_topic)?
         .with_context(|| format!("no decodable message on {lidar_topic}"))?;
 
@@ -327,6 +337,20 @@ mod tests {
         let tf_messages = messages.iter().filter(|message| message.channel.topic == TF_TOPIC).count();
         assert_eq!(tf_messages, 2);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The cap is the whole reason two machines agree on this data, so it is
+    /// pinned rather than left to a config default that ships disabled.
+    #[test]
+    fn the_handheld_estimator_caps_its_velocity_where_the_stock_config_does_not() {
+        assert_eq!(Config::go2_mid360().max_velocity, 0.0, "upstream still ships the guard off");
+        let config = handheld_config();
+        assert_eq!(config.max_velocity, HANDHELD_MAX_VELOCITY);
+        assert!(config.max_velocity > 2.0, "a brisk walk must not be rejected");
+        assert!(config.max_velocity < 10.0, "a runaway scan must be");
+        // Everything else is still the Mid-360 tuning.
+        assert_eq!(config.filter_size_map, Config::go2_mid360().filter_size_map);
+        assert_eq!(config.lidar_to_imu_trans, Config::go2_mid360().lidar_to_imu_trans);
     }
 
     #[test]
