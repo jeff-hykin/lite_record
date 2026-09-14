@@ -147,6 +147,10 @@ pub enum Deskewed {
 /// what the estimator adds to a lidar stamp to reach that clock. Fields,
 /// `point_step` and every byte that is not x/y/z are copied through, so the
 /// per-point times still say when each return was really taken.
+/// Returns closer than this are dropped rather than corrected. See the long note
+/// in [`deskew`] for why, and for the measurements behind the value.
+pub const BLIND_RANGE: f64 = 0.5;
+
 pub fn deskew(cloud: &crate::cdr::CloudView<'_>, states: &[Sample], lidar_in_imu: &Pose, clock_offset: f64) -> Deskewed {
     if states.is_empty() {
         return Deskewed::Unchanged(PassedThrough::NoStates);
@@ -170,11 +174,48 @@ pub fn deskew(cloud: &crate::cdr::CloudView<'_>, states: &[Sample], lidar_in_imu
 
     let mut data = cloud.data.to_vec();
     for entry in data.chunks_exact_mut(step) {
+        let read = |at: usize| f32::from_le_bytes(entry[at..at + 4].try_into().unwrap()) as f64;
+        let point = [read(x_at), read(y_at), read(z_at)];
+        // Blind zone, applied BEFORE the correction and in place.
+        //
+        // Two different things sit under half a metre and neither belongs in a
+        // published cloud. Most of it is the driver's invalid returns, which the
+        // Mid-360 reports as exactly (0, 0, 0) -- roughly half of every scan. Run
+        // those through motion compensation and they stop being zero: they land
+        // wherever the sensor travelled during the sweep, a shell of phantom
+        // points centimetres to decimetres out whose radius grows with speed. A
+        // consumer testing for zero then keeps all of them. Measured on park.mcap
+        // index for index, 100% of the driver's zero slots came out inside 0.5 m.
+        // The rest is the rig returning its own structure, ~3000 points a scan
+        // holding their offset from the sensor to within 5 cm over 200 s of travel.
+        //
+        // 0.5 m is hku-mars' own `blind` default for this sensor in FAST-LIO's
+        // mid360.yaml, and Point-LIO here already sets it -- but in the preprocess
+        // block, so it gates what feeds the state estimator and never reached what
+        // we publish. The cut costs nothing: the range histogram is bimodal, with
+        // 76,883 points in 0.20-0.50 m, then 314 (0.1%) in the whole of 0.50-1.00 m,
+        // then real structure. Anywhere in that valley gives the same cloud.
+        //
+        // Zeroed rather than removed, so the point count, the per-point times and
+        // the slot correspondence with `livox_lidar` all survive -- and so that a
+        // discarded return keeps saying the one thing the driver already says
+        // about it.
+        //
+        // Worth knowing: this is a correctness fix for anything counting points,
+        // not a map improvement. Rebuilding a voxel map with and without it moved
+        // 296 of 36,152 voxels, 0.8% -- a hundred thousand points packed inside a
+        // half-metre sphere collapse into a handful of cells that the real ground
+        // return under the sensor already occupies.
+        if point[0] * point[0] + point[1] * point[1] + point[2] * point[2] < BLIND_RANGE * BLIND_RANGE
+        {
+            for at in [x_at, y_at, z_at] {
+                entry[at..at + 4].copy_from_slice(&0f32.to_le_bytes());
+            }
+            continue;
+        }
         let Some(time) = clock.read(entry, stamp_seconds) else {
             continue;
         };
-        let read = |at: usize| f32::from_le_bytes(entry[at..at + 4].try_into().unwrap()) as f64;
-        let point = [read(x_at), read(y_at), read(z_at)];
         // lidar-at-capture -> odom -> lidar-at-reference, in one composition.
         let moved = reference.then(&pose_at(states, time + clock_offset).then(lidar_in_imu)).apply(point);
         for (at, value) in [(x_at, moved[0]), (y_at, moved[1]), (z_at, moved[2])] {
@@ -375,6 +416,59 @@ mod tests {
             Deskewed::Corrected(data) => points_of(&data),
             Deskewed::Unchanged(reason) => panic!("not corrected: {reason:?}"),
         }
+    }
+
+    #[test]
+    fn an_invalid_return_stays_at_the_origin_instead_of_being_flung_into_a_shell() {
+        // The bug this filter exists for. The driver reports a non-return as exactly
+        // (0, 0, 0) -- about half of every Mid-360 scan. Deskewing one moves it to
+        // wherever the sensor travelled during the sweep, so it stops being zero and
+        // every consumer testing for zero then keeps it. Measured on a real recording,
+        // index for index, 100% of the driver's zero slots came out inside 0.5 m.
+        let encoded = scan(0, [0.0, 0.0, 0.0], 8);
+        let states = [
+            Sample { time: 0.0, pose: Pose::new([0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]) },
+            Sample { time: 0.1, pose: Pose::new([3.0, 4.0, 0.0], [0.0, 0.0, 0.0, 1.0]) },
+        ];
+        for point in corrected(&encoded, &states) {
+            assert_eq!(point, [0.0, 0.0, 0.0], "an invalid return was displaced: {point:?}");
+        }
+    }
+
+    #[test]
+    fn a_return_inside_the_blind_radius_is_discarded_rather_than_corrected() {
+        // The rig returning its own structure -- a real observation, at a fixed offset
+        // from the sensor, that does not belong in a published cloud. Same disposal as
+        // an invalid return so that a discarded point keeps saying what the driver
+        // already says about one.
+        let near = (BLIND_RANGE as f32) * 0.5;
+        let encoded = scan(0, [near, 0.0, 0.0], 8);
+        let states = [
+            Sample { time: 0.0, pose: Pose::new([0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]) },
+            Sample { time: 0.1, pose: Pose::new([3.0, 4.0, 0.0], [0.0, 0.0, 0.0, 1.0]) },
+        ];
+        for point in corrected(&encoded, &states) {
+            assert_eq!(point, [0.0, 0.0, 0.0], "a blind-zone return survived: {point:?}");
+        }
+    }
+
+    #[test]
+    fn a_return_just_outside_the_blind_radius_is_kept_and_corrected() {
+        // The other side of the cut. The histogram is bimodal with an almost empty
+        // 0.5-1.0 m valley, so the threshold must not be eating real structure.
+        let far = (BLIND_RANGE as f32) * 1.2;
+        let encoded = scan(0, [far, 0.0, 0.0], 8);
+        let states = [
+            Sample { time: 0.0, pose: Pose::new([0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]) },
+            Sample { time: 0.1, pose: Pose::new([3.0, 4.0, 0.0], [0.0, 0.0, 0.0, 1.0]) },
+        ];
+        let points = corrected(&encoded, &states);
+        assert!(points.iter().any(|p| *p != [0.0, 0.0, 0.0]), "everything was discarded");
+        // A moving sensor must actually spread them, i.e. they went through the correction.
+        assert!(
+            points.iter().any(|p| (p[0] - far as f64).abs() > 1e-3),
+            "kept but not corrected: {points:?}"
+        );
     }
 
     #[test]

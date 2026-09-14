@@ -54,10 +54,24 @@ pub struct Sample {
     pub log_time: u64,
 }
 
-/// Where the rig's static transforms go. Not `/tf_static`: dimos has no
-/// latched topic, so it re-publishes static transforms on the ordinary tf
-/// stream (`StaticTfPublisher`) and a recording is expected to look the same.
+/// Where the rig's static transforms go. dimos has no latched topic, so it
+/// re-publishes static transforms on the ordinary tf stream
+/// (`StaticTfPublisher`) and a recording is expected to look the same.
 pub const TF_TOPIC: &str = "/tf";
+
+/// The same transforms are ALSO written once here, for everyone who is not dimos.
+///
+/// A viewer that follows the ROS convention treats `/tf_static` as latched and
+/// valid for all time, so the rig's tree is complete the instant a file opens. On
+/// `/tf` alone it is not: the first repeat lands up to 1/STATIC_TRANSFORM_HZ after
+/// t=0, and until it does a consumer asking for, say, base_link -> a camera frame
+/// gets "missing transform" and draws nothing. Foxglove's 3D panel does exactly
+/// that, which is why a recording could look as though it had no camera in it.
+/// Seeking backwards has the same effect on `/tf` and none on `/tf_static`.
+///
+/// Both topics carry identical edges, so a consumer reading either one is right and
+/// a consumer reading both sees no conflict.
+pub const TF_STATIC_TOPIC: &str = "/tf_static";
 
 /// How often the static transforms are repeated, mirroring dimos.
 pub const STATIC_TRANSFORM_HZ: f64 = 5.0;
@@ -70,7 +84,7 @@ pub const TRANSFORM_CONVENTION_VALUE: &str = "child_pose_in_parent";
 
 pub fn channel_metadata(topic: &str) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
-    if topic == TF_TOPIC {
+    if topic == TF_TOPIC || topic == TF_STATIC_TOPIC {
         metadata.insert(
             TRANSFORM_CONVENTION_KEY.to_string(),
             TRANSFORM_CONVENTION_VALUE.to_string(),
@@ -212,10 +226,16 @@ impl Recorder {
     /// seconds, re-stamped each time, until the recording finishes. The first
     /// copy is written on the caller's thread so it lands before anything the
     /// caller offers next.
+    ///
+    /// The same edges are also written **once** to `/tf_static`, which is what a
+    /// ROS-convention viewer treats as latched and therefore valid from t=0. See
+    /// [`TF_STATIC_TOPIC`]. Once, not repeated: a latched topic does not need it,
+    /// and repeating would put the file's largest tf cost somewhere it buys nothing.
     pub fn repeat_transforms(&mut self, transforms: Vec<TransformStamped>) {
         if transforms.is_empty() {
             return;
         }
+        self.offer(TF_STATIC_TOPIC, crate::cdr::tf_message(&transforms));
         self.offer(TF_TOPIC, crate::cdr::tf_message(&transforms));
         let Some(sender) = self.sender.clone() else {
             return;

@@ -1756,30 +1756,50 @@ mod tests {
         hub.start_recording(Some("tf.mcap")).unwrap();
         // Three copies at 5 Hz take 400 ms on an idle machine; a loaded one
         // schedules the repeater late, so wait for the count, not the clock.
+        // Four, not three: the one-off /tf_static message is in this total too,
+        // so waiting for three would stop after only two /tf repeats.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while hub.recording_status().messages < 3 {
+        while hub.recording_status().messages < 4 {
             assert!(Instant::now() < deadline, "the static transforms were not repeated");
             std::thread::sleep(Duration::from_millis(20));
         }
         let status = hub.stop_recording().unwrap();
-        assert!(status.messages >= 3, "{}", status.messages);
+        assert!(status.messages >= 4, "{}", status.messages);
 
         let bytes = std::fs::read(directory.join("tf.mcap")).unwrap();
         let messages: Vec<_> = mcap::MessageStream::new(&bytes)
             .unwrap()
             .map(|message| message.unwrap())
             .collect();
+        // The tree is on the wire before any sensor data, on both topics.
         let first = &messages[0];
-        assert_eq!(first.channel.topic, record::TF_TOPIC);
+        assert!(
+            first.channel.topic == record::TF_STATIC_TOPIC || first.channel.topic == record::TF_TOPIC,
+            "a recording must open with transforms, not {}",
+            first.channel.topic
+        );
         assert_eq!(
             first.channel.schema.as_ref().unwrap().name,
             "tf2_msgs/msg/TFMessage"
         );
-        assert_eq!(
-            first.channel.metadata.get(record::TRANSFORM_CONVENTION_KEY).map(String::as_str),
-            Some(record::TRANSFORM_CONVENTION_VALUE)
-        );
-        // Repeated at 5 Hz with fresh stamps, the way dimos publishes them.
+
+        // Both topics carry the convention marker. Without it on /tf_static,
+        // `convert` reads a fresh file as an old recorder's and inverts the edges.
+        for topic in [record::TF_TOPIC, record::TF_STATIC_TOPIC] {
+            let channel = messages
+                .iter()
+                .find(|message| message.channel.topic == topic)
+                .unwrap_or_else(|| panic!("nothing was written to {topic}"))
+                .channel
+                .clone();
+            assert_eq!(
+                channel.metadata.get(record::TRANSFORM_CONVENTION_KEY).map(String::as_str),
+                Some(record::TRANSFORM_CONVENTION_VALUE),
+                "{topic} is missing the transform convention marker"
+            );
+        }
+
+        // Repeated at 5 Hz with fresh stamps on /tf, the way dimos publishes them.
         let tf_stamps: Vec<u64> = messages
             .iter()
             .filter(|message| message.channel.topic == record::TF_TOPIC)
@@ -1787,7 +1807,24 @@ mod tests {
             .collect();
         assert!(tf_stamps.len() >= 3, "{tf_stamps:?}");
         assert!(tf_stamps.windows(2).all(|pair| pair[1] > pair[0]), "{tf_stamps:?}");
-        assert!(!messages.iter().any(|message| message.channel.topic == "/tf_static"));
+
+        // Written exactly once on /tf_static: a latched topic does not need repeating,
+        // and a viewer that honours latching has the whole tree from t=0.
+        let static_messages: Vec<_> = messages
+            .iter()
+            .filter(|message| message.channel.topic == record::TF_STATIC_TOPIC)
+            .collect();
+        assert_eq!(static_messages.len(), 1, "expected one /tf_static message");
+
+        // Identical edges on both, so neither consumer sees a different rig.
+        let first_tf = messages
+            .iter()
+            .find(|message| message.channel.topic == record::TF_TOPIC)
+            .unwrap();
+        assert_eq!(
+            static_messages[0].data, first_tf.data,
+            "/tf_static and /tf disagree about the rig"
+        );
         std::fs::remove_dir_all(&directory).ok();
         std::fs::remove_file(hub.settings_file()).ok();
     }
