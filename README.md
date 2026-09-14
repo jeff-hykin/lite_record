@@ -171,7 +171,8 @@ on any Mac or Linux box with the recording (`cargo build --release`, or a static
 `nix build .#linux-x86`):
 
 ```
-lite_record post_process <file.mcap> [--urdf rig.urdf] [--no-odom] [--reclaim]
+lite_record post_process <file.mcap> [--urdf rig.urdf] [--no-odom] [--no-deskew]
+                                     [--deskew-only] [--allow-tf-conflict] [--reclaim]
 ```
 
 It runs three stages. The jxl decode above is the first and is skipped when there is
@@ -183,8 +184,26 @@ new is put back, so a 63 GB recording grows by the megabytes added and is never 
   wrote them in the SDK's direction), the URDF's joints are merged over them, and the
   complete set is appended to `/tf` at 5 Hz across the recording. `lite_record tf_fixup
   <file.mcap> --urdf rig.urdf` runs this stage alone, prints the tree and every problem
-  with it, and exits non-zero while the tree is still disconnected. Running it again
+  with it, and exits non-zero while the tree is still disconnected.
+
+  **It refuses to write a transform for a frame the recording already places.**
+  Appending cannot remove, so writing a second value for such an edge leaves the file
+  publishing both, for ever, with nothing saying which is meant — a consumer has to
+  guess, and a tf tree that interpolates slerps between them. That is what happened to
+  `sensor_mount_link -> livox_link` in the grocery recording, and it cost two people
+  most of a day: a tf tree sweeping through 90 degrees across the span, and two
+  depth-projection experiments that each cleanly measured a different answer. Cut the
+  old value out first (`mcap_edit --drop-tf-edge <parent>:<child>`) and run this again,
+  or pass `--allow-tf-conflict` to write it anyway and accept the ambiguity. An edge the
+  recording does not already place is not a conflict and is appended as before. Running it again
   appends only edges that are not already there.
+  Appended chunks are capped at five seconds of log time as well as by size. Transforms
+  and odometry are tiny, so a size-only limit put the whole recording in one chunk, and a
+  chunk that spans the recording overlaps every other chunk in the file — which stops a
+  reader getting messages in log order by sorting the chunk index. It cannot remove the
+  overlap entirely, since appended data covers time the original chunks already cover,
+  but it bounds it: the widest appended chunk went from the full 804 s to 0.7 s.
+
 - **Odometry.** Point-LIO (pure Rust, vendored) runs over the lidar and IMU and the
   trajectory is appended as `/pointlio_odometry` and as `odom -> <root>` edges on `/tf`,
   where `<root>` is the top of the tree the lidar hangs from. Give the URDF in the same
@@ -192,6 +211,38 @@ new is put back, so a 63 GB recording grows by the megabytes added and is never 
   re-rooted afterwards. The lidar's header stamps and the log clock can differ (the Pi's
   clock stepping after the lidar's offset was taken); the odometry is stamped on the log
   clock, like the cameras and the tf that places them, and the offset is printed.
+
+  The same pass writes a **motion-compensated copy of the lidar** as
+  `/pointlio_lidar`, unless `--no-deskew`. A Mid-360 sweeps for the whole 100 ms
+  of a frame and stamps every return with when it was taken, but expresses them
+  all as though the sensor had not moved, so on a rig somebody is carrying a
+  scan is smeared the way a rolling shutter smears a photograph. Point-LIO's
+  update already propagates the state to each point-group's time, so those poses
+  are kept and every return is rewritten into where it would have been seen from
+  the scan's own header stamp. Same stamp, same frame, same fields, same
+  `point_step` — a consumer that read `/livox/lidar` reads this instead. Measured
+  on the grocery recording at a 0.6 m/s walk, the correction grows through the
+  sweep from 2 cm at the start to 26 cm at the end; accumulating 120 scans of the
+  fastest-turning stretch (32 deg/s) into `odom` and counting occupied voxels,
+  the corrected cloud is 1.9% tighter at 6 cm and 1.1% at 3 cm, while the same
+  correction applied backwards is 3.1% and 2.5% *looser* — the sign and rough
+  magnitude are what they should be. At 1.5 cm it is a wash, because the
+  sensor's own range noise is that size. Scans the estimator could not place —
+  the first few, while the map initialises, and any the velocity cap rolls back
+  — are left out rather than passed through uncorrected, and counted in the
+  report. The corrected clouds are spooled beside the recording during the walk
+  and appended afterwards, so the disk needs room for the lidar stream twice; on
+  the 58 GB grocery recording that is about 5 GB. A recording that was
+  post-processed before this existed cannot gain the topic on a normal re-run,
+  because the estimator is skipped once `/pointlio_odometry` is there and the
+  corrected clouds come out of that same pass — `--deskew-only` runs the
+  estimator anyway and appends *only* the clouds. It appends only the clouds
+  because appending cannot remove anything, so a second odometry pass would
+  leave two full sets on the topic instead of replacing the first; the run is
+  deterministic given the same input and `--max-speed`, so the clouds agree with
+  the odometry already in the file (verified: one-step and two-step runs produce
+  byte-identical clouds). A recording that already has `/pointlio_lidar` is left
+  alone either way.
 
 Two more take an mcap and produce something to look at: `lite_record heatmap` (a
 top-down density render of a cloud stream with the odometry path over it) and

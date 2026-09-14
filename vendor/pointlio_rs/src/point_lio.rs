@@ -57,6 +57,14 @@ pub struct PointLio {
 
     last_good: Option<(StateOutput, DMatrix<f64>)>,
     pub trajectory: Vec<PoseSample>,
+    /// Where the IMU was at each point-group time *within* the scan just
+    /// processed, oldest first, on the IMU clock. The trajectory keeps one pose
+    /// per scan, which is all odometry needs; deskewing a scan needs the pose at
+    /// the instant each return was taken, and that is exactly what the
+    /// point-by-point propagation above computes on its way through. Empty when
+    /// the scan produced nothing usable, including when the velocity cap rolled
+    /// it back — those states came from a diverged run and must not be used.
+    pub scan_states: Vec<PoseSample>,
     pub scan_count: usize,
     pub rejected_scans: usize,
     /// Effective plane correspondences used in the most recent scan (debug).
@@ -98,6 +106,7 @@ impl PointLio {
             acc_avr: V3D::zeros(),
             last_good: None,
             trajectory: Vec::new(),
+            scan_states: Vec::new(),
             scan_count: 0,
             rejected_scans: 0,
             dbg_effct: 0,
@@ -135,6 +144,10 @@ impl PointLio {
     }
 
     pub fn process(&mut self, pkg: &SyncPackage) {
+        // Every early return below leaves this empty, which is the honest
+        // answer: no pose was estimated inside this scan.
+        self.scan_states.clear();
+
         // Ingest this scan's IMU samples into the persistent stream.
         for imu in &pkg.imus {
             self.imu_queue.push_back(*imu);
@@ -330,6 +343,12 @@ impl PointLio {
             for j in g0..=g1 {
                 feats_world[j] = self.body_to_world(&feats_down[j]);
             }
+            self.scan_states.push(PoseSample {
+                time: time_current,
+                pos: self.kf.x.pos,
+                rot: self.kf.x.rot,
+                vel: self.kf.x.vel,
+            });
 
             idx += group_len as isize;
         }
@@ -344,6 +363,8 @@ impl PointLio {
             }
             self.kf.x.vel = V3D::zeros();
             self.rejected_scans += 1;
+            // The states walked into the blow-up, so they describe nowhere.
+            self.scan_states.clear();
         } else {
             frontend::map_incremental(&mut self.ivox, &self.cfg, &feats_world, &nearest);
             self.last_good = Some((self.kf.x.clone(), self.kf.p.clone()));

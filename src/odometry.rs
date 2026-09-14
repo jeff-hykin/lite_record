@@ -22,6 +22,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use pointlio_rs::{mcap_input, Config, PointLio, PoseSample};
 
+use crate::deskew::{self, Spool};
 use crate::mcap_append::Appender;
 use crate::msgs::{Header, Odometry, NANOS_PER_SEC, ODOMETRY_TYPE};
 use crate::record::{channel_metadata, TF_TOPIC};
@@ -125,8 +126,7 @@ pub struct Estimate {
 impl Estimate {
     /// The lidar's pose in `odom` at `sample`.
     pub fn lidar_pose(&self, sample: &PoseSample) -> Pose {
-        let rotation: [f64; 9] = std::array::from_fn(|index| sample.rot[(index / 3, index % 3)]);
-        Pose::from_matrix(rotation, [sample.pos[0], sample.pos[1], sample.pos[2]]).then(&self.lidar_in_imu)
+        pose_of(sample).then(&self.lidar_in_imu)
     }
 
     pub fn log_stamp_nanos(&self, sample: &PoseSample) -> u64 {
@@ -134,25 +134,64 @@ impl Estimate {
     }
 }
 
+/// The IMU pose in `odom` a `PoseSample` describes.
+fn pose_of(sample: &PoseSample) -> Pose {
+    let rotation: [f64; 9] = std::array::from_fn(|index| sample.rot[(index / 3, index % 3)]);
+    Pose::from_matrix(rotation, [sample.pos[0], sample.pos[1], sample.pos[2]])
+}
+
 /// Runs the estimator over `mapped`. `scans` counts processed scans as it goes,
 /// for a progress line. Takes tens of minutes on an hour of video, because the
 /// walk decompresses every chunk to find the lidar's messages.
+///
+/// `deskew_into`, when given, collects a motion-compensated copy of every scan
+/// as it goes. It rides along on this walk rather than taking one of its own
+/// because the states it needs only exist for the scan the estimator has in
+/// hand, and because a second walk of a 58 GB recording costs another half hour.
 pub fn estimate(
     mapped: &[u8],
     lidar_topic: &str,
     imu_topic: &str,
     scans: &Arc<AtomicU64>,
+    max_velocity: f64,
+    mut deskew_into: Option<&mut Spool>,
 ) -> Result<Estimate> {
-    let config = handheld_config();
+    let config = Config { max_velocity, ..handheld_config() };
     let lidar_frame = first_frame(mapped, lidar_topic)?
         .with_context(|| format!("no decodable message on {lidar_topic}"))?;
 
+    let rotation: [f64; 9] = std::array::from_fn(|index| config.lidar_to_imu_rot[(index / 3, index % 3)]);
+    let translation = [config.lidar_to_imu_trans[0], config.lidar_to_imu_trans[1], config.lidar_to_imu_trans[2]];
+    let lidar_in_imu = Pose::from_matrix(rotation, translation);
+
     let mut lio = PointLio::new(config.clone());
-    mcap_input::for_each_package(mapped, &config, 0.0, lidar_topic, imu_topic, |package| {
+    let mut spool_failure = None;
+    let mut states = Vec::new();
+    mcap_input::for_each_package_raw(mapped, &config, 0.0, lidar_topic, imu_topic, |package, raw| {
         lio.process(&package);
         scans.fetch_add(1, Ordering::Relaxed);
+        let (Some(spool), None) = (deskew_into.as_deref_mut(), spool_failure.as_ref()) else {
+            return;
+        };
+        states.clear();
+        states.extend(lio.scan_states.iter().map(|sample| deskew::Sample {
+            time: sample.time,
+            pose: pose_of(sample),
+        }));
+        let corrected = match crate::cdr::decode_point_cloud2(raw.data) {
+            Ok(cloud) => deskew::deskew(&cloud, &states, &lidar_in_imu, config.time_offset_lidar_to_imu),
+            // The estimator read this cloud, so this cannot be a bad message;
+            // treat it the way an uncorrectable scan is treated.
+            Err(_) => deskew::Deskewed::Unchanged(deskew::PassedThrough::NoPointClock),
+        };
+        if let Err(problem) = spool.push(raw.log_time, &corrected) {
+            spool_failure = Some(problem);
+        }
     })
     .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if let Some(problem) = spool_failure {
+        return Err(problem);
+    }
     if lio.trajectory.is_empty() {
         bail!("no poses came out — is {lidar_topic} the lidar and {imu_topic} its imu?");
     }
@@ -161,29 +200,31 @@ pub fn estimate(
         .unwrap_or(0.0);
     let path_length_metres =
         pointlio_rs::metrics::path_length(&pointlio_rs::trajectory::samples_to_traj(&lio.trajectory));
-    let rotation: [f64; 9] = std::array::from_fn(|index| config.lidar_to_imu_rot[(index / 3, index % 3)]);
-    let translation = [config.lidar_to_imu_trans[0], config.lidar_to_imu_trans[1], config.lidar_to_imu_trans[2]];
     Ok(Estimate {
         rejected_scans: lio.rejected_scans,
         poses: lio.trajectory,
         log_offset_seconds,
         lidar_frame,
         path_length_metres,
-        lidar_in_imu: Pose::from_matrix(rotation, translation),
+        lidar_in_imu,
     })
 }
 
 fn first_frame(mapped: &[u8], topic: &str) -> Result<Option<String>> {
     let summary = mcap::Summary::read(mapped)?.context("no summary")?;
-    let Some(channel) = summary.channels.values().find(|channel| channel.topic == topic) else {
+    let ids = crate::walk::channel_ids(&summary, topic);
+    if ids.is_empty() {
         return Ok(None);
-    };
+    }
     let mut chunks = summary.chunk_indexes.clone();
     chunks.sort_by_key(|chunk| chunk.chunk_start_offset);
-    for chunk in chunks.iter().filter(|chunk| chunk.message_index_offsets.contains_key(&channel.id)) {
+    for chunk in chunks
+        .iter()
+        .filter(|chunk| ids.iter().any(|id| chunk.message_index_offsets.contains_key(id)))
+    {
         for message in summary.stream_chunk(mapped, chunk)? {
             let message = message?;
-            if message.channel.id == channel.id {
+            if ids.contains(&message.channel.id) {
                 if let Some(header) = crate::cdr::decode_header(&message.data) {
                     return Ok(Some(header.frame_id));
                 }
@@ -291,11 +332,9 @@ pub fn already_present(path: &Path) -> Result<Option<Existing>> {
         return Ok(None);
     };
     Ok(Some(Existing {
-        messages: summary
-            .stats
-            .as_ref()
-            .and_then(|stats| stats.channel_message_counts.get(&channel.id).copied())
-            .unwrap_or(0),
+        // Across every channel carrying the topic, not just this one: a rewritten
+        // recording splits a topic over several ids and can leave one empty.
+        messages: crate::walk::message_count(&summary, ODOMETRY_TOPIC),
         geometry: channel.metadata.get(GEOMETRY_KEY).cloned(),
     }))
 }

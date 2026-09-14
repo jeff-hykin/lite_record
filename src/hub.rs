@@ -298,6 +298,8 @@ pub struct Hub {
     /// `pipeline_dropped` as it stood when the current recording started, so the
     /// shed count can be narrowed to that one file.
     shed_baseline: Mutex<BTreeMap<String, u64>>,
+    /// Set by `start_recording` when the tf tree it wrote was broken.
+    tree_warning: Mutex<Option<String>>,
     /// The latest intrinsics seen on each camera_info topic.
     ///
     /// A backend announces these once when it opens, not on every frame, so a
@@ -366,6 +368,7 @@ impl Hub {
             rates: Mutex::new(BTreeMap::new()),
             pipeline_dropped: Mutex::new(BTreeMap::new()),
             shed_baseline: Mutex::new(BTreeMap::new()),
+            tree_warning: Mutex::new(None),
             latest_intrinsics: Mutex::new(BTreeMap::new()),
             encode_senders,
             preview: Mutex::new(None),
@@ -767,6 +770,7 @@ impl Hub {
                 links: Vec::new(),
                 joints: 0,
                 problems: Vec::new(),
+                tree_problems: self.tree_problems(None),
                 parse_error: None,
             };
         };
@@ -777,6 +781,7 @@ impl Hub {
                 links: parsed.links.clone(),
                 joints: parsed.joints.len(),
                 problems: parsed.problems(&frames),
+                tree_problems: self.tree_problems(Some(xml)),
                 parse_error: None,
             },
             Err(error) => UrdfReport {
@@ -785,9 +790,15 @@ impl Hub {
                 links: Vec::new(),
                 joints: 0,
                 problems: Vec::new(),
+                tree_problems: Vec::new(),
                 parse_error: Some(format!("{error:#}")),
             },
         }
+    }
+
+    /// The warning the last `start_recording` raised about the tf tree, if any.
+    pub fn tree_warning(&self) -> Option<String> {
+        self.tree_warning.lock().unwrap().clone()
     }
 
     /// The full `/tf_static` payload: the URDF's joints, plus the edges that
@@ -799,10 +810,15 @@ impl Hub {
     /// wrong by a couple of centimetres, but a named frame that exists beats a
     /// TF tree with a hole in it where readers expect a frame.
     pub fn static_transforms(&self, stamp_nanos: u64) -> Vec<TransformStamped> {
+        let xml = self.settings().urdf_xml.clone();
+        self.static_transforms_with(xml.as_deref(), stamp_nanos)
+    }
+
+    /// The same payload for a URDF that is not (yet) the saved one, so an upload
+    /// can be judged against the sensors' own edges before it is accepted.
+    pub fn static_transforms_with(&self, urdf_xml: Option<&str>, stamp_nanos: u64) -> Vec<TransformStamped> {
         let settings = self.settings();
-        let mut transforms = settings
-            .urdf_xml
-            .as_deref()
+        let mut transforms = urdf_xml
             .and_then(|xml| urdf::parse(xml).ok())
             .map(|parsed| parsed.static_transforms(stamp_nanos))
             .unwrap_or_default();
@@ -864,10 +880,69 @@ impl Hub {
         transforms
     }
 
+    /// What is wrong with the tree the recorder would actually write: the URDF's
+    /// joints *and* the sensors' own edges together. `Urdf::problems` judges the
+    /// file alone; this catches the URDF hanging a frame a sensor also places, a
+    /// sensor frame the URDF never reaches, and a URDF-less rig whose sensors
+    /// form separate trees.
+    pub fn tree_problems(&self, urdf_xml: Option<&str>) -> Vec<TreeProblem> {
+        let transforms = self.static_transforms_with(urdf_xml, 0);
+        let mut parents_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut tree = crate::tf::StaticTree::default();
+        for transform in &transforms {
+            let parents = parents_of.entry(transform.child_frame_id.clone()).or_default();
+            if !parents.contains(&transform.header.frame_id) {
+                parents.push(transform.header.frame_id.clone());
+            }
+            tree.insert_transform(transform);
+        }
+        let mut problems: Vec<TreeProblem> = parents_of
+            .iter()
+            .filter(|(_, parents)| parents.len() > 1)
+            .map(|(child, parents)| TreeProblem::DoubleParent {
+                child: child.clone(),
+                parents: parents.clone(),
+            })
+            .collect();
+        if transforms.is_empty() {
+            return problems;
+        }
+        let roots = tree.roots();
+        if roots.len() > 1 {
+            problems.push(TreeProblem::MultipleRoots { roots });
+        }
+        let settings = self.settings();
+        let mut data_frames: Vec<String> = Vec::new();
+        for config in [&settings.realsense, &settings.orbbec, &settings.oakd] {
+            if config.enabled {
+                data_frames.extend(config.streams().into_iter().map(|stream| config.naming.frame_id(stream)));
+            }
+        }
+        if settings.livox.enabled {
+            data_frames.extend(settings.livox.streams().into_iter().map(|stream| settings.livox.naming.frame_id(stream)));
+        }
+        for frame in data_frames {
+            if !tree.contains(&frame) {
+                problems.push(TreeProblem::UncoveredFrame { frame });
+            }
+        }
+        problems
+    }
+
     // -- recording --------------------------------------------------------
 
     pub fn start_recording(&self, name: Option<&str>) -> Result<RecordingStatus> {
         let settings = self.settings();
+        // Flagged, not refused: a rig with no URDF still records, but nobody
+        // should find out the tree was broken from a reader weeks later.
+        let broken = self.tree_problems(settings.urdf_xml.as_deref());
+        if !broken.is_empty() {
+            let text = broken.iter().map(TreeProblem::message).collect::<Vec<_>>().join("; ");
+            eprintln!("warning: recording with a broken tf tree: {text}");
+            *self.tree_warning.lock().unwrap() = Some(format!("tf tree is broken: {text}"));
+        } else {
+            *self.tree_warning.lock().unwrap() = None;
+        }
         // Gathered before the recorder lock, not after. This reads the backend
         // map, and disengaging holds that map while it joins a sensor thread
         // that is itself trying to take the recorder lock — taking the two in
@@ -987,6 +1062,9 @@ pub struct UrdfReport {
     pub links: Vec<String>,
     pub joints: usize,
     pub problems: Vec<TreeProblem>,
+    /// Problems of the tree the recorder would write with this URDF *and* the
+    /// sensors' own edges combined, which is what a reader will actually see.
+    pub tree_problems: Vec<TreeProblem>,
     pub parse_error: Option<String>,
 }
 
@@ -1003,17 +1081,27 @@ impl UrdfReport {
         if let Some(error) = &self.parse_error {
             return Some(format!("urdf could not be parsed: {error}"));
         }
-        if self.problems.is_empty() {
-            return None;
+        if !self.problems.is_empty() {
+            return Some(format!(
+                "urdf tree is broken: {}",
+                self.problems
+                    .iter()
+                    .map(TreeProblem::message)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
         }
-        Some(format!(
-            "urdf tree is broken: {}",
-            self.problems
-                .iter()
-                .map(TreeProblem::message)
-                .collect::<Vec<_>>()
-                .join("; ")
-        ))
+        if !self.tree_problems.is_empty() {
+            return Some(format!(
+                "urdf and sensor frames together do not make one tree: {}",
+                self.tree_problems
+                    .iter()
+                    .map(TreeProblem::message)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+        None
     }
 }
 
@@ -1760,6 +1848,46 @@ mod tests {
 
     /// The calibration a camera announced at boot must not carry a boot-time
     /// stamp into a file recorded later — on a Pi that stamp predates NTP's
+    /// The grocery recording's lesson: with no URDF the sensors' placeholder
+    /// edges make separate trees, and a URDF must be judged together with
+    /// those edges, not on its own.
+    #[test]
+    fn a_rig_without_a_urdf_is_flagged_and_a_joining_urdf_clears_it() {
+        let hub = scratch_hub();
+        let mut settings = hub.settings();
+        settings.realsense.enabled = true;
+        settings.livox.enabled = true;
+        hub.update_settings(settings).unwrap();
+
+        let without = hub.tree_problems(None);
+        assert!(
+            without.iter().any(|problem| matches!(problem, TreeProblem::MultipleRoots { .. })),
+            "two sensors with no urdf must be reported as separate trees: {without:?}"
+        );
+        assert!(hub.inspect_urdf(None).warning().is_some());
+
+        let joined = r#"<robot name="rig">
+            <link name="base_link"/><link name="camera_link"/><link name="livox_link"/>
+            <link name="livox_frame"/><link name="livox_imu_frame"/>
+            <joint name="c" type="fixed"><parent link="base_link"/><child link="camera_link"/><origin xyz="0 0 0"/></joint>
+            <joint name="l" type="fixed"><parent link="base_link"/><child link="livox_link"/><origin xyz="0 0 0.2"/></joint>
+            <joint name="o" type="fixed"><parent link="livox_link"/><child link="livox_frame"/><origin xyz="0 0 0.047"/></joint>
+            <joint name="i" type="fixed"><parent link="livox_frame"/><child link="livox_imu_frame"/><origin xyz="0.011 0.023 -0.044"/></joint>
+        </robot>"#;
+        let with = hub.tree_problems(Some(joined));
+        assert!(with.is_empty(), "a urdf that joins every sensor frame must report nothing: {with:?}");
+        let report = hub.inspect_urdf(Some(joined));
+        assert!(report.warning().is_none(), "{:?}", report.warning());
+        // And the published payload really has one parent per frame.
+        let transforms = hub.static_transforms_with(Some(joined), 0);
+        let imu_parents: Vec<_> = transforms
+            .iter()
+            .filter(|t| t.child_frame_id == "livox_imu_frame")
+            .map(|t| t.header.frame_id.clone())
+            .collect();
+        assert_eq!(imu_parents, vec!["livox_frame".to_string()]);
+    }
+
     /// correction and lands thousands of seconds before the images.
     #[test]
     fn a_replayed_camera_info_is_stamped_when_the_recording_started() {

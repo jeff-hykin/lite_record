@@ -587,6 +587,11 @@ button.path-button {
     color: var(--bad);
 }
 
+.tf-warning {
+    margin: 0;
+    padding: 0.5rem 1rem;
+}
+
 .warning {
     margin: 0 0 var(--step);
     padding: calc(var(--step) * 0.75) var(--step);

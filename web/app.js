@@ -823,6 +823,11 @@ const renderUrdf = (payload) => {
     const banner = element("urdf-warning")
     banner.hidden = !payload.warning
     banner.textContent = payload.warning || ""
+    // The same line above the fold, so a broken tree is seen before recording,
+    // not found in the settings tab afterwards.
+    const global = element("tf-warning")
+    global.hidden = !payload.warning
+    global.textContent = payload.warning || ""
     const problems = element("urdf-problems")
     problems.textContent = ""
     for (const message of payload.problems || []) {
@@ -901,6 +906,11 @@ const applyStatus = (payload) => {
     renderStreams(payload.streams)
     renderPreviewTopics(payload.preview_topics, payload.preview_topic)
     renderUrdf(payload.urdf)
+    if (payload.tf_warning && !payload.urdf.warning) {
+        const global = element("tf-warning")
+        global.hidden = false
+        global.textContent = payload.tf_warning
+    }
     element("preview-enabled").checked = payload.settings.preview_enabled
     element("password-state").textContent = payload.has_password ? "held" : "not set"
     element("password-state").classList.toggle("pill-good", payload.has_password)

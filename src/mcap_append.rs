@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use mcap::records;
 
+use crate::msgs::NANOS_PER_SEC;
+
 /// Magic bytes at both ends of every mcap.
 const MAGIC: [u8; 8] = [0x89, b'M', b'C', b'A', b'P', 0x30, b'\r', b'\n'];
 
@@ -44,6 +46,18 @@ mod op {
 /// to one message decompresses little, large enough that zstd sees the
 /// repetition in a stream of near-identical transforms.
 const CHUNK_TARGET_BYTES: usize = 4 << 20;
+
+/// Log time a single appended chunk may span.
+///
+/// Size alone is the wrong limit for what this appends. Transforms and odometry
+/// are tiny, so 4 MB of them is the whole recording in one chunk — and a chunk
+/// that spans the recording overlaps every other chunk in the file. A reader
+/// that wants messages in log order can then no longer get there by sorting the
+/// chunk index; it needs a merge. On the 58 GB grocery recording the appended
+/// chunks left 2153 overlapping pairs. Capping the span keeps appended chunks
+/// disjoint in time and roughly the width of the recorder's own, so sorting the
+/// index is enough again.
+const CHUNK_TARGET_NANOS: u64 = 5 * NANOS_PER_SEC;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schema {
@@ -255,9 +269,18 @@ impl Appender {
     fn flush_all(&mut self) -> Result<()> {
         let mut messages = std::mem::take(&mut self.pending);
         messages.sort_by_key(|message| message.log_time);
-        let mut chunk = Vec::new();
+        let mut chunk: Vec<Pending> = Vec::new();
         let mut chunk_bytes = 0;
         for message in messages {
+            // Cut on either limit. The span is measured from the chunk's first
+            // message, so a burst that fits in the window still gets one chunk.
+            let spans_too_long = chunk
+                .first()
+                .is_some_and(|first| message.log_time.saturating_sub(first.log_time) >= CHUNK_TARGET_NANOS);
+            if spans_too_long {
+                self.flush_chunk(std::mem::take(&mut chunk))?;
+                chunk_bytes = 0;
+            }
             chunk_bytes += message.data.len() + 22 + 9;
             chunk.push(message);
             if chunk_bytes >= CHUNK_TARGET_BYTES {

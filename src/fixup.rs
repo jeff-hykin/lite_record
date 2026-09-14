@@ -193,6 +193,10 @@ pub struct Plan {
     pub new_edges: Vec<(String, String, Pose)>,
     /// Recorded edges a URDF joint replaced, named so the operator can see it.
     pub overridden: Vec<String>,
+    /// Edges this plan would append that the recording already publishes for the
+    /// same child. Appending cannot remove the old value, so writing these
+    /// leaves the file with two answers and no marker.
+    pub conflicting: Vec<String>,
     pub problems: Vec<TreeProblem>,
     /// Things that are not wrong with the tree but will bite: chiefly odometry
     /// already appended for a frame the URDF has since put under another.
@@ -218,16 +222,16 @@ pub fn plan(recording: &Recording, urdf: Option<&crate::urdf::Urdf>) -> Plan {
             );
             if let Some(previous) = tree.parent_of(&joint.child) {
                 if previous != joint.parent || tree.pose_in(previous, &joint.child) != Some(pose) {
-                    overridden.push(format!(
-                        "{} <- {} (was under {previous})",
-                        joint.child, joint.parent
-                    ));
+                    overridden.push(match previous == joint.parent {
+                        true => format!("{} <- {} (a different value)", joint.child, joint.parent),
+                        false => format!("{} <- {} (was under {previous})", joint.child, joint.parent),
+                    });
                 }
             }
             tree.insert(&joint.parent, &joint.child, pose);
         }
     }
-    let new_edges = tree
+    let new_edges: Vec<(String, String, Pose)> = tree
         .edges()
         .filter(|(parent, child, pose)| {
             match recording.published.get(&((*parent).to_string(), (*child).to_string())) {
@@ -236,6 +240,27 @@ pub fn plan(recording: &Recording, urdf: Option<&crate::urdf::Urdf>) -> Plan {
             }
         })
         .map(|(parent, child, pose)| (parent.to_string(), child.to_string(), *pose))
+        .collect();
+
+    // Appending cannot remove. So an edge whose child the recording ALREADY
+    // places, under any parent, does not get replaced by writing a new value —
+    // the file ends up publishing both, for ever, with nothing saying which is
+    // meant. That is what happened to `sensor_mount_link -> livox_link` in the
+    // grocery recording, and it cost two people most of a day: a tf tree that
+    // slerps between the two answers, and two depth-projection experiments that
+    // each measured a different one.
+    let conflicting: Vec<String> = new_edges
+        .iter()
+        .filter_map(|(parent, child, _)| {
+            let (published_parent, _) = recording
+                .published
+                .keys()
+                .find(|(_, published_child)| published_child == child)?;
+            Some(match published_parent == parent {
+                true => format!("{parent} -> {child} (a different value)"),
+                false => format!("{parent} -> {child} (the file already has {published_parent} -> {child})"),
+            })
+        })
         .collect();
     let problems = tree.problems(&recording.data_frames());
     // Odometry is appended as `odom -> <root>`. A URDF applied afterwards can
@@ -268,6 +293,7 @@ pub fn plan(recording: &Recording, urdf: Option<&crate::urdf::Urdf>) -> Plan {
         tree,
         new_edges,
         overridden,
+        conflicting,
         problems,
         warnings,
     }
@@ -333,7 +359,16 @@ pub fn describe(plan: &Plan, appended: u64) -> String {
         out.push('\n');
     }
     for replaced in &plan.overridden {
-        out.push_str(&format!("replaced by the urdf: {replaced}\n"));
+        out.push_str(&format!("the urdf moves: {replaced}\n"));
+    }
+    if !plan.conflicting.is_empty() {
+        out.push_str(&format!(
+            "CONFLICT: {} edge(s) would end up with two values in this file, because appending\ncannot remove the old one. A consumer then has to guess, and a tf tree that\ninterpolates will slerp between them:\n",
+            plan.conflicting.len()
+        ));
+        for edge in &plan.conflicting {
+            out.push_str(&format!("  {edge}\n"));
+        }
     }
     for problem in &plan.problems {
         out.push_str(&format!("problem: {problem}\n"));

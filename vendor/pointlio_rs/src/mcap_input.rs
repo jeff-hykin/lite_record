@@ -196,6 +196,81 @@ pub fn decode_cloud(data: &[u8], cfg: &Config) -> Option<Scan> {
     Some(Scan { points, start, end })
 }
 
+/// Hands every message to `handle`, in LOG-TIME order, stopping when it returns
+/// false.
+///
+/// Two reasons this is not `mcap::MessageStream`. That reader is **linear**, so
+/// it learns channels as it passes their records and dies with `Message N
+/// referenced unknown channel M` on a file that declares one later — legal,
+/// since the summary is what a reader resolves channels from. And **file order
+/// is not log order**: a tool that rewrites chunks in place puts the rewritten
+/// ones at the end, so a recording can run to its last second and then jump
+/// back to its first. An estimator fed that does not fail, it quietly returns a
+/// worse trajectory with the teleports rejected, which is far harder to notice.
+///
+/// So merge the chunks by log time, opening each only when a message could come
+/// out of it, and keep the linear read for a file with no summary — one the
+/// recorder was killed part way through.
+fn for_each_message(
+    mapped: &[u8],
+    mut handle: impl FnMut(&mcap::Message<'_>) -> Result<bool, Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let indexed = match mcap::Summary::read(mapped) {
+        Ok(Some(summary)) if !summary.chunk_indexes.is_empty() => Some(summary),
+        _ => None,
+    };
+    let Some(summary) = indexed else {
+        for message in mcap::MessageStream::new(mapped)? {
+            if !handle(&message?)? {
+                return Ok(());
+            }
+        }
+        return Ok(());
+    };
+
+    let mut chunks = summary.chunk_indexes.clone();
+    chunks.sort_by_key(|chunk| (chunk.message_start_time, chunk.chunk_start_offset));
+
+    type Rest<'a> = Box<dyn Iterator<Item = mcap::McapResult<mcap::Message<'a>>> + 'a>;
+    let mut open: Vec<(mcap::Message<'_>, Rest<'_>)> = Vec::new();
+    let mut unopened = 0;
+
+    loop {
+        loop {
+            let earliest = open.iter().map(|(message, _)| message.log_time).min();
+            let should_open = match (unopened < chunks.len(), earliest) {
+                (false, _) => false,
+                (true, None) => true,
+                (true, Some(time)) => chunks[unopened].message_start_time <= time,
+            };
+            if !should_open {
+                break;
+            }
+            let mut rest = summary.stream_chunk(mapped, &chunks[unopened])?;
+            unopened += 1;
+            if let Some(first) = rest.next() {
+                open.push((first?, Box::new(rest)));
+            }
+        }
+        let Some(next) = open
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (message, _))| message.log_time)
+            .map(|(index, _)| index)
+        else {
+            return Ok(());
+        };
+        let following = open[next].1.next().transpose()?;
+        let message = match following {
+            Some(following) => std::mem::replace(&mut open[next].0, following),
+            None => open.swap_remove(next).0,
+        };
+        if !handle(&message)? {
+            return Ok(());
+        }
+    }
+}
+
 /// Seconds to add to a scan's own timestamps to land on the clock the recording
 /// was logged with.
 ///
@@ -209,16 +284,28 @@ pub fn log_time_offset(
     cfg: &Config,
     lidar_topic: &str,
 ) -> Result<Option<f64>, Box<dyn std::error::Error>> {
-    for message in mcap::MessageStream::new(mapped)? {
-        let message = message?;
+    let mut offset = None;
+    for_each_message(mapped, |message| {
         if message.channel.topic != lidar_topic {
-            continue;
+            return Ok(true);
         }
-        if let Some(scan) = decode_cloud(&message.data, cfg) {
-            return Ok(Some(message.log_time as f64 * 1e-9 - scan.start));
+        match decode_cloud(&message.data, cfg) {
+            Some(scan) => {
+                offset = Some(message.log_time as f64 * 1e-9 - scan.start);
+                Ok(false)
+            }
+            None => Ok(true),
         }
-    }
-    Ok(None)
+    })?;
+    Ok(offset)
+}
+
+/// The lidar message a `SyncPackage` was built from, for a caller that needs
+/// more of the cloud than the estimator kept. The package's points are
+/// downsampled and range-filtered; these bytes are the whole scan as recorded.
+pub struct RawScan<'a> {
+    pub data: &'a [u8],
+    pub log_time: u64,
 }
 
 /// Walks the recording in file order, handing each scan and the IMU samples
@@ -231,31 +318,43 @@ pub fn for_each_package(
     imu_topic: &str,
     mut handle: impl FnMut(SyncPackage),
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    for_each_package_raw(mapped, cfg, duration_s, lidar_topic, imu_topic, |package, _raw| handle(package))
+}
+
+/// [`for_each_package`], also handing over the lidar message each package came
+/// from.
+pub fn for_each_package_raw(
+    mapped: &[u8],
+    cfg: &Config,
+    duration_s: f64,
+    lidar_topic: &str,
+    imu_topic: &str,
+    mut handle: impl FnMut(SyncPackage, RawScan<'_>),
+) -> Result<usize, Box<dyn std::error::Error>> {
     let mut imu_buf: Vec<ImuData> = Vec::new();
     let mut first: Option<f64> = None;
     let mut scans = 0;
 
-    for message in mcap::MessageStream::new(mapped)? {
-        let message = message?;
+    for_each_message(mapped, |message| {
         let topic = message.channel.topic.as_str();
         if topic == imu_topic {
             if let Some(sample) = decode_imu(&message.data) {
                 imu_buf.push(sample);
             }
-            continue;
+            return Ok(true);
         }
         if topic != lidar_topic {
-            continue;
+            return Ok(true);
         }
         let scan = match decode_cloud(&message.data, cfg) {
             Some(scan) => scan,
-            None => continue,
+            None => return Ok(true),
         };
         if first.is_none() {
             first = Some(scan.start);
         }
         if duration_s > 0.0 && scan.start - first.unwrap() > duration_s {
-            break;
+            return Ok(false);
         }
 
         // Point-LIO needs the IMU that brackets the scan; anything later belongs
@@ -263,7 +362,7 @@ pub fn for_each_package(
         let split = imu_buf.partition_point(|sample| sample.time <= scan.end);
         let imus: Vec<ImuData> = imu_buf.drain(..split).collect();
         if imus.is_empty() {
-            continue;
+            return Ok(true);
         }
 
         let cloud: Vec<Point> = scan
@@ -274,13 +373,17 @@ pub fn for_each_package(
             })
             .collect();
         scans += 1;
-        handle(SyncPackage {
-            imus,
-            cloud,
-            cloud_start_time: scan.start,
-            cloud_end_time: scan.end,
-        });
-    }
+        handle(
+            SyncPackage {
+                imus,
+                cloud,
+                cloud_start_time: scan.start,
+                cloud_end_time: scan.end,
+            },
+            RawScan { data: &message.data, log_time: message.log_time },
+        );
+        Ok(true)
+    })?;
     Ok(scans)
 }
 

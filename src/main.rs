@@ -115,12 +115,48 @@ struct PostProcessArgs {
     #[arg(long)]
     fix_clocks: bool,
 
+    /// Metres per second above which the odometry rolls a scan back as a
+    /// mismatch. The default suits a rig somebody carries; a bike needs more.
+    #[arg(long, default_value_t = lite_record::odometry::HANDHELD_MAX_VELOCITY)]
+    max_speed: f64,
+
     /// Rewrite a `/tf_static` an older recorder wrote in the SDK's direction.
     /// The appended `/tf` already supersedes it for anything that keeps a
     /// history per frame, so this is only worth the rewrite for a consumer
     /// that reads `/tf_static` on its own.
     #[arg(long)]
     fix_static_tf: bool,
+
+    /// Skip the motion-compensated copy of the lidar the odometry pass
+    /// otherwise appends as /pointlio_lidar. It is roughly the size of the
+    /// lidar stream again.
+    #[arg(long)]
+    no_deskew: bool,
+
+    /// Run the estimator over a recording that already has odometry, and append
+    /// only the corrected /pointlio_lidar clouds from it.
+    ///
+    /// This exists because a recording post-processed before /pointlio_lidar
+    /// was a thing has no way to gain one: the corrected clouds need the states
+    /// the estimator holds inside each scan, and the estimator is skipped once
+    /// /pointlio_odometry is there. It appends *only* the clouds, because
+    /// appending cannot remove anything — a second odometry pass would leave
+    /// two full sets on the topic rather than replacing the first. The run is
+    /// deterministic given the same input and --max-speed, so the clouds agree
+    /// with the odometry already in the file.
+    #[arg(long)]
+    deskew_only: bool,
+
+    /// Append a transform even when the recording already places that frame.
+    ///
+    /// Off by default, because appending cannot remove: writing a second value
+    /// for an edge the file already publishes leaves it with two answers and
+    /// nothing saying which is meant. A consumer then has to guess, and a tf
+    /// tree that interpolates slerps between them — which is what happened to
+    /// `sensor_mount_link -> livox_link` in the grocery recording. Cut the old
+    /// value out first instead, then run this.
+    #[arg(long)]
+    allow_tf_conflict: bool,
 }
 
 impl Args {
@@ -196,9 +232,31 @@ fn load_urdf(path: Option<&Path>) -> Result<Option<lite_record::urdf::Urdf>> {
 fn post_process(args: &PostProcessArgs) -> Result<()> {
     let PostProcessArgs {
         recording, reclaim, no_odom, urdf, lidar_topic, imu_topic, dry_run, trajectory, fix_clocks,
-        fix_static_tf,
+        fix_static_tf, max_speed, no_deskew, deskew_only, allow_tf_conflict,
     } = args;
     let (recording, reclaim, no_odom, dry_run) = (recording.as_path(), *reclaim, *no_odom, *dry_run);
+    let deskew_only = *deskew_only;
+    // Already there is a reason to skip, not to duplicate: appending cannot
+    // remove the first set.
+    let already_deskewed = lite_record::deskew::already_present(recording)?;
+    let wants_deskew = !no_deskew && !dry_run && already_deskewed == 0;
+    if already_deskewed > 0 && !no_deskew {
+        println!(
+            "{} already carries {already_deskewed} messages on {}; not correcting again",
+            recording.display(),
+            lite_record::deskew::DESKEWED_TOPIC
+        );
+    }
+    if deskew_only && !wants_deskew {
+        anyhow::bail!(
+            "--deskew-only has nothing to do: {}",
+            match (no_deskew, dry_run, already_deskewed) {
+                (true, _, _) => "--no-deskew was also given".to_string(),
+                (_, true, _) => "--dry-run writes nothing".to_string(),
+                (_, _, count) => format!("the recording already has {count} corrected clouds"),
+            }
+        );
+    }
     // Surveyed before anything is written, so the report describes the file as
     // it was handed over rather than as this run leaves it.
     let clocks = lite_record::restamp::survey_path(recording)?;
@@ -273,9 +331,12 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
         );
     }
 
+    // Filled by the estimator's walk when a corrected lidar was asked for, and
+    // emptied into the file after the appender is open.
+    let mut spool = None;
     let estimate = if no_odom {
         None
-    } else if let Some(existing) = lite_record::odometry::already_present(recording)? {
+    } else if let (Some(existing), false) = (lite_record::odometry::already_present(recording)?, deskew_only) {
         println!(
             "{} already carries {} messages on {}; not estimating again",
             recording.display(),
@@ -323,20 +384,35 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
             }
             Some((lidar, imu)) => {
                 println!("estimating odometry from {lidar} + {imu} (this takes a while)");
+                if wants_deskew {
+                    spool = Some(lite_record::deskew::Spool::beside(recording)?);
+                }
                 let scans = Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let watched = Arc::clone(&scans);
                 let estimate = with_ticker(
                     move || format!("{} scans", watched.load(std::sync::atomic::Ordering::Relaxed)),
-                    || lite_record::odometry::estimate(&mapped, &lidar, &imu, &scans),
+                    || lite_record::odometry::estimate(&mapped, &lidar, &imu, &scans, *max_speed, spool.as_mut()),
                 )?;
                 println!(
                     "  {} poses, {:.1} m of path, {} scans rejected by the {} m/s cap, log clock {:+.3} s from the lidar's stamps",
                     estimate.poses.len(),
                     estimate.path_length_metres,
                     estimate.rejected_scans,
-                    lite_record::odometry::HANDHELD_MAX_VELOCITY,
+                    max_speed,
                     estimate.log_offset_seconds
                 );
+                if let Some(spool) = spool.as_ref() {
+                    println!(
+                        "  {} motion-compensated scans -> {} ({:.2} GB){}",
+                        spool.clouds(),
+                        lite_record::deskew::DESKEWED_TOPIC,
+                        spool.bytes() as f64 / 1e9,
+                        match spool.passed_through() {
+                            0 => String::new(),
+                            skipped => format!(", {skipped} scan(s) the estimator could not place left out"),
+                        }
+                    );
+                }
                 if let Some(path) = trajectory {
                     lite_record::odometry::write_tum(&estimate, path)?;
                     println!("  trajectory -> {}", path.display());
@@ -348,6 +424,9 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
     drop(mapped);
 
     if dry_run || (plan.new_edges.is_empty() && estimate.is_none()) {
+        if let Some(spool) = spool.take() {
+            spool.discard();
+        }
         print!("{}", lite_record::fixup::describe(&plan, 0));
         if dry_run {
             println!(
@@ -361,6 +440,13 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
         }
         return Ok(());
     }
+    if !plan.conflicting.is_empty() && !*allow_tf_conflict {
+        print!("{}", lite_record::fixup::describe(&plan, 0));
+        anyhow::bail!(
+            "refusing to write {} conflicting transform(s).\nCut the old value out first (`mcap_edit --drop-tf-edge <parent>:<child>`), then run this\nagain — or pass --allow-tf-conflict to write it anyway and leave the file ambiguous.",
+            plan.conflicting.len()
+        );
+    }
     let mut appender = lite_record::mcap_append::Appender::open(recording)?;
     let static_messages = lite_record::fixup::append_static_transforms(
         &mut appender,
@@ -368,9 +454,17 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
         inspected.start_nanos,
         inspected.end_nanos,
     )?;
-    let appended = match &estimate {
-        Some(estimate) => Some(lite_record::odometry::append(&mut appender, estimate, &plan.tree)?),
-        None => None,
+    let appended = match (&estimate, deskew_only) {
+        (Some(estimate), false) => Some(lite_record::odometry::append(&mut appender, estimate, &plan.tree)?),
+        _ => None,
+    };
+    let deskewed = match (spool, &estimate) {
+        (Some(spool), Some(estimate)) => spool.drain_into(&mut appender, &estimate.lidar_frame)?,
+        (Some(spool), None) => {
+            spool.discard();
+            0
+        }
+        (None, _) => 0,
     };
     let total = appender.finish()?;
     print!("{}", lite_record::fixup::describe(&plan, static_messages));
@@ -381,6 +475,9 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
             lite_record::odometry::ODOMETRY_TOPIC,
             appended.child_frame
         );
+    }
+    if deskewed > 0 {
+        println!("appended {deskewed} {} clouds", lite_record::deskew::DESKEWED_TOPIC);
     }
     println!("{total} messages appended to {}; {}s", recording.display(), started.elapsed().as_secs());
     Ok(())

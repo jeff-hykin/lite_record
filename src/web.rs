@@ -200,6 +200,7 @@ fn urdf_payload(report: &crate::hub::UrdfReport) -> serde_json::Value {
         "problems": report
             .problems
             .iter()
+            .chain(report.tree_problems.iter())
             .map(crate::urdf::TreeProblem::message)
             .collect::<Vec<_>>(),
     })
@@ -223,6 +224,9 @@ fn status_payload(state: &AppState) -> serde_json::Value {
         // picks one, and the dropdown has to show what is really being encoded.
         "preview_topic": state.hub.preview_topic(),
         "urdf": urdf_payload(&urdf),
+        // What the last recording start said about the tree; the page shows it
+        // next to the record button so a broken rig is not a surprise later.
+        "tf_warning": state.hub.tree_warning(),
         "removable_mounts": privileged::likely_removable_mounts(),
         "is_root": privileged::is_root(),
         "has_password": !state.password().is_empty(),

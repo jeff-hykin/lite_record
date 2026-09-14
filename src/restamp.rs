@@ -82,17 +82,15 @@ impl ChannelClock {
 /// is nothing to compare, and nothing this can repair. `/tf` is skipped too —
 /// its stamps are written by this program, on the log clock by construction.
 pub fn survey(mapped: &[u8]) -> Result<BTreeMap<u16, ChannelClock>> {
-    let summary = mcap::Summary::read(mapped)?.context("the recording has no summary section")?;
-    let _ = summary;
+    mcap::Summary::read(mapped)?.context("the recording has no summary section")?;
     let mut topics: BTreeMap<u16, String> = BTreeMap::new();
     let mut offsets: BTreeMap<u16, Vec<i64>> = BTreeMap::new();
-    for message in mcap::MessageStream::new(mapped)? {
-        let message = message?;
+    crate::walk::for_each_message(mapped, |message| {
         if !repairable(&message.channel) {
-            continue;
+            return Ok(std::ops::ControlFlow::Continue(()));
         }
         let Some(header) = crate::cdr::decode_header(&message.data) else {
-            continue;
+            return Ok(std::ops::ControlFlow::Continue(()));
         };
         topics
             .entry(message.channel.id)
@@ -101,7 +99,8 @@ pub fn survey(mapped: &[u8]) -> Result<BTreeMap<u16, ChannelClock>> {
             .entry(message.channel.id)
             .or_default()
             .push(message.log_time as i64 - header.stamp_nanos() as i64);
-    }
+        Ok(std::ops::ControlFlow::Continue(()))
+    })?;
 
     let mut clocks = BTreeMap::new();
     for (id, mut seen) in offsets {
