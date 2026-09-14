@@ -42,9 +42,9 @@ enum Command {
     #[command(name = "survive_reboot", alias = "survive-reboot")]
     SurviveReboot,
 
-    /// Rewrite a recording in place, moving every jxl stream into a format
-    /// Foxglove can decode. The same work the UI's Post process button does,
-    /// for a rig with no browser pointed at it.
+    /// Rewrite a recording in place, moving every image stream into a format
+    /// Foxglove and rerun can both decode. The same work the UI's Post process
+    /// button does, for a rig with no browser pointed at it.
     #[command(name = "post_process", alias = "post-process")]
     PostProcess(PostProcessArgs),
 
@@ -227,7 +227,7 @@ fn load_urdf(path: Option<&Path>) -> Result<Option<lite_record::urdf::Urdf>> {
 }
 
 /// The three stages that turn a fresh recording into one that is viewable,
-/// placed and localised: decode jxl (a rewrite, skipped when there is none),
+/// placed and localised: recode the images (a rewrite, skipped when there is none),
 /// then complete the frame tree and estimate odometry (both appended).
 fn post_process(args: &PostProcessArgs) -> Result<()> {
     let PostProcessArgs {
@@ -289,7 +289,7 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
         },
         || match (dry_run, convert::needs_conversion(recording).map(|needed| needed || *fix_static_tf)) {
             (true, Ok(true)) => {
-                println!("{}: would convert jxl / refit camera infos (dry run)", recording.display());
+                println!("{}: would recode images / refit camera infos (dry run)", recording.display());
                 Err(convert::NothingToConvert.into())
             }
             (true, Ok(false)) => Err(convert::NothingToConvert.into()),

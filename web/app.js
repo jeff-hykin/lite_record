@@ -1481,7 +1481,7 @@ const openFileSheet = (file) => {
         actions.append(download)
 
         if (!isConverted(file.name)) {
-            const convert = action("secondary", "Post process", "Re-encode every JPEG XL stream into something Foxglove can draw: webp colour, png infrared, raw 16-bit depth. Lossless, and replaces this file in place — only if every frame decodes.")
+            const convert = action("secondary", "Post process", "Re-encode every image stream into something Foxglove and rerun can both draw: png colour and infrared, raw 16-bit depth. Lossless, and replaces this file in place — only if every frame decodes.")
             const start = (reclaim) =>
                 postJson(`/api/recordings/${encodeURIComponent(file.name)}/convert${reclaim ? "?reclaim=true" : ""}`)
             convert.addEventListener("click", async () => {

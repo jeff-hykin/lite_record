@@ -1,14 +1,25 @@
-//! Turning a finished recording into one Foxglove will draw.
+//! Turning a finished recording into one Foxglove and rerun will both draw.
 //!
 //! Images record as lossless JPEG XL, which is the right choice for the card —
 //! but Foxglove ships png, jpeg, webp and avif decoders and nothing for jxl, so
 //! every image panel comes up empty. There is no extension to install for it the
 //! way there was for RVL.
 //!
-//! So: decode every jxl frame and write it back in a format Foxglove has a
-//! decoder for, picked per pixel layout by [`viewable_format`]. All of them are
+//! So: decode every frame in a codec a viewer cannot draw and write it back in
+//! one it can, picked per pixel layout by [`viewable_format`]. All of them are
 //! lossless. The result is one file that is both the archive and the thing you
 //! look at, which is the point — a viewing copy would mean carrying two.
+//!
+//! The two viewers do not agree on what they can draw, and the overlap is one
+//! format wide. rerun 0.32's `MediaType` offers only jpeg, png and RVL — no
+//! webp — and dimos' `CompressedImage.to_rerun` decodes jpeg, png and jxl and
+//! raises on anything else. So jxl draws in rerun and not in Foxglove, webp
+//! draws in Foxglove and not in rerun, and **png is the only codec both read**.
+//! Colour therefore lands on png even though webp is smaller: a recording that
+//! one of the two tools cannot open is not converted, it is half converted.
+//! Frames already sitting in webp from an earlier conversion are re-encoded on
+//! the next pass, so a file caught by the old rule is mended by re-running
+//! `post_process` rather than by re-recording.
 //!
 //! The same pass also mends calibrations: a camera_info recorded with
 //! `distortion_model: "unknown"` — a RealSense inverse Brown-Conrady stream,
@@ -28,26 +39,32 @@ use mcap::sans_io::linear_reader::{LinearReadEvent, LinearReader, LinearReaderOp
 use serde::Serialize;
 
 use crate::cdr::{self, CdrReader};
-use crate::image::{compress, decode_jpegxl, ImageFormat};
+use crate::image::{compress, decode_jpegxl, decode_webp, ImageFormat};
 use crate::msgs::RawImage;
 
-/// What `format` on a CompressedImage looks like when the payload is JPEG XL.
-/// Matched case-insensitively because it is free text on the wire.
-const JXL_FORMATS: [&str; 2] = ["jxl", "jpegxl"];
+/// Reads one compressed frame back into pixels.
+type Decoder = fn(&[u8]) -> Result<RawImage>;
+
+/// The codecs a rewrite decodes out of, and what reads each one. jxl is what
+/// the recorder writes and no Foxglove build can draw; webp is what colour
+/// frames were rewritten as before rerun turned out to have no webp media type.
+/// Matched case-insensitively because `format` is free text on the wire.
+const RECODED_FORMATS: [(&str, Decoder); 3] =
+    [("jxl", decode_jpegxl), ("jpegxl", decode_jpegxl), ("webp", decode_webp)];
 
 /// The suffix a compressed image topic carries, and which the decoded topic drops
 /// so the two can coexist in one file. Applied when recording, see
 /// [`crate::record`].
 pub const COMPRESSED_SUFFIX: &str = "/compressed";
 
-/// The recording is already in a form Foxglove can draw. Not a failure — the
+/// The recording is already in a form both viewers can draw. Not a failure — the
 /// CLI treats it as "nothing to do here" and carries on to the other stages.
 #[derive(Debug)]
 pub struct NothingToConvert;
 
 impl std::fmt::Display for NothingToConvert {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "no jxl images or refittable camera infos — nothing to convert")
+        write!(formatter, "no re-encodable images or refittable camera infos — nothing to convert")
     }
 }
 
@@ -55,7 +72,7 @@ impl std::error::Error for NothingToConvert {}
 
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
-    /// Frames re-encoded out of jxl into something Foxglove can decode.
+    /// Frames re-encoded out of a codec one of the viewers cannot decode.
     pub decoded: u64,
     /// Camera infos rewritten from an "unknown" inverse Brown-Conrady
     /// calibration to a fitted forward plumb_bob one.
@@ -89,21 +106,33 @@ fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).map(|data| data.len()).unwrap_or(0)
 }
 
-fn is_jxl(format: &str) -> bool {
-    JXL_FORMATS.contains(&format.to_ascii_lowercase().as_str())
+/// The decoder for a `format` a rewrite should move off, or `None` when the
+/// frame is already in something both viewers read and should be copied through.
+fn decoder_for(format: &str) -> Option<Decoder> {
+    let format = format.to_ascii_lowercase();
+    RECODED_FORMATS
+        .iter()
+        .find(|(name, _)| *name == format)
+        .map(|(_, decode)| *decode)
 }
 
 /// What a decoded frame should be written back as, chosen by its pixel layout.
 ///
 /// Every option here is lossless, so this is only ever picking the smallest of
-/// the formats Foxglove can decode. Ratios are of the jxl payload each replaces,
-/// measured on frames off dimpi5 by `examples/recode_cost.rs`:
+/// the formats *both* Foxglove and rerun can decode. Ratios are of the jxl
+/// payload each replaces, measured on frames off dimpi5 by
+/// `examples/recode_cost.rs`:
 ///
 /// | layout            | raw   | png   | webp  |
 /// |-------------------|-------|-------|-------|
 /// | rgb8 colour       | 3.90x | 1.60x | 1.16x |
 /// | mono8 infrared    | 2.65x | 1.05x | 1.17x |
 /// | mono16 depth      | 6.20x | 1.36x |  n/a  |
+///
+/// Colour takes png rather than webp, which is smaller, because rerun cannot
+/// draw webp at all — see the module docs. The 1.60x against webp's 1.16x is
+/// of the payload, and most of the difference comes back out in the chunk's
+/// zstd; a colour stream rerun refuses to open costs more than that.
 ///
 /// Depth takes raw despite being the dearest of the three. A 16-bit png would be
 /// smaller on disk but Foxglove hands compressed images to the browser's image
@@ -117,23 +146,21 @@ fn is_jxl(format: &str) -> bool {
 fn viewable_format(encoding: &str) -> ImageFormat {
     match encoding {
         "mono16" | "16UC1" => ImageFormat::Raw,
-        "rgb8" | "bgr8" | "rgba8" | "bgra8" => ImageFormat::Webp,
+        "rgb8" | "bgr8" | "rgba8" | "bgra8" => ImageFormat::Png,
         _ => ImageFormat::Png,
     }
 }
 
-/// Reads the CompressedImage far enough to answer "is this jxl", then decodes it.
-/// Returns `None` for anything that is not a jxl frame, which is the signal to
-/// copy the message through instead.
+/// Reads the CompressedImage far enough to name its codec, then decodes it.
+/// Returns `None` for a frame already in a format both viewers read, which is
+/// the signal to copy the message through instead.
 fn decoded_frame(payload: &[u8]) -> Option<Result<RawImage>> {
     let mut reader = CdrReader::new(payload);
     let header = reader.header();
     let format = reader.string();
-    if !is_jxl(&format) {
-        return None;
-    }
+    let decode = decoder_for(&format)?;
     let compressed = reader.bytes();
-    Some(decode_jpegxl(&compressed).map(|mut image| {
+    Some(decode(&compressed).map(|mut image| {
         // The decoder knows the pixel layout but not where the frame came from,
         // and Foxglove needs the frame_id to place it against the camera info.
         image.header = header;
@@ -213,8 +240,9 @@ pub fn in_place(
     Ok(report)
 }
 
-/// Whether a rewrite would change anything: a jxl frame on any CompressedImage
-/// channel, or an "unknown"-model calibration on any CameraInfo channel. Read
+/// Whether a rewrite would change anything: a frame in a codec one of the
+/// viewers cannot draw on any CompressedImage channel, or an "unknown"-model
+/// calibration on any CameraInfo channel. Read
 /// from the first message of each such channel rather than by walking the
 /// file, so a second run — or a run that only wants the appended stages —
 /// answers in a moment instead of rewriting 63 GB to find out nothing changed.
@@ -252,7 +280,7 @@ pub fn needs_conversion(input: &Path) -> Result<bool> {
             if schema_name == Some(crate::msgs::COMPRESSED_IMAGE_TYPE) {
                 let mut reader = CdrReader::new(&message.data);
                 let _ = reader.try_header();
-                if reader.try_string().is_some_and(|format| is_jxl(&format)) {
+                if reader.try_string().is_some_and(|format| decoder_for(&format).is_some()) {
                     return Ok(true);
                 }
             } else if crate::distortion::parse_camera_info(&message.data).distortion_model

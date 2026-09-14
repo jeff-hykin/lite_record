@@ -144,9 +144,15 @@ another process, and re-engages it later without restarting `lite_record`.
 
 Foxglove ships png, jpeg, webp and avif decoders and nothing for jpeg-xl, so a jxl recording
 opens with every image panel blank. **Post process** rewrites the file in place, moving each
-jxl stream into the smallest format Foxglove can decode that still holds its pixels exactly:
-webp for colour, png for infrared, raw `16UC1` for depth. Nothing is thrown away, so the
-result is still the archive — there is no separate viewing copy to keep track of.
+image stream into the smallest format that still holds its pixels exactly and that *both*
+viewers can decode: png for colour and infrared, raw `16UC1` for depth. Nothing is thrown
+away, so the result is still the archive — there is no separate viewing copy to keep track of.
+
+The two viewers do not overlap by much. rerun 0.32 exposes jpeg, png and RVL and has no webp
+media type at all, while Foxglove has no jxl decoder — so jxl draws in rerun only, webp draws
+in Foxglove only, and png is the one codec both read. Colour used to come out as webp, which
+is about 1.4x smaller; it is png now, and a file converted under the old rule is mended by
+running post processing over it again rather than by re-recording.
 
 It costs disk. Measured on real recordings the file grows 15–26%, most of it raw depth that
 mcap's zstd only partly takes back, and the rewrite is written beside the original before it
@@ -175,8 +181,8 @@ lite_record post_process <file.mcap> [--urdf rig.urdf] [--no-odom] [--no-deskew]
                                      [--deskew-only] [--allow-tf-conflict] [--reclaim]
 ```
 
-It runs three stages. The jxl decode above is the first and is skipped when there is
-nothing to decode. The other two **append** to the file rather than rewriting it — the
+It runs three stages. The image recode above is the first and is skipped when there is
+nothing to recode. The other two **append** to the file rather than rewriting it — the
 summary is cut off, new chunks are written where it was, and a summary covering old and
 new is put back, so a 63 GB recording grows by the megabytes added and is never copied:
 

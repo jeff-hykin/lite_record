@@ -551,9 +551,9 @@ struct ConvertQuery {
     reclaim: bool,
 }
 
-/// Rewrites every jxl stream into a format Foxglove can decode, replacing the
-/// file in place once every frame has come through. Answers as soon as the job
-/// starts; `/api/convert` reports how far it has got.
+/// Rewrites every image stream into a format Foxglove and rerun can both decode,
+/// replacing the file in place once every frame has come through. Answers as
+/// soon as the job starts; `/api/convert` reports how far it has got.
 async fn convert_recording(
     Path(name): Path<String>,
     Query(query): Query<ConvertQuery>,

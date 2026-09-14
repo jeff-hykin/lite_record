@@ -61,13 +61,6 @@ fn read_compressed_image(message: &[u8]) -> (String, Vec<u8>) {
     (reader.string(), reader.bytes().to_vec())
 }
 
-fn decode_webp(encoded: &[u8]) -> Vec<u8> {
-    let mut decoder = image_webp::WebPDecoder::new(std::io::Cursor::new(encoded)).unwrap();
-    let mut pixels = vec![0u8; decoder.output_buffer_size().unwrap()];
-    decoder.read_image(&mut pixels).unwrap();
-    pixels
-}
-
 fn decode_png(encoded: &[u8]) -> Vec<u8> {
     let mut reader = png::Decoder::new(std::io::Cursor::new(encoded)).read_info().unwrap();
     let mut pixels = vec![0u8; reader.output_buffer_size().unwrap()];
@@ -494,8 +487,8 @@ fn converting_a_recording_moves_every_jxl_stream_to_a_format_foxglove_can_draw()
     let (color_schema, color_payloads) = &channels["/camera/color_image/compressed"];
     assert_eq!(color_schema, "sensor_msgs/msg/CompressedImage");
     let (format, encoded) = read_compressed_image(&color_payloads[0]);
-    assert_eq!(format, "webp", "Foxglove has no jxl decoder");
-    assert_eq!(decode_webp(&encoded), color_pixels, "the webp lost colour pixels");
+    assert_eq!(format, "png", "colour must land on the one codec Foxglove and rerun both read");
+    assert_eq!(decode_png(&encoded), color_pixels, "the png lost colour pixels");
 
     let (infra_schema, infra_payloads) = &channels["/camera/infrared_left/compressed"];
     assert_eq!(infra_schema, "sensor_msgs/msg/CompressedImage");
@@ -503,13 +496,95 @@ fn converting_a_recording_moves_every_jxl_stream_to_a_format_foxglove_can_draw()
     assert_eq!(format, "png", "Foxglove has no jxl decoder");
     assert_eq!(decode_png(&encoded), infrared, "the png lost infrared pixels");
 
-    // A second run finds no jxl left. It must refuse and leave the file alone,
+
+    // A second run finds nothing left that needs recoding. It must refuse and
+    // leave the file alone,
     // because a "conversion" that re-compresses an already-raw file in place
     // would churn every recording someone taps twice.
     let before = std::fs::read(source).unwrap();
     let error = convert::in_place(source, &progress, convert::Reclaim::No, &Default::default()).unwrap_err();
     assert!(error.to_string().contains("nothing to convert"), "{error}");
     assert_eq!(std::fs::read(source).unwrap(), before, "a refused conversion changed the file");
+
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+/// A colour frame that a previous conversion left in webp. Foxglove draws it,
+/// rerun cannot — `MediaType` has no webp — so the next pass must move it to
+/// png, which is the one codec both read, without touching a pixel.
+#[test]
+fn a_colour_stream_left_in_webp_is_recoded_as_png() {
+    let directory = std::env::temp_dir().join(format!("lite_record_webp_{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("webp_colour.mcap");
+
+    let pixels: Vec<u8> = (0..WIDTH * HEIGHT * 3).map(|index| (index * 31 % 251) as u8).collect();
+    let frame = RawImage {
+        header: Header::new(STAMP, "camera_color_optical_frame"),
+        width: WIDTH,
+        height: HEIGHT,
+        step: WIDTH * 3,
+        is_bigendian: 0,
+        encoding: "rgb8".to_string(),
+        data: pixels.clone(),
+    };
+    let webp = lite_record::image::compress(&frame, ImageFormat::Webp).unwrap();
+    assert_eq!(webp.format, "webp");
+    let encoded = lite_record::cdr::compressed_image(&webp);
+    const COPIES: u64 = 4;
+    {
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = mcap::WriteOptions::new()
+            .compression(Some(mcap::Compression::Zstd))
+            .profile("ros2")
+            .create(std::io::BufWriter::new(file))
+            .unwrap();
+        let schema = writer
+            .add_schema(encoded.schema_name, "ros2msg", encoded.schema_text.as_bytes())
+            .unwrap();
+        let channel = writer
+            .add_channel(schema, "/realsense/color_image/compressed", "cdr", &BTreeMap::new())
+            .unwrap();
+        for sequence in 0..COPIES {
+            writer
+                .write_to_known_channel(
+                    &mcap::records::MessageHeader {
+                        channel_id: channel,
+                        sequence: sequence as u32,
+                        log_time: STAMP + sequence,
+                        publish_time: STAMP + sequence,
+                    },
+                    &encoded.data,
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    assert!(
+        convert::needs_conversion(&path).unwrap(),
+        "a webp colour stream reads as already viewable, so nothing would ever mend it"
+    );
+
+    let progress = Arc::new(convert::Progress::default());
+    let report = convert::in_place(&path, &progress, convert::Reclaim::No, &Default::default()).unwrap();
+    assert_eq!(report.decoded, COPIES);
+    assert_eq!(report.failed, 0);
+
+    let channels = read_back(&path);
+    // Still a CompressedImage, so the topic keeps its suffix — only depth, which
+    // comes out raw, drops it.
+    let (schema, payloads) = &channels["/realsense/color_image/compressed"];
+    assert_eq!(schema, "sensor_msgs/msg/CompressedImage");
+    assert_eq!(payloads.len(), COPIES as usize);
+    let (format, data) = read_compressed_image(&payloads[0]);
+    assert_eq!(format, "png", "colour must land on the one codec Foxglove and rerun both read");
+    assert_eq!(decode_png(&data), pixels, "the webp -> png hop changed a pixel");
+
+    // Run two: png is already viewable everywhere, so the file must be refused
+    // rather than churned through another decode.
+    let error = convert::in_place(&path, &progress, convert::Reclaim::No, &Default::default()).unwrap_err();
+    assert!(error.to_string().contains("nothing to convert"), "{error}");
 
     std::fs::remove_dir_all(&directory).ok();
 }
