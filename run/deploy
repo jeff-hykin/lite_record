@@ -15,7 +15,10 @@ UNIT="/etc/systemd/system/lite_record.service"
 git add -A
 
 echo "Building aarch64 musl ..."
-out=$(nix build .#linux-arm64 --no-link --print-out-paths | tail -1)
+# --out-link, not --no-link: see the note in run/build. A deploy that has to
+# rebuild the cross toolchain because the last one was garbage-collected is the
+# difference between a minute and an evening.
+out=$(nix build .#linux-arm64 --out-link result-linux-arm64 --print-out-paths | tail -1)
 
 echo "Copying to $HOST ..."
 # Writing onto the running binary fails with ETXTBSY, so land it beside the

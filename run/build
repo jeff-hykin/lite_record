@@ -13,7 +13,12 @@ build() {
     local attribute="$1"
     local name="$2"
     echo "Building $name ..."
-    out=$(nix build ".#$attribute" --no-link --print-out-paths | tail -1)
+    # --out-link, not --no-link. Without a gc root the result is collectable the
+    # moment it is built, so the next `nix-collect-garbage` throws away a cross
+    # build that took hours -- and the toolchain under it. That is what made an
+    # aarch64 build we had already done rebuild GCC from source: its .drv was
+    # still in the store and its output was gone. The links are gitignored.
+    out=$(nix build ".#$attribute" --out-link "result-$attribute" --print-out-paths | tail -1)
     # Store outputs are mode 555 and cp preserves the source mode, so a second
     # run would hit EACCES overwriting the first run's file.
     install -m 755 "$out/bin/lite_record" "$DIST/$name"
