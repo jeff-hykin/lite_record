@@ -171,6 +171,19 @@ impl Naming {
         self.topic(stream.camera_info_leaf())
     }
 
+    /// `/realsense/depth_image/camera_info` -- the same intrinsics under the name
+    /// a ROS-convention viewer looks for.
+    ///
+    /// Foxglove pairs an image with its calibration by SIBLING topic: it appends
+    /// `/camera_info` to the image topic and uses whatever is there. Our canonical
+    /// name is a sibling of the image, not a child of it, so nothing pairs and the
+    /// panel reports "calibration topic doesn't exist" -- which is what a recording
+    /// of ours looks like when someone else opens it. dimos wants the canonical
+    /// name, so both are published rather than one being renamed.
+    pub fn sibling_camera_info_topic(&self, stream: StreamId) -> String {
+        format!("{}/camera_info", self.image_topic(stream))
+    }
+
     pub fn imu_topic(&self) -> String {
         self.topic(StreamId::Imu.topic_leaf())
     }

@@ -38,6 +38,10 @@ float64 z
 float64 w
 ";
 
+/// Clone so one encoding can be offered on more than one topic -- the same
+/// intrinsics go out under both the canonical and the sibling `camera_info` name,
+/// and encoding twice to avoid a copy would be the more expensive of the two.
+#[derive(Clone)]
 pub struct Encoded {
     pub schema_name: &'static str,
     pub schema_text: String,

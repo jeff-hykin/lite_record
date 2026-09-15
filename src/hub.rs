@@ -167,6 +167,27 @@ fn image_topics(settings: &Settings) -> Vec<String> {
 /// Built from the configs rather than parsed out of the topic string, because
 /// the prefixes are operator-editable: a rig that renames `/realsense` to
 /// `/front_cam` still has to be able to turn its colour stream off.
+/// Each canonical `camera_info` topic and the sibling name the same intrinsics are
+/// also published under, so a viewer that pairs by sibling can find them. Built by
+/// the same walk as [`topic_settings`] so the two cannot drift apart.
+fn camera_info_siblings(settings: &Settings) -> BTreeMap<String, String> {
+    let mut siblings = BTreeMap::new();
+    for config in [&settings.realsense, &settings.orbbec, &settings.oakd] {
+        for stream in [
+            StreamId::Depth,
+            StreamId::Color,
+            StreamId::InfraLeft,
+            StreamId::InfraRight,
+        ] {
+            siblings.insert(
+                config.naming.camera_info_topic(stream),
+                config.naming.sibling_camera_info_topic(stream),
+            );
+        }
+    }
+    siblings
+}
+
 fn topic_settings(settings: &Settings) -> BTreeMap<String, String> {
     let mut paths = BTreeMap::new();
     let cameras = [
@@ -544,7 +565,11 @@ impl Hub {
                 }
             }
             Produced::CameraInfo { topic, info } => {
-                self.offer(&topic, crate::cdr::camera_info(&info));
+                let encoded = crate::cdr::camera_info(&info);
+                if let Some(sibling) = camera_info_siblings(&self.settings.read().unwrap()).get(&topic) {
+                    self.offer(sibling, encoded.clone());
+                }
+                self.offer(&topic, encoded);
                 self.latest_intrinsics
                     .lock()
                     .unwrap()
@@ -977,10 +1002,15 @@ impl Hub {
         // grocery recording. The content is what matters here; the stamp only
         // says when this file learned it.
         let announced_at = record::now_nanos();
+        let siblings = camera_info_siblings(&self.settings.read().unwrap());
         for (topic, info) in &intrinsics {
             let mut info = info.clone();
             info.header = crate::msgs::Header::new(announced_at, info.header.frame_id);
-            recorder.offer(topic, crate::cdr::camera_info(&info));
+            let encoded = crate::cdr::camera_info(&info);
+            if let Some(sibling) = siblings.get(topic) {
+                recorder.offer(sibling, encoded.clone());
+            }
+            recorder.offer(topic, encoded);
         }
         *self.shed_baseline.lock().unwrap() = self.pipeline_dropped.lock().unwrap().clone();
         let status = recorder.status();
@@ -1879,8 +1909,43 @@ mod tests {
             topics.iter().any(|t| t == "/realsense/camera_info"),
             "got {topics:?}"
         );
+        // The same intrinsics under the name a viewer pairs by. Without this,
+        // Foxglove's image panel reports "calibration topic doesn't exist" on a
+        // recording that plainly contains the calibration.
+        assert!(
+            topics.iter().any(|t| t == "/realsense/color_image/camera_info"),
+            "no sibling camera_info; got {topics:?}"
+        );
         std::fs::remove_dir_all(&directory).ok();
         std::fs::remove_file(hub.settings_file()).ok();
+    }
+
+    /// The sibling name is derived from the IMAGE topic, not from the canonical
+    /// camera_info topic: a viewer appends `/camera_info` to whatever topic the
+    /// image is on, so deriving it from anything else pairs with nothing.
+    #[test]
+    fn the_sibling_camera_info_topic_hangs_off_the_image_topic() {
+        let naming = crate::sensors::Naming {
+            topic_prefix: "/realsense".into(),
+            frame_prefix: "camera".into(),
+        };
+        assert_eq!(
+            naming.sibling_camera_info_topic(StreamId::Color),
+            format!("{}/camera_info", naming.image_topic(StreamId::Color))
+        );
+        assert_eq!(
+            naming.sibling_camera_info_topic(StreamId::Color),
+            "/realsense/color_image/camera_info"
+        );
+        assert_eq!(
+            naming.sibling_camera_info_topic(StreamId::Depth),
+            "/realsense/depth_image/camera_info"
+        );
+        // Colour's canonical name is the bare one, so the two must not collide.
+        assert_ne!(
+            naming.sibling_camera_info_topic(StreamId::Color),
+            naming.camera_info_topic(StreamId::Color)
+        );
     }
 
     /// The calibration a camera announced at boot must not carry a boot-time
