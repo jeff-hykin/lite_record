@@ -53,109 +53,133 @@
                         ];
                     };
 
-                    commonArgs = {
-                        pname = "lite_record";
-                        version = "0.1.0";
-                        src = source;
-                        cargoLock.lockFile = ./Cargo.lock;
+                    # crate2nix, one derivation per crate, so editing this crate does not
+                    # rebuild its dependency tree. `Cargo.nix` is generated and committed
+                    # rather than produced at eval time: import-from-derivation would make
+                    # every evaluation -- `nix flake show` included -- wait on a build.
+                    # Regenerate after any Cargo.lock change with
+                    #   nix run github:nix-community/crate2nix -- generate -f ./Cargo.toml -o Cargo.nix
+                    #
+                    # Cross works by handing this the CROSS pkgs rather than by exporting
+                    # CC_<triple>/CXX_<triple>/AR_<triple> by hand: a cross stdenv already
+                    # sets those, and its cc wrapper already contributes every buildInput's
+                    # include and library paths. Same shape as ~/repos/g1_ps1.
+                    crate2nixFor = { targetPkgs, crateOverrides ? { }, rootFeatures ? [ "default" ] }:
+                        (import ./Cargo.nix {
+                            pkgs = targetPkgs;
+                            inherit rootFeatures;
+                            buildRustCrateForPkgs = cratePkgs: cratePkgs.buildRustCrate.override {
+                                defaultCrateOverrides = cratePkgs.defaultCrateOverrides // crateOverrides;
+                            };
+                        }).rootCrate.build;
+
+                    # gamut-jxl-sys cmake-builds a vendored libjxl, and finds the source
+                    # through `DEP_JXL_PATH`. Cargo would set that from jpegxl-src's `links`
+                    # key; buildRustCrate names DEP_ vars after the *crate* instead, so it
+                    # never arrives and the build script panics with "Source directory
+                    # .../libjxl does not exist". Same defect dimos works around in
+                    # dimos/mapping/dim_slam/rust/flake.nix for DEP_CUVSLAM_LIB_DIR.
+                    #
+                    # The hash is the one crate2nix put in Cargo.nix for jpegxl-src, so the
+                    # source here and the source it compiles against cannot drift.
+                    jpegxlSource = pkgs.runCommand "jpegxl-src-libjxl-0.12.0" { } ''
+                        tar -xzf ${pkgs.fetchurl {
+                            url = "https://static.crates.io/crates/jpegxl-src/jpegxl-src-0.12.0.crate";
+                            sha256 = "02hqjr37d4sw94w8k0rnd53rii8i1b0vgc7bvqbqas3gwd8nmx86";
+                        }}
+                        mv jpegxl-src-0.12.0/libjxl $out
+                    '';
+
+                    commonCrateOverrides = targetPkgs: {
+                        gamut-jxl-sys = attrs: {
+                            nativeBuildInputs = (attrs.nativeBuildInputs or [ ]) ++ [ pkgs.cmake ];
+                            DEP_JXL_PATH = "${jpegxlSource}";
+                        };
                     };
 
-                    native = rustPlatform.buildRustPackage commonArgs;
+                    # Upstream bug, and it survives the move to crate2nix: jpegxl-src 0.12.0
+                    # picks its C++ runtime with `cfg!(target_vendor = "apple")`, which a build
+                    # script evaluates against the machine doing the BUILDING, not the one being
+                    # built for. So building on a Mac makes every cross target ask for clang's
+                    # libc++, which a gcc toolchain does not ship, and the link dies with
+                    #   cannot find -lc++
+                    # right after libgamut_jxl_sys. `ld` reads any file it finds as a linker
+                    # script, so this hands it the runtime the toolchain actually has. Both names
+                    # are needed: the musl targets link -Bstatic and so look for the `.a`.
+                    #
+                    # Left out of the first crate2nix attempt on purpose, to find out whether a
+                    # real cross stdenv made it unnecessary. It did not -- x86 musl failed exactly
+                    # as above. Kept because a build said so, not because it was inherited.
+                    cxxRuntimeShim = pkgs.runCommand "libcxx-shim" { } ''
+                        mkdir -p $out/lib
+                        echo 'INPUT(-lstdc++)' > $out/lib/libc++.so
+                        echo 'INPUT(-lstdc++)' > $out/lib/libc++.a
+                    '';
 
-                    buildCross = { rustTarget, crossPkgs, features ? [ ], sdkLibraries ? [ ] }:
-                        let
-                            targetSnake = builtins.replaceStrings [ "-" ] [ "_" ] rustTarget;
-                            targetUpper = pkgs.lib.toUpper targetSnake;
-                            binDirectory = "${crossPkgs.stdenv.cc}/bin";
-                            prefix = crossPkgs.stdenv.cc.targetPrefix;
-                            featureFlag = pkgs.lib.optionalString (features != [ ])
-                                "--features ${pkgs.lib.concatStringsSep "," features}";
+                    # Only cross targets need it; a Mac really does have libc++.
+                    crossCrateOverrides = targetPkgs: (commonCrateOverrides targetPkgs) // {
+                        lite_record = attrs: {
+                            extraRustcOpts = (attrs.extraRustcOpts or [ ])
+                                ++ [ "-L native=${cxxRuntimeShim}/lib" ];
+                        };
+                    };
 
-                            # `-sys` crates find their SDK through pkg-config, which refuses a
-                            # cross build unless told the .pc files really do describe the
-                            # target. Exported here rather than as a derivation attribute
-                            # because stdenv already defines this one and would collide.
-                            # Nothing compiles against the SDK's headers -- realsense-sys ships
-                            # pre-generated bindings -- so only the .so and its .pc matter.
-                            allowCross = pkgs.lib.optionalString (sdkLibraries != [ ])
-                                "export PKG_CONFIG_ALLOW_CROSS=1";
+                    # The crate2nix native build, offered alongside the old one until the
+                    # cross targets are ported too -- so a regression is a comparison
+                    # rather than a bisect.
+                    nativeC2N = crate2nixFor {
+                        targetPkgs = pkgs;
+                        crateOverrides = commonCrateOverrides pkgs;
+                    };
 
-                            # Works around an upstream bug: jpegxl-src 0.12.0 picks the
-                            # C++ runtime to link with `cfg!(target_vendor = "apple")`,
-                            # which a build script evaluates against the machine doing
-                            # the building, not the machine being built for. Building on
-                            # a Mac therefore asks every cross target for clang's
-                            # `libc++`, which a gcc toolchain does not ship. `ld` reads
-                            # any file it finds as a linker script, so this hands it the
-                            # runtime the toolchain actually has. Both names are needed:
-                            # the musl targets link `-Bstatic` and so look for the `.a`.
-                            cxxRuntimeShim = pkgs.runCommand "libcxx-shim" { } ''
-                                mkdir -p $out/lib
-                                echo 'INPUT(-lstdc++)' > $out/lib/libc++.so
-                                echo 'INPUT(-lstdc++)' > $out/lib/libc++.a
-                            '';
-                        in
-                        rustPlatform.buildRustPackage (commonArgs // {
-                            pname = "lite_record-${rustTarget}";
+                    # musl, x86_64. No camera SDK, so nothing here needs a per-crate
+                    # override beyond the shared jpegxl and libc++ ones.
+                    #
+                    # NOT `isStatic = true`. Rust's musl target already links crt-static, so
+                    # the binary comes out static either way, and asking nixpkgs for a static
+                    # cross as well makes rustc emit `-static-pie` -- which then cannot link
+                    # the toolchain's own non-PIE libstdc++.a:
+                    #   relocation R_X86_64_32 against `__gxx_personality_v0` can not be used
+                    #   when making a PIE object
+                    # and libstdc++ is unavoidable here because gamut-jxl-sys pulls it in.
+                    x86MuslPkgs = crossPkgsFor "x86_64-unknown-linux-musl";
+                    linuxX86C2N = crate2nixFor {
+                        targetPkgs = x86MuslPkgs;
+                        crateOverrides = crossCrateOverrides x86MuslPkgs;
+                    };
 
-                            # The test binary is built for the foreign target and cannot run here.
-                            doCheck = false;
-
-                            buildPhase = ''
-                                runHook preBuild
-                                ${allowCross}
-                                cargo build --release --target ${rustTarget} ${featureFlag}
-                                runHook postBuild
-                            '';
-
-                            installPhase = ''
-                                runHook preInstall
-                                mkdir -p $out/bin
-                                install -m755 target/${rustTarget}/release/lite_record $out/bin/lite_record
-                                runHook postInstall
-                            '';
-
-                            # gamut-jxl-sys cmake-builds a vendored libjxl. `dontUseCmakeConfigure`
-                            # keeps cmake's setup hook from replacing the configure phase that
-                            # buildRustPackage needs to vendor the registry.
-                            nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config ];
-                            dontUseCmakeConfigure = true;
-
-                            "CARGO_TARGET_${targetUpper}_LINKER" = "${binDirectory}/${prefix}cc";
-
-                            # zstd-sys, lz4-sys and ring compile C from build scripts. Without
-                            # these cc-rs reaches for the host clang with --target=<triple>,
-                            # which has no matching sysroot and dies on `#include <string.h>`.
-                            "CC_${targetSnake}" = "${binDirectory}/${prefix}cc";
-                            "CXX_${targetSnake}" = "${binDirectory}/${prefix}c++";
-                            "AR_${targetSnake}" = "${binDirectory}/${prefix}ar";
-
-                            PKG_CONFIG_PATH = pkgs.lib.concatMapStringsSep ":"
-                                (library: "${pkgs.lib.getDev library}/lib/pkgconfig") sdkLibraries;
-
-                            # Two separate jobs for the sdk libraries here.
-                            #
-                            # `-L native=` is a workaround for an upstream bug:
-                            # librealsense ships a realsense2.pc that hardcodes
-                            # `libdir=''${prefix}/lib/x86_64-linux-gnu` -- there is a
-                            # literal `#TODO` above that line -- no matter which
-                            # architecture it was built for. So pkg-config sends the
-                            # linker to an x86 path inside the aarch64 package and
-                            # `-lrealsense2` is not found. The true directory is passed
-                            # explicitly rather than trusting the .pc.
-                            #
-                            # The rpath is unrelated: the SDK is a dynamic .so, so the
-                            # binary must carry its store path to start on the target.
-                            # Deploy with `nix copy --to ssh://<host>` to bring it along.
-                            "CARGO_TARGET_${targetUpper}_RUSTFLAGS" =
-                                pkgs.lib.concatStringsSep " "
-                                    ([ "-L native=${cxxRuntimeShim}/lib" ]
-                                        ++ map
-                                        (library:
-                                            "-L native=${pkgs.lib.getLib library}/lib"
-                                            + " -C link-arg=-Wl,-rpath,${pkgs.lib.getLib library}/lib")
-                                        sdkLibraries);
-                        });
+                    # The Pi. Every camera in one binary, so unplugging a sensor is not a
+                    # rebuild; a backend that finds no hardware reports itself disengaged.
+                    #
+                    # Only two crates need anything beyond the cross stdenv:
+                    #   realsense-sys  -- the SDK, found through pkg-config. PKG_CONFIG_ALLOW_CROSS
+                    #                     because pkg-config refuses a cross build otherwise, and
+                    #                     an explicit -L because librealsense's own realsense2.pc
+                    #                     hardcodes libdir=''${prefix}/lib/x86_64-linux-gnu whatever
+                    #                     it was built for (there is a literal #TODO above the line).
+                    #   lite_record    -- depthai, whose public headers include their dependencies'
+                    #                     headers directly and whose build script stdenv adds no
+                    #                     target include paths to, so each one has to be named.
+                    linuxArm64C2N = crate2nixFor {
+                        targetPkgs = aarch64Gnu;
+                        rootFeatures = [ "default" "realsense" "oakd" "livox" ];
+                        crateOverrides = (crossCrateOverrides aarch64Gnu) // {
+                            realsense-sys = attrs: {
+                                nativeBuildInputs = (attrs.nativeBuildInputs or [ ]) ++ [ pkgs.pkg-config ];
+                                buildInputs = (attrs.buildInputs or [ ]) ++ [ aarch64Gnu.librealsense ];
+                                PKG_CONFIG_ALLOW_CROSS = 1;
+                                extraLinkFlags = [ "-L${pkgs.lib.getLib aarch64Gnu.librealsense}/lib" ];
+                            };
+                            lite_record = attrs: {
+                                extraRustcOpts = (attrs.extraRustcOpts or [ ])
+                                    ++ [ "-L native=${cxxRuntimeShim}/lib" ];
+                                DEPTHAI_DIR = depthaiCoreFor aarch64Gnu;
+                                DEPTHAI_INCLUDE_DIRS = pkgs.lib.concatMapStringsSep ":"
+                                    (library: "${pkgs.lib.getDev library}/include")
+                                    (with aarch64Gnu; [ nlohmann_json spdlog fmt xtensor xtl ]);
+                            };
+                        };
+                    };
 
                     # The OAK-D's SDK. Not in nixpkgs, and its own build system
                     # wants to bootstrap vcpkg and reach the network for both its
@@ -343,6 +367,18 @@
                     # headless recorder ever opens a window, so the GUI is turned
                     # off. This is the difference between a cross build that
                     # finishes in minutes and one that does not finish at all.
+                    # The encode-cost bench as its own aarch64 binary, so the codec
+                    # decision can be measured on the Pi without putting a rust toolchain
+                    # there. It only touches `image` and `msgs`, so it needs neither the
+                    # camera SDKs nor their features -- plain musl is enough.
+                    linuxArm64BenchC2N =
+                        let musl = crossPkgsFor "aarch64-unknown-linux-musl"; in
+                        crate2nixFor {
+                            targetPkgs = musl;
+                            rootFeatures = [ "default" "bench" ];
+                            crateOverrides = crossCrateOverrides musl;
+                        };
+
                     aarch64Gnu = (crossPkgsFor "aarch64-unknown-linux-gnu").extend
                         (final: previous: {
                             v4l-utils = previous.v4l-utils.override { withGUI = false; };
@@ -439,55 +475,14 @@
                     # depthai ships no .pc file, only a CMake config, so it is
                     # found through `DEPTHAI_DIR` rather than the `sdkLibraries`
                     # pkg-config path every other SDK here uses.
-                    withDepthai = package: package.overrideAttrs (old: {
-                        DEPTHAI_DIR = depthaiCoreFor aarch64Gnu;
-
-                        # depthai's public headers include their dependencies'
-                        # headers directly, and cc-rs is invoked by a build script
-                        # that stdenv adds no target include paths to, so each one
-                        # has to be named.
-                        DEPTHAI_INCLUDE_DIRS = pkgs.lib.concatMapStringsSep ":"
-                            (library: "${pkgs.lib.getDev library}/include")
-                            (with aarch64Gnu; [ nlohmann_json spdlog fmt xtensor xtl ]);
-                    });
                 in
                 {
-                    lite_record = native;
-                    default = native;
-                    linux-x86 = buildCross {
-                        rustTarget = "x86_64-unknown-linux-musl";
-                        crossPkgs = crossPkgsFor "x86_64-unknown-linux-musl";
-                    };
-                    # Every camera in one binary, so unplugging a sensor is not a
-                    # rebuild. A backend that finds no hardware just reports
-                    # itself disengaged, which costs nothing at runtime.
-                    linux-arm64 = withDepthai (buildCross {
-                        rustTarget = "aarch64-unknown-linux-gnu";
-                        crossPkgs = aarch64Gnu;
-                        features = [ "realsense" "oakd" "livox" ];
-                        sdkLibraries = [ aarch64Gnu.librealsense ];
-                    });
-                    # The encode-cost bench as its own aarch64 binary, so the codec
-                    # decision can be measured on the Pi without putting a rust
-                    # toolchain there. It only touches `image` and `msgs`, so it does
-                    # not need the realsense feature or its SDK.
-                    linux-arm64-bench = (buildCross {
-                        rustTarget = "aarch64-unknown-linux-musl";
-                        crossPkgs = crossPkgsFor "aarch64-unknown-linux-musl";
-                    }).overrideAttrs (old: {
-                        pname = "lite_record-bench-aarch64-unknown-linux-musl";
-                        buildPhase = ''
-                            runHook preBuild
-                            cargo build --release --target aarch64-unknown-linux-musl --example encode_cost
-                            runHook postBuild
-                        '';
-                        installPhase = ''
-                            runHook preInstall
-                            mkdir -p $out/bin
-                            install -m755 target/aarch64-unknown-linux-musl/release/examples/encode_cost $out/bin/encode_cost
-                            runHook postInstall
-                        '';
-                    });
+                    lite_record = nativeC2N;
+                    default = nativeC2N;
+
+                    linux-x86 = linuxX86C2N;
+                    linux-arm64 = linuxArm64C2N;
+                    linux-arm64-bench = linuxArm64BenchC2N;
                     depthai-arm64 = depthaiCoreFor aarch64Gnu;
                 }
                 # Only ever consumed by the Linux-only `cameras` shell, and its

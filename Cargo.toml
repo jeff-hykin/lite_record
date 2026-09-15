@@ -14,8 +14,21 @@ path = "src/lib.rs"
 name = "lite_record"
 path = "src/main.rs"
 
+# The encode-cost bench, a real binary rather than an example, so it can be
+# cross-built for the Pi like anything else: crate2nix generates derivations from
+# the crate's declared targets and examples are not among them. Gated behind a
+# feature so an ordinary `cargo build` does not pay for it.
+#
+#   cargo run --bin encode_cost --features bench
+[[bin]]
+name = "encode_cost"
+path = "src/bin/encode_cost.rs"
+required-features = ["bench"]
+
 [features]
 default = []
+# Builds the encode-cost bench binary. See the [[bin]] above.
+bench = []
 # Every vendor SDK is opt-in so the crate builds and tests on a laptop with no
 # hardware and no SDK installed.
 realsense = ["dep:realsense-sys"]
