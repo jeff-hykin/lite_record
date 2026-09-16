@@ -1,0 +1,78 @@
+# Builds lite_record for the three platforms dtk knows how to fetch, and keeps a
+# release tagged `latest` pointing at them, so
+# https://github.com/jeff-hykin/lite_record/releases/latest/download/lite_record-<platform>
+# is always the newest build of main.
+name: release
+
+on:
+    push:
+        branches: [main]
+    workflow_dispatch:
+
+permissions:
+    contents: write
+
+jobs:
+    linux-x86:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: DeterminateSystems/nix-installer-action@main
+            - uses: DeterminateSystems/magic-nix-cache-action@main
+            # static musl, no camera SDKs; the lidar works without one
+            - run: nix build .#linux-x86 --print-build-logs
+            - run: install -m755 result/bin/lite_record lite_record-x86_64-linux
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: linux-x86
+                  path: lite_record-x86_64-linux
+
+    linux-arm64:
+        # Its own job because this one cross-builds librealsense and depthai-core
+        # from source, and so gets its own time budget.
+        runs-on: ubuntu-latest
+        timeout-minutes: 350
+        steps:
+            - uses: actions/checkout@v4
+            - uses: DeterminateSystems/nix-installer-action@main
+            - uses: DeterminateSystems/magic-nix-cache-action@main
+            # every camera in one binary, so unplugging a sensor is not a rebuild
+            - run: nix build .#linux-arm64 --print-build-logs
+            - run: install -m755 result/bin/lite_record lite_record-aarch64-linux
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: linux-arm64
+                  path: lite_record-aarch64-linux
+
+    macos:
+        # apple silicon
+        runs-on: macos-14
+        steps:
+            - uses: actions/checkout@v4
+            - uses: dtolnay/rust-toolchain@stable
+            # nix would work here too, but a nix-built mac binary links against
+            # /nix/store dylibs and will not run on a Mac without nix.
+            - run: cargo build --release --locked
+            - run: install -m755 target/release/lite_record lite_record-aarch64-macos
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: macos
+                  path: lite_record-aarch64-macos
+
+    release:
+        needs: [linux-x86, linux-arm64, macos]
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/download-artifact@v4
+              with:
+                  merge-multiple: true
+                  path: dist
+            - name: publish the `latest` release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  gh release delete latest --yes --cleanup-tag || true
+                  gh release create latest dist/* \
+                      --title "latest" \
+                      --notes "Built from ${{ github.sha }}"
