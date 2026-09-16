@@ -19,13 +19,16 @@ jobs:
             - uses: actions/checkout@v4
             - uses: DeterminateSystems/nix-installer-action@main
             - uses: DeterminateSystems/magic-nix-cache-action@main
-            # static musl, no camera SDKs; the lidar works without one
+            # musl, no camera SDKs; the lidar works without one
             - run: nix build .#linux-x86 --print-build-logs
-            - run: install -m755 result/bin/lite_record lite_record-x86_64-linux
+            - name: take the binary and the store paths it needs at runtime
+              run: |
+                  install -m755 result/bin/lite_record lite_record-x86_64-linux
+                  ./.github/export-closure.sh result lite_record-x86_64-linux.closure.gz
             - uses: actions/upload-artifact@v4
               with:
                   name: linux-x86
-                  path: lite_record-x86_64-linux
+                  path: lite_record-x86_64-linux*
 
     linux-arm64:
         # Its own job because this one cross-builds librealsense and depthai-core
@@ -38,11 +41,14 @@ jobs:
             - uses: DeterminateSystems/magic-nix-cache-action@main
             # every camera in one binary, so unplugging a sensor is not a rebuild
             - run: nix build .#linux-arm64 --print-build-logs
-            - run: install -m755 result/bin/lite_record lite_record-aarch64-linux
+            - name: take the binary and the store paths it needs at runtime
+              run: |
+                  install -m755 result/bin/lite_record lite_record-aarch64-linux
+                  ./.github/export-closure.sh result lite_record-aarch64-linux.closure.gz
             - uses: actions/upload-artifact@v4
               with:
                   name: linux-arm64
-                  path: lite_record-aarch64-linux
+                  path: lite_record-aarch64-linux*
 
     macos:
         # apple silicon
