@@ -24,7 +24,7 @@ jobs:
             - name: take the binary and the store paths it needs at runtime
               run: |
                   install -m755 result/bin/lite_record lite_record-x86_64-linux
-                  ./.github/export-closure.sh result lite_record-x86_64-linux.closure.gz
+                  ./.github/export-closure.sh result lite_record-x86_64-linux.runtime.tar.gz
             - uses: actions/upload-artifact@v4
               with:
                   name: linux-x86
@@ -44,7 +44,7 @@ jobs:
             - name: take the binary and the store paths it needs at runtime
               run: |
                   install -m755 result/bin/lite_record lite_record-aarch64-linux
-                  ./.github/export-closure.sh result lite_record-aarch64-linux.closure.gz
+                  ./.github/export-closure.sh result lite_record-aarch64-linux.runtime.tar.gz
             - uses: actions/upload-artifact@v4
               with:
                   name: linux-arm64
