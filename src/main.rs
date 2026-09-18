@@ -185,6 +185,11 @@ struct PostProcessArgs {
     #[arg(long)]
     deskew_only: bool,
 
+    /// Skip the raycast voxel map that otherwise appends /global_map and writes
+    /// a .pc2.lcm beside the recording.
+    #[arg(long)]
+    no_raytrace: bool,
+
     /// Append a transform even when the recording already places that frame.
     ///
     /// Off by default, because appending cannot remove: writing a second value
@@ -270,6 +275,7 @@ fn load_urdf(path: Option<&Path>) -> Result<Option<lite_record::urdf::Urdf>> {
 fn post_process(args: &PostProcessArgs) -> Result<()> {
     let PostProcessArgs {
         recording, reclaim, no_odom, urdf, lidar_topic, imu_topic, dry_run, trajectory, fix_clocks,
+        no_raytrace,
         fix_static_tf, max_speed, no_deskew, deskew_only, allow_tf_conflict,
     } = args;
     let (recording, reclaim, no_odom, dry_run) = (recording.as_path(), *reclaim, *no_odom, *dry_run);
@@ -476,6 +482,12 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
         } else {
             println!("nothing to append; {}s", started.elapsed().as_secs());
         }
+        // Having nothing to append says nothing about the map: a recording that
+        // already carries its odometry and clouds reaches here every time, and
+        // it is exactly the one a second run is meant to add a map to.
+        if !dry_run && !*no_raytrace {
+            raytrace_stage(recording)?;
+        }
         return Ok(());
     }
     if !plan.conflicting.is_empty() && !*allow_tf_conflict {
@@ -518,6 +530,68 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
         println!("appended {deskewed} {} clouds", lite_record::deskew::DESKEWED_TOPIC);
     }
     println!("{total} messages appended to {}; {}s", recording.display(), started.elapsed().as_secs());
+    if !*no_raytrace {
+        raytrace_stage(recording)?;
+    }
+    Ok(())
+}
+
+/// Builds the raycast voxel map and writes it back, once the clouds and poses
+/// it reads are actually in the file.
+///
+/// This runs as its own pass rather than riding along with the estimator,
+/// because it reads the motion-compensated clouds the estimator only finishes
+/// writing at the append above.
+fn raytrace_stage(recording: &Path) -> Result<()> {
+    let already = lite_record::raytrace::already_present(recording)?;
+    if already > 0 {
+        println!(
+            "{} already carries {already} {} message(s); not mapping again",
+            recording.display(),
+            lite_record::raytrace::GLOBAL_MAP_TOPIC,
+        );
+        return Ok(());
+    }
+    let opened = lite_record::topics::Recording::open(recording)?;
+    // A recording with no odometry has nothing to place scans by. That is a
+    // reason to say so and move on, not to fail a run whose other stages worked.
+    if opened.channel(lite_record::odometry::ODOMETRY_TOPIC).is_err() {
+        println!(
+            "no {} in the recording, so there is nothing to build a map from",
+            lite_record::odometry::ODOMETRY_TOPIC,
+        );
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    println!("building the voxel map (this takes a while)");
+    let scans = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let watched = Arc::clone(&scans);
+    let map = with_ticker(
+        move || format!("{} scans", watched.load(std::sync::atomic::Ordering::Relaxed)),
+        || {
+            lite_record::raytrace::build(
+                &opened,
+                lite_record::deskew::DESKEWED_TOPIC,
+                lite_record::odometry::ODOMETRY_TOPIC,
+                lite_record::odometry::ODOM_FRAME,
+                &scans,
+            )
+        },
+    )?;
+    let beside = lite_record::raytrace::write(recording, &map)?;
+    println!(
+        "  {} voxels at {} m from {} scans{} -> {} and {}",
+        map.points(),
+        map.voxel_size,
+        map.scans,
+        match map.unplaced {
+            0 => String::new(),
+            n => format!(", {n} scan(s) with no pose left out"),
+        },
+        lite_record::raytrace::GLOBAL_MAP_TOPIC,
+        beside.display(),
+    );
+    println!("  voxel map in {}s", started.elapsed().as_secs());
     Ok(())
 }
 

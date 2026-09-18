@@ -1,0 +1,18 @@
+[package]
+name = "voxel_ray_tracing"
+version = "0.1.0"
+edition = "2021"
+description = "dimos' raycast-clearing voxel mapper, lifted out of the dimos module runtime so a recording can be mapped offline."
+license = "Apache-2.0"
+
+[lib]
+name = "voxel_ray_tracing"
+path = "src/lib.rs"
+
+[dependencies]
+ahash = "0.8"
+arrayvec = "0.7"
+nalgebra = "0.35.0"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+validator = { version = "0.21", features = ["derive"] }

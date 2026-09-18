@@ -55,6 +55,8 @@ memmap2 = "0.9"
 png = "0.18.1"
 # Point-LIO, run over a recording after the fact. See vendor/pointlio_rs/README.md.
 pointlio_rs = { path = "vendor/pointlio_rs" }
+# dimos' raycast-clearing voxel mapper, same arrangement. See vendor/voxel_ray_tracing/src/lib.rs.
+voxel_ray_tracing = { path = "vendor/voxel_ray_tracing" }
 quick-xml = "0.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

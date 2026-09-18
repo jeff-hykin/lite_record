@@ -246,7 +246,7 @@ impl TfHistory {
 }
 
 /// The xyz of every point, in whatever frame the cloud was stored.
-fn cloud_points(cloud: &CloudView<'_>) -> Result<Vec<[f32; 3]>> {
+pub(crate) fn cloud_points(cloud: &CloudView<'_>) -> Result<Vec<[f32; 3]>> {
     if cloud.is_bigendian {
         bail!("big-endian point data is not supported");
     }
