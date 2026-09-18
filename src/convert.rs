@@ -654,6 +654,11 @@ fn by_chunk(
         let before = rewriter.written();
         for message in summary.stream_chunk(mapped, chunk)? {
             rewriter.write(&message?)?;
+            // Per message rather than per chunk: one chunk of jxl is minutes of
+            // decoding on the Pi, and a progress line that reads zero for all of
+            // it is indistinguishable from a hung job. Bytes still only move at
+            // the flush below, because until then nothing is on the disk.
+            progress.messages.store(rewriter.written(), Ordering::Relaxed);
         }
         // Ends the output chunk and pushes it through the BufWriter, so what we
         // are about to read back is actually on the disk.
