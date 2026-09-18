@@ -113,16 +113,21 @@ fn nearest<'a>(poses: &'a [StampedPose], stamp: f64) -> &'a StampedPose {
     }
 }
 
-/// What a run produced, for the caller's progress line.
+/// How often the accumulating map is written out, in scans. The lidar runs at
+/// 10 Hz, so every tenth scan is one snapshot a second.
 ///
-/// The map is one message covering the whole run, and a viewer shows the latest
-/// message at or before the playhead -- so stamping it at the end, when it was
-/// finished, hides it for the entire recording bar the last frame. It is
-/// stamped at the *first* scan that went into it instead, which is the earliest
-/// moment it can honestly be said to describe, and makes it visible wherever
-/// you scrub.
+/// The map is worth watching build, not just seeing finished: a single message
+/// covering the whole run would only ever draw at whatever instant it carried,
+/// and every other moment on the timeline would show the live scan and nothing
+/// else. Snapshots cost size -- the last ones are the full map -- which is why
+/// this is a second rather than every frame.
+pub const SNAPSHOT_EVERY_SCANS: usize = 10;
+
+/// What a run produced.
 pub struct Map {
-    pub cloud: PointCloud2,
+    /// The accumulating map over time, oldest first, each stamped at the scan
+    /// that completed it. The last is the whole run.
+    pub snapshots: Vec<(u64, PointCloud2)>,
     pub scans: usize,
     /// Scans with no pose within tolerance, which are left out rather than
     /// placed somewhere wrong.
@@ -131,8 +136,42 @@ pub struct Map {
 }
 
 impl Map {
+    /// Points in the finished map.
     pub fn points(&self) -> usize {
-        self.cloud.width as usize
+        self.snapshots.last().map_or(0, |(_, cloud)| cloud.width as usize)
+    }
+
+    /// The finished map, which is what goes in the `.pc2.lcm`.
+    pub fn final_cloud(&self) -> Option<&PointCloud2> {
+        self.snapshots.last().map(|(_, cloud)| cloud)
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.snapshots.iter().map(|(_, cloud)| cloud.data.len()).sum()
+    }
+}
+
+/// A flat xyz triple list as a `PointCloud2` in `frame`.
+fn cloud_of(flat: &[f32], stamp_nanos: u64, frame: &str) -> PointCloud2 {
+    let mut data = Vec::with_capacity(flat.len() * 4);
+    for value in flat {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+    let points = (flat.len() / 3) as u32;
+    PointCloud2 {
+        header: Header::new(stamp_nanos, frame),
+        height: 1,
+        width: points,
+        fields: vec![
+            PointField { name: "x".into(), offset: 0, datatype: crate::msgs::POINT_FIELD_FLOAT32, count: 1 },
+            PointField { name: "y".into(), offset: 4, datatype: crate::msgs::POINT_FIELD_FLOAT32, count: 1 },
+            PointField { name: "z".into(), offset: 8, datatype: crate::msgs::POINT_FIELD_FLOAT32, count: 1 },
+        ],
+        is_bigendian: false,
+        point_step: 12,
+        row_step: 12 * points,
+        data,
+        is_dense: true,
     }
 }
 
@@ -151,7 +190,8 @@ pub fn build(
     let channel = recording.channel(cloud_topic)?;
     let mut mapper = Mapper::new(config);
     let (mut scans, mut unplaced) = (0usize, 0usize);
-    let mut first_stamp_nanos = u64::MAX;
+    let mut snapshots: Vec<(u64, PointCloud2)> = Vec::new();
+    let mut last_stamp_nanos = 0u64;
 
     for message in recording.messages(channel.id, None)? {
         let message = message?;
@@ -165,7 +205,7 @@ pub fn build(
             unplaced += 1;
             continue;
         }
-        first_stamp_nanos = first_stamp_nanos.min(message.log_time);
+        last_stamp_nanos = message.log_time;
         // A Livox sweep is a fixed 20064 slots and the ones that got no return
         // are written as (0, 0, 0). Deskewing rotates those off the origin
         // rather than dropping them, so they arrive as a shell of points within
@@ -188,37 +228,24 @@ pub fn build(
         );
         scans += 1;
         scans_done.fetch_add(1, Ordering::Relaxed);
+        if scans % SNAPSHOT_EVERY_SCANS == 0 {
+            snapshots.push((message.log_time, cloud_of(&mapper.global_points(), message.log_time, world_frame)));
+        }
     }
     if scans == 0 {
         bail!("no scan on {cloud_topic} had a pose on {odom_topic} within {tolerance} s");
     }
 
-    let flat = mapper.global_points();
-    let mut data = Vec::with_capacity(flat.len() * 4);
-    for value in &flat {
-        data.extend_from_slice(&value.to_le_bytes());
+    // The last scan rarely lands on the snapshot cadence, and the finished map
+    // is the one thing that must be in there -- it is what the .pc2.lcm carries
+    // and what anyone scrubbing to the end expects to see.
+    if snapshots.last().is_none_or(|(stamp, _)| *stamp != last_stamp_nanos) {
+        snapshots.push((
+            last_stamp_nanos,
+            cloud_of(&mapper.global_points(), last_stamp_nanos, world_frame),
+        ));
     }
-    let points = flat.len() / 3;
-    Ok(Map {
-        cloud: PointCloud2 {
-            header: Header::new(first_stamp_nanos, world_frame),
-            height: 1,
-            width: points as u32,
-            fields: vec![
-                PointField { name: "x".into(), offset: 0, datatype: crate::msgs::POINT_FIELD_FLOAT32, count: 1 },
-                PointField { name: "y".into(), offset: 4, datatype: crate::msgs::POINT_FIELD_FLOAT32, count: 1 },
-                PointField { name: "z".into(), offset: 8, datatype: crate::msgs::POINT_FIELD_FLOAT32, count: 1 },
-            ],
-            is_bigendian: false,
-            point_step: 12,
-            row_step: 12 * points as u32,
-            data,
-            is_dense: true,
-        },
-        scans,
-        unplaced,
-        voxel_size,
-    })
+    Ok(Map { snapshots, scans, unplaced, voxel_size })
 }
 
 /// Writes the map into the recording as [`GLOBAL_MAP_TOPIC`] and beside it as a
@@ -228,22 +255,29 @@ pub fn build(
 /// CDR so anything reading the mcap sees it, the file is LCM because that is
 /// what dimos' map tooling opens.
 pub fn write(recording: &std::path::Path, map: &Map) -> Result<std::path::PathBuf> {
-    let encoded = crate::cdr::point_cloud2(&map.cloud);
+    let Some(final_cloud) = map.final_cloud() else {
+        bail!("the map came out empty");
+    };
+    let sample = crate::cdr::point_cloud2(final_cloud);
     let mut appender = crate::mcap_append::Appender::open(recording)?;
-    let schema = appender.schema(encoded.schema_name, "ros2msg", encoded.schema_text.as_bytes());
+    let schema = appender.schema(sample.schema_name, "ros2msg", sample.schema_text.as_bytes());
     let channel = appender.channel(
         GLOBAL_MAP_TOPIC,
         schema,
         "cdr",
         &crate::record::channel_metadata(GLOBAL_MAP_TOPIC),
     );
-    let stamp = map.cloud.header.stamp_sec as u64 * 1_000_000_000
-        + map.cloud.header.stamp_nsec as u64;
-    appender.write(channel, stamp, encoded.data)?;
+    // In log-time order, which is the order a reader will want them, and each at
+    // the scan that completed it so the map grows as the recording plays.
+    for (stamp, cloud) in &map.snapshots {
+        appender.write(channel, *stamp, crate::cdr::point_cloud2(cloud).data)?;
+    }
     appender.finish()?;
 
+    // The file beside it is the finished map, not the series: it is a single
+    // cloud by definition, and what anybody opening it wants is the whole thing.
     let beside = recording.with_extension("pc2.lcm");
-    std::fs::write(&beside, crate::lcm::point_cloud2(&map.cloud))
+    std::fs::write(&beside, crate::lcm::point_cloud2(final_cloud))
         .with_context(|| format!("could not write {}", beside.display()))?;
     Ok(beside)
 }
