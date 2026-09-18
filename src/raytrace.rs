@@ -61,12 +61,6 @@ pub fn default_config(world_frame: &str) -> Config {
     }
 }
 
-struct StampedPose {
-    stamp: f64,
-    position: (f32, f32, f32),
-    orientation: (f32, f32, f32, f32),
-}
-
 /// Header stamps are the sensor's own clock; a stream whose header clock is off
 /// still sorts correctly by log time, so fall back to it the way heatmap does.
 fn stamp_seconds(header: &Header, log_time: u64) -> f64 {
@@ -74,43 +68,6 @@ fn stamp_seconds(header: &Header, log_time: u64) -> f64 {
         return log_time as f64 / 1e9;
     }
     header.stamp_sec as f64 + header.stamp_nsec as f64 / 1e9
-}
-
-fn read_poses(recording: &Recording, topic: &str) -> Result<Vec<StampedPose>> {
-    let channel = recording.channel(topic)?;
-    let mut poses = Vec::new();
-    for message in recording.messages(channel.id, None)? {
-        let message = message?;
-        let pose = crate::cdr::decode_odometry(&message.data)
-            .with_context(|| format!("message {} on {topic}", message.sequence))?;
-        poses.push(StampedPose {
-            stamp: stamp_seconds(&pose.header, message.log_time),
-            position: (
-                pose.position[0] as f32,
-                pose.position[1] as f32,
-                pose.position[2] as f32,
-            ),
-            orientation: (
-                pose.orientation[0] as f32,
-                pose.orientation[1] as f32,
-                pose.orientation[2] as f32,
-                pose.orientation[3] as f32,
-            ),
-        });
-    }
-    if poses.is_empty() {
-        bail!("no poses on {topic}");
-    }
-    poses.sort_by(|left, right| left.stamp.total_cmp(&right.stamp));
-    Ok(poses)
-}
-
-fn nearest<'a>(poses: &'a [StampedPose], stamp: f64) -> &'a StampedPose {
-    let after = poses.partition_point(|pose| pose.stamp < stamp).min(poses.len() - 1);
-    match after.checked_sub(1).map(|index| &poses[index]) {
-        Some(before) if (before.stamp - stamp).abs() < (poses[after].stamp - stamp).abs() => before,
-        _ => &poses[after],
-    }
 }
 
 /// How often the accumulating map is written out, in scans. The lidar runs at
@@ -175,18 +132,27 @@ fn cloud_of(flat: &[f32], stamp_nanos: u64, frame: &str) -> PointCloud2 {
     }
 }
 
-/// Folds every scan on `cloud_topic`, placed by `odom_topic`, into one map.
+/// Folds every scan on `cloud_topic` into one map, each placed by walking tf
+/// from the cloud's own frame up to the world.
+///
+/// **Not** by the odometry pose directly. The estimator's pose is for the body
+/// -- `odom -> base_link` once a urdf has re-rooted it -- while the clouds are
+/// stamped in `livox_frame`, and between them sit the mount joints, including
+/// the Mid-360's 90 degree rotation. Applying the body pose to lidar-frame
+/// points turns every scan by that mount and the map comes out an inflated
+/// blob rather than a building. tf already carries the whole chain, moving
+/// edges and fixed ones alike, so walking it is both correct and indifferent to
+/// where the odometry happens to be rooted.
 pub fn build(
     recording: &Recording,
     cloud_topic: &str,
-    odom_topic: &str,
+    tf_topic: &str,
     world_frame: &str,
     scans_done: &Arc<AtomicU64>,
 ) -> Result<Map> {
     let config = default_config(world_frame);
-    let tolerance = config.tf_match_tolerance_s;
     let voxel_size = config.voxel_size;
-    let poses = read_poses(recording, odom_topic)?;
+    let transforms = crate::heatmap::TfHistory::read(recording, tf_topic)?;
     let channel = recording.channel(cloud_topic)?;
     let mut mapper = Mapper::new(config);
     let (mut scans, mut unplaced) = (0usize, 0usize);
@@ -198,10 +164,10 @@ pub fn build(
         let cloud = crate::cdr::decode_point_cloud2(&message.data)
             .with_context(|| format!("message {} on {cloud_topic}", message.sequence))?;
         let stamp = stamp_seconds(&cloud.header, message.log_time);
-        let pose = nearest(&poses, stamp);
-        // Placing a scan by a pose from a different part of the run puts a whole
-        // sweep somewhere it never was, which is worse than leaving it out.
-        if (pose.stamp - stamp).abs() > tolerance {
+        let (placement, root) = transforms.chain_to_root(&cloud.header.frame_id, stamp);
+        // A frame tf does not reach the world is a frame nothing can place, and
+        // guessing is worse than leaving the scan out.
+        if root != world_frame {
             unplaced += 1;
             continue;
         }
@@ -224,7 +190,19 @@ pub fn build(
         }
         mapper.add_frame(
             points,
-            MapperPose { position: pose.position, orientation: pose.orientation },
+            MapperPose {
+                position: (
+                    placement.translation[0] as f32,
+                    placement.translation[1] as f32,
+                    placement.translation[2] as f32,
+                ),
+                orientation: (
+                    placement.rotation[0] as f32,
+                    placement.rotation[1] as f32,
+                    placement.rotation[2] as f32,
+                    placement.rotation[3] as f32,
+                ),
+            },
         );
         scans += 1;
         scans_done.fetch_add(1, Ordering::Relaxed);
@@ -233,7 +211,7 @@ pub fn build(
         }
     }
     if scans == 0 {
-        bail!("no scan on {cloud_topic} had a pose on {odom_topic} within {tolerance} s");
+        bail!("tf never placed {cloud_topic}'s frame in {world_frame}");
     }
 
     // The last scan rarely lands on the snapshot cadence, and the finished map

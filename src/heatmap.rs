@@ -167,13 +167,13 @@ struct TfSample {
 /// moving odom->base_link from another — so edges are kept per child and
 /// looked up by stamp, with the static ones valid at every time.
 #[derive(Default)]
-struct TfHistory {
+pub(crate) struct TfHistory {
     dynamic: HashMap<String, Vec<TfSample>>,
     fixed: StaticTree,
 }
 
 impl TfHistory {
-    fn read(recording: &Recording, topic: &str) -> Result<Self> {
+    pub(crate) fn read(recording: &Recording, topic: &str) -> Result<Self> {
         let mut history = TfHistory::default();
         let channel = recording.channel(topic)?;
         for message in recording.messages(channel.id, None)? {
@@ -230,7 +230,7 @@ impl TfHistory {
 
     /// Walks `frame` up to the root of the tree at `stamp`, giving the pose of
     /// `frame` in that root and the root's name.
-    fn chain_to_root(&self, frame: &str, stamp: f64) -> (Pose, String) {
+    pub(crate) fn chain_to_root(&self, frame: &str, stamp: f64) -> (Pose, String) {
         let mut pose = Pose::IDENTITY;
         let mut cursor = frame.to_string();
         let mut seen = HashSet::new();

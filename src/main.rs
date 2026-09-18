@@ -572,7 +572,7 @@ fn raytrace_stage(recording: &Path) -> Result<()> {
             lite_record::raytrace::build(
                 &opened,
                 lite_record::deskew::DESKEWED_TOPIC,
-                lite_record::odometry::ODOMETRY_TOPIC,
+                lite_record::record::TF_TOPIC,
                 lite_record::odometry::ODOM_FRAME,
                 &scans,
             )
