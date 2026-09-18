@@ -68,9 +68,25 @@ pub fn geometry_drift(marker: &str, tree: &StaticTree, lidar_frame: &str) -> Opt
 
 /// The estimator's settings for a rig somebody carries.
 ///
-/// The one departure from the Mid-360 defaults is the velocity cap, and it
-/// matters more than it looks. A scan the filter cannot match sends the state
-/// off at metres per second and every pose after it is lost; the cap rolls that
+/// Two departures from the Go2's Mid-360 settings, and both matter.
+///
+/// The first is registration resolution. The Go2 preset downsamples each scan
+/// onto a 0.5 m grid before matching, which suits a robot driving through open
+/// space and throws away almost everything indoors: on the dimpi5 handheld run
+/// the median return is 2.3 m away, so a 0.5 m leaf leaves a couple of cells
+/// across a corridor to match on. The estimate still walks the right path --
+/// it is the placement that goes soft, which is why the odometry looks correct
+/// while the accumulated cloud smears. Measured on that recording, dropping
+/// `filter_size_surf` to 0.1 and the map/iVox grids to 0.25 left the trajectory
+/// alone (76.0 m of path against 80.2 m, same extent, no scans rejected, no
+/// points dropped) and put the same 7.0 M points into 71% fewer 5 cm cells.
+/// World z, which spread to 13.92 m of bogus height before, came back to 5.49 m
+/// -- tighter than a deformation-graph ICP pass over the old estimate managed.
+/// `ivox_resolution` must not exceed `filter_size_map`; see the note in
+/// pointlio_rs's `Config::default`.
+///
+/// The second is the velocity cap, and it matters more than it looks. A scan
+/// the filter cannot match sends the state off at metres per second and every pose after it is lost; the cap rolls that
 /// scan back and lets the next one try again. Point-LIO ships it disabled.
 /// Measured on the grocery recording: uncapped, x86 and aarch64 agree to under a
 /// micron for 648 s and then split at a single decision, the aarch64 run ending
@@ -79,6 +95,9 @@ pub fn geometry_drift(marker: &str, tree: &StaticTree, lidar_frame: &str) -> Opt
 pub fn handheld_config() -> Config {
     Config {
         max_velocity: HANDHELD_MAX_VELOCITY,
+        filter_size_surf: 0.1,
+        filter_size_map: 0.25,
+        ivox_resolution: 0.25,
         ..Config::go2_mid360()
     }
 }
@@ -433,9 +452,29 @@ mod tests {
         assert_eq!(config.max_velocity, HANDHELD_MAX_VELOCITY);
         assert!(config.max_velocity > 2.0, "a brisk walk must not be rejected");
         assert!(config.max_velocity < 10.0, "a runaway scan must be");
-        // Everything else is still the Mid-360 tuning.
-        assert_eq!(config.filter_size_map, Config::go2_mid360().filter_size_map);
+        // The extrinsic is still the Mid-360's.
         assert_eq!(config.lidar_to_imu_trans, Config::go2_mid360().lidar_to_imu_trans);
+    }
+
+    /// The Go2's 0.5 m leaves are for a robot in open space. Indoors they throw
+    /// away the geometry the scan match needs and the accumulated cloud smears
+    /// while the trajectory still looks right, so a handheld rig registers finer.
+    #[test]
+    fn the_handheld_estimator_registers_finer_than_the_robot_preset() {
+        let config = handheld_config();
+        let stock = Config::go2_mid360();
+        assert_eq!(config.filter_size_surf, 0.1);
+        assert_eq!(config.filter_size_map, 0.25);
+        assert_eq!(config.ivox_resolution, 0.25);
+        assert!(config.filter_size_surf < stock.filter_size_surf);
+        assert!(config.filter_size_map < stock.filter_size_map);
+        // map_incremental keeps one point per filter_size_map cell while the
+        // neighbour search pays for every point in its stencil, so an iVox
+        // coarser than the map cell multiplies that search for the same map.
+        assert!(
+            config.ivox_resolution <= config.filter_size_map,
+            "ivox_resolution must not exceed filter_size_map",
+        );
     }
 
     /// A recording keeps the geometry its odometry was computed under, so a
