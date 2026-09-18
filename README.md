@@ -102,6 +102,92 @@ inherit your shell's directory.
 Undo it with `sudo systemctl disable --now lite_record`, or on macOS
 `sudo launchctl bootout system/com.jeffhykin.lite_record`.
 
+## Network setup
+
+```sh
+sudo lite_record network              # the menu
+sudo lite_record network status       # report only, non-zero when something is broken
+sudo lite_record network wifi_add --ssid dimensional [--priority 50]
+sudo lite_record network ethernet [--interface eth0]
+```
+
+Saves the wifi profiles a headless rig needs to come back on its own, and tells you what
+is wrong with the ones it has. It needs root because it writes NetworkManager's profiles
+directly; the wifi password is read from the terminal with echo off, or from stdin for
+`wifi_add`, and is **never** passed to `nmcli ... wifi-sec.psk` — argv is world-readable
+through `/proc` for as long as the command runs.
+
+`status` exits non-zero when anything is broken, so it works as a health check from a
+script, which is the only way to ask a rig with no screen how it is.
+
+### What it checks, and why each one is there
+
+Every rule is one that cost real time:
+
+- **A filesystem with under 2 GB free.** netplan rewrites its files in place rather than
+  writing a temp file and renaming, so on a full card the truncate succeeds and the write
+  fails: the profile is gone, nothing is logged, and nothing tells you. This is the most
+  likely account of the dimpi5 failure below — a 114.8 GB recording filled the card at
+  03:43 on 2026-09-11 and three config files were emptied at 04:49.
+- **A 0-byte file in `/etc/netplan`.** The above, after the fact. On dimpi5 this deleted
+  `dimensional`, `JeffWifi` *and* the ethernet profile in one go, minutes after a new
+  network was added at a different house. The Pi then booted fine, radio enabled, with
+  `wlan0` sitting DOWN for four days — from outside, indistinguishable from dead
+  hardware. Profiles written by this tool live in NetworkManager's own keyfiles and are
+  not touched by a netplan rewrite.
+- **An access point in range with no saved password.** The shape of that same failure:
+  the network is right there at full signal and there is simply nothing to join it with.
+- **No saved wifi at all**, which means a rig that cannot phone home from anywhere.
+- **A wifi profile with autoconnect off**, which only joins when somebody asks it to —
+  and nobody can, on a rig with no screen.
+- **An ethernet port with only static profiles**, which cannot take an address from a
+  router, so the obvious recovery move does not work.
+
+### The ethernet port, and why it takes two profiles
+
+A Mid-360 link has no DHCP server, and an ordinary router has nothing at `192.168.1.50`.
+Serving both from one port cannot be done with one profile: NetworkManager treats an
+`ipv4.method=auto` whose lease never arrives as a failure of the whole connection, and
+with `ipv6.method=disabled` there is no second family to carry it, so any static address
+configured alongside goes down with it. On dimpi5 that ends in `IP configuration could
+not be reserved` and an interface with no address at all.
+
+So `network ethernet` adds a second profile, `eth0-dhcp`, above the lidar's:
+
+| profile | priority | ipv4 |
+| --- | --- | --- |
+| `eth0-dhcp` | 10 | `auto`, `may-fail=no`, 15 s timeout |
+| `mid360` | 0 | `manual`, `192.168.1.50/24`, `never-default=yes` |
+
+`may-fail=no` is the mechanism: it makes a dead DHCP server fail the connection outright
+rather than leaving the port up and address-less, and that failure is what hands the
+interface to the static profile. Verified across a reboot on dimpi5 — `eth0-dhcp` starts,
+times out after 15 s, `mid360` takes over with `192.168.1.50`, and the default route
+stays on wifi.
+
+The cost is that every boot with a lidar on the cable waits those 15 s before the point
+stream can start.
+
+### Getting back into a rig that has vanished
+
+The static lidar address is also the way in when wifi is gone. Cable the Pi to a laptop,
+give the laptop an address on the same `/24` **as an alias** so its own network is
+undisturbed, and ssh to the rig:
+
+```sh
+sudo ifconfig en7 alias 192.168.1.51 255.255.255.0   # macOS; `ip addr add` on Linux
+ssh dimos@192.168.1.50
+```
+
+Pick the interface by link state (`ifconfig en7 | grep status:` reading `active`), not by
+name. If ssh does not answer, `arp -an` on that interface still tells you something: an
+entry at all proves the rig booted and brought the port up, which separates a dead card
+from a network problem before you have a shell.
+
+Worth knowing when hunting for a rig on a LAN: **absent from ARP is much stronger evidence
+than absent from ping**, because a host answers ARP even when it drops ICMP. Sweep the
+subnet, then filter `arp -an` by the vendor prefix — a Pi 5 is `2c:cf:67` or `d8:3a:dd`.
+
 ## The web UI
 
 - **Record** — starts and stops one mcap file, and shows its size and message count while

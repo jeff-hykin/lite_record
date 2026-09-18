@@ -20,6 +20,7 @@ pub mod livox;
 pub mod livox_command;
 pub mod mcap_append;
 pub mod msgs;
+pub mod network;
 pub mod odometry;
 pub mod privileged;
 pub mod record;

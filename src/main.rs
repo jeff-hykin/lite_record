@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use lite_record::hub::{Hub, Settings};
 use lite_record::sensors::SensorKind;
-use lite_record::{convert, heatmap, service, video, web};
+use lite_record::{convert, heatmap, network, service, video, web};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -67,6 +67,44 @@ enum Command {
     /// Encode an image topic as an mp4 by piping its frames through ffmpeg.
     #[command(name = "to_video", alias = "to-video")]
     ToVideo(video::Options),
+
+    /// Set up the wifi and ethernet a headless rig needs to come back on its
+    /// own, and report what is wrong with what it has. Interactive with no
+    /// argument. Needs root, because it writes NetworkManager's profiles.
+    Network {
+        #[command(subcommand)]
+        what: Option<NetworkCommand>,
+    },
+}
+
+#[derive(Subcommand)]
+enum NetworkCommand {
+    /// Print the interfaces, the free space, and every problem found, then
+    /// exit non-zero if anything is broken. Safe to run as a health check.
+    Status,
+
+    /// Save one wifi network without a menu, for setting up a fleet.
+    ///
+    /// The password is read from stdin, never taken as a flag: an argument
+    /// would put it in argv, which any local user can read out of /proc, and
+    /// in the shell history of whoever ran it.
+    #[command(name = "wifi_add", alias = "wifi-add")]
+    WifiAdd {
+        #[arg(long)]
+        ssid: String,
+
+        /// Higher wins where more than one saved network is in range.
+        /// Defaults to just above the highest already saved.
+        #[arg(long)]
+        priority: Option<i32>,
+    },
+
+    /// Add the ethernet profile that tries DHCP first and falls back to the
+    /// lidar's static address when no DHCP server answers.
+    Ethernet {
+        #[arg(long, default_value = "eth0")]
+        interface: String,
+    },
 }
 
 #[derive(clap::Args)]
@@ -530,6 +568,16 @@ async fn main() -> Result<()> {
         }
         Some(Command::Heatmap(options)) => return heatmap::run(&options),
         Some(Command::ToVideo(options)) => return video::run(&options),
+        Some(Command::Network { what }) => {
+            return match what {
+                None => network::interactive(),
+                Some(NetworkCommand::Status) => network::status(),
+                Some(NetworkCommand::WifiAdd { ssid, priority }) => {
+                    network::wifi_add(&ssid, priority)
+                }
+                Some(NetworkCommand::Ethernet { interface }) => network::ethernet(&interface),
+            };
+        }
         None => {}
     }
 

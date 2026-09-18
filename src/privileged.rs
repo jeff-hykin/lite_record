@@ -29,8 +29,26 @@ impl Secret {
     }
 
     /// The only way out. Kept explicit and ugly so it is easy to grep for.
-    fn expose(&self) -> &str {
+    pub(crate) fn expose(&self) -> &str {
         &self.0
+    }
+
+    /// Length, for a validator that must reject a too-short wifi password
+    /// without any part of the password reaching the check.
+    pub fn exposed_len(&self) -> usize {
+        self.0.chars().count()
+    }
+
+    /// Whether this could be a pre-hashed 64-digit wpa key rather than a
+    /// passphrase.
+    pub fn is_ascii_hex(&self) -> bool {
+        !self.0.is_empty() && self.0.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    /// A control character would let a password close one section of a
+    /// NetworkManager keyfile and open another.
+    pub fn contains_control(&self) -> bool {
+        self.0.chars().any(char::is_control)
     }
 }
 
@@ -58,7 +76,7 @@ pub struct Planned {
 }
 
 impl Planned {
-    fn root(reason: &str, argv: &[&str]) -> Self {
+    pub(crate) fn root(reason: &str, argv: &[&str]) -> Self {
         Planned {
             argv: argv.iter().map(|part| part.to_string()).collect(),
             needs_root: true,
@@ -67,7 +85,7 @@ impl Planned {
         }
     }
 
-    fn user(reason: &str, argv: &[&str]) -> Self {
+    pub(crate) fn user(reason: &str, argv: &[&str]) -> Self {
         Planned {
             argv: argv.iter().map(|part| part.to_string()).collect(),
             needs_root: false,
@@ -76,7 +94,7 @@ impl Planned {
         }
     }
 
-    fn optional(mut self) -> Self {
+    pub(crate) fn optional(mut self) -> Self {
         self.optional = true;
         self
     }
