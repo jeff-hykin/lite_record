@@ -114,6 +114,13 @@ fn nearest<'a>(poses: &'a [StampedPose], stamp: f64) -> &'a StampedPose {
 }
 
 /// What a run produced, for the caller's progress line.
+///
+/// The map is one message covering the whole run, and a viewer shows the latest
+/// message at or before the playhead -- so stamping it at the end, when it was
+/// finished, hides it for the entire recording bar the last frame. It is
+/// stamped at the *first* scan that went into it instead, which is the earliest
+/// moment it can honestly be said to describe, and makes it visible wherever
+/// you scrub.
 pub struct Map {
     pub cloud: PointCloud2,
     pub scans: usize,
@@ -144,7 +151,7 @@ pub fn build(
     let channel = recording.channel(cloud_topic)?;
     let mut mapper = Mapper::new(config);
     let (mut scans, mut unplaced) = (0usize, 0usize);
-    let mut last_stamp_nanos = 0u64;
+    let mut first_stamp_nanos = u64::MAX;
 
     for message in recording.messages(channel.id, None)? {
         let message = message?;
@@ -158,7 +165,7 @@ pub fn build(
             unplaced += 1;
             continue;
         }
-        last_stamp_nanos = message.log_time;
+        first_stamp_nanos = first_stamp_nanos.min(message.log_time);
         // A Livox sweep is a fixed 20064 slots and the ones that got no return
         // are written as (0, 0, 0). Deskewing rotates those off the origin
         // rather than dropping them, so they arrive as a shell of points within
@@ -194,7 +201,7 @@ pub fn build(
     let points = flat.len() / 3;
     Ok(Map {
         cloud: PointCloud2 {
-            header: Header::new(last_stamp_nanos, world_frame),
+            header: Header::new(first_stamp_nanos, world_frame),
             height: 1,
             width: points as u32,
             fields: vec![
