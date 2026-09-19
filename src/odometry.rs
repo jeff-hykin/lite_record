@@ -129,8 +129,10 @@ pub fn find_lidar_and_imu(summary: &mcap::Summary) -> Option<(String, String)> {
 
 pub struct Estimate {
     pub poses: Vec<PoseSample>,
-    /// How far the log clock runs ahead of the lidar's header stamps, seconds.
-    pub log_offset_seconds: f64,
+    /// How long the first scan took to reach the recorder: sweep duration plus
+    /// transport. Reported so a rig with a sick link is visible; **not** a clock
+    /// difference, and never added to a stamp. See [`Estimate::stamp_nanos`].
+    pub delivery_latency_seconds: f64,
     /// The frame the lidar's clouds are stamped in.
     pub lidar_frame: String,
     pub path_length_metres: f64,
@@ -148,8 +150,19 @@ impl Estimate {
         pose_of(sample).then(&self.lidar_in_imu)
     }
 
-    pub fn log_stamp_nanos(&self, sample: &PoseSample) -> u64 {
-        ((sample.time + self.log_offset_seconds) * NANOS_PER_SEC as f64).round() as u64
+    /// The instant this pose describes, on the clock every stream in the file
+    /// already shares.
+    ///
+    /// The estimator is fed the lidar's per-point absolute times and the IMU's
+    /// header stamps, both of which the recorder has already put on the host
+    /// clock, so `sample.time` needs no correction. This used to add the first
+    /// scan's `log_time - scan.start`, on the belief that it bridged two clocks.
+    /// It does not: that quantity is the 100 ms the Mid-360 spends sweeping
+    /// before it can send anything, plus transport. Adding it stamped every pose
+    /// and every tf edge ~101 ms after the instant it describes, which a viewer
+    /// and the raytracer both resolve into placing each scan a sweep stale.
+    pub fn stamp_nanos(&self, sample: &PoseSample) -> u64 {
+        (sample.time * NANOS_PER_SEC as f64).round() as u64
     }
 }
 
@@ -214,7 +227,7 @@ pub fn estimate(
     if lio.trajectory.is_empty() {
         bail!("no poses came out — is {lidar_topic} the lidar and {imu_topic} its imu?");
     }
-    let log_offset_seconds = mcap_input::log_time_offset(mapped, &config, lidar_topic)
+    let delivery_latency_seconds = mcap_input::log_time_offset(mapped, &config, lidar_topic)
         .map_err(|error| anyhow::anyhow!("{error}"))?
         .unwrap_or(0.0);
     let path_length_metres =
@@ -222,7 +235,7 @@ pub fn estimate(
     Ok(Estimate {
         rejected_scans: lio.rejected_scans,
         poses: lio.trajectory,
-        log_offset_seconds,
+        delivery_latency_seconds,
         lidar_frame,
         path_length_metres,
         lidar_in_imu,
@@ -292,7 +305,7 @@ pub fn append(appender: &mut Appender, estimate: &Estimate, tree: &StaticTree) -
 
     let mut odometry_messages = 0;
     for sample in &estimate.poses {
-        let stamp = estimate.log_stamp_nanos(sample);
+        let stamp = estimate.stamp_nanos(sample);
         let root_in_odom = estimate.lidar_pose(sample).then(&root_in_lidar);
         // The estimator's velocity is in the world frame; a Twist is in the
         // child frame, which is what anything integrating it assumes.
@@ -376,7 +389,7 @@ mod tests {
     fn estimate_with(poses: Vec<PoseSample>) -> Estimate {
         Estimate {
             poses,
-            log_offset_seconds: 2005.0,
+            delivery_latency_seconds: 2005.0,
             lidar_frame: "livox_frame".into(),
             path_length_metres: 0.0,
             rejected_scans: 0,
@@ -385,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn the_odometry_describes_the_tree_root_and_is_stamped_on_the_log_clock() {
+    fn the_odometry_describes_the_tree_root_and_keeps_the_estimator_s_own_instant() {
         let path = std::env::temp_dir().join(format!("lite_record_odom_{}.mcap", crate::record::now_nanos()));
         {
             let file = std::fs::File::create(&path).unwrap();
@@ -428,7 +441,9 @@ mod tests {
         assert_eq!(odometry.len(), 2);
         assert_eq!(odometry[0].header.frame_id, "odom");
         assert_eq!(odometry[0].child_frame_id, "base_link");
-        assert_eq!(odometry[0].header.stamp_nanos(), 2_015_000_000_000);
+        // `delivery_latency_seconds` is 2005 s here precisely so that adding it
+        // would be unmissable. The pose is the estimator's own instant, 10 s.
+        assert_eq!(odometry[0].header.stamp_nanos(), 10_000_000_000);
         // The lidar is 0.5 m above base_link and sits 4.4 cm above its own IMU,
         // so with the IMU at the origin the base is 0.5 - 0.044 below it.
         let base_z = odometry[0].position[2];
@@ -441,6 +456,17 @@ mod tests {
         let tf_messages = messages.iter().filter(|message| message.channel.topic == TF_TOPIC).count();
         assert_eq!(tf_messages, 2);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A pose stamped later than the instant it describes makes every viewer and
+    /// the raytracer place that scan against a stale transform; at a brisk pan
+    /// one sweep of error is metres at the far wall. The delivery latency is the
+    /// number that used to be added, so it is the one to prove absent.
+    #[test]
+    fn a_poses_stamp_is_never_moved_by_the_delivery_latency() {
+        let estimate = estimate_with(vec![sample(10.0, [0.0, 0.0, 0.0], 0.0)]);
+        assert_eq!(estimate.delivery_latency_seconds, 2005.0, "the test fixture must make a shift visible");
+        assert_eq!(estimate.stamp_nanos(&estimate.poses[0]), 10_000_000_000);
     }
 
     /// The cap is the whole reason two machines agree on this data, so it is
