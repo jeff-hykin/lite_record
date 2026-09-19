@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const LINUX_UNIT: &str = "/etc/systemd/system/lite_record.service";
+const LINUX_AUTOMOUNT_UNIT: &str = "/etc/systemd/system/lite_record-usb-mount@.service";
+const LINUX_AUTOMOUNT_RULE: &str = "/etc/udev/rules.d/99-lite_record-usb.rules";
+const LINUX_AUTOMOUNT_HELPER: &str = "/usr/local/lib/lite_record/usb_mount";
 const MACOS_LABEL: &str = "com.jeffhykin.lite_record";
 
 pub fn install(arguments: &[String], working_directory: &Path) -> Result<()> {
@@ -95,9 +98,11 @@ fn systemd_quote(value: &str) -> String {
 fn install_systemd(binary: &Path, arguments: &[String], working_directory: &Path) -> Result<()> {
     let unit = systemd_unit(binary, arguments, working_directory, &current_user()?);
     write_privileged(LINUX_UNIT, &unit)?;
+    install_usb_automount(&current_user()?)?;
     privileged("systemctl", &["daemon-reload"])?;
     privileged("systemctl", &["enable", "--now", "lite_record"])?;
     println!("\nlite_record now starts on boot.");
+    println!("  usb drives mount themselves under /media, where the page looks.");
     println!("  status:  systemctl status lite_record");
     println!("  logs:    journalctl -u lite_record -f");
     println!("  disable: sudo systemctl disable --now lite_record");
@@ -141,6 +146,123 @@ fn systemd_unit(binary: &Path, arguments: &[String], working_directory: &Path, u
          [Install]\n\
          WantedBy=multi-user.target\n",
         working = working_directory.display(),
+    )
+}
+
+/// Makes a plugged-in USB drive appear under `/media` on its own.
+///
+/// Without this the page's storage dropdown shows nothing when a drive is
+/// plugged in: `likely_removable_mounts` looks for *mounted* filesystems, and
+/// raspios headless mounts none of them — there is no desktop session running
+/// udisks to do it. The pieces are a udev rule that tags each new USB partition,
+/// a templated unit udev pulls in, and a helper that picks the mount options the
+/// filesystem will actually accept.
+fn install_usb_automount(user: &str) -> Result<()> {
+    write_privileged(LINUX_AUTOMOUNT_HELPER, &usb_mount_helper(user))?;
+    privileged("chmod", &["755", LINUX_AUTOMOUNT_HELPER])?;
+    write_privileged(LINUX_AUTOMOUNT_UNIT, AUTOMOUNT_UNIT)?;
+    write_privileged(LINUX_AUTOMOUNT_RULE, AUTOMOUNT_RULE)?;
+    privileged("udevadm", &["control", "--reload"])?;
+    // Drives plugged in before this ran get picked up now, rather than only
+    // after the next replug.
+    privileged(
+        "udevadm",
+        &["trigger", "--subsystem-match=block", "--action=add"],
+    )?;
+    Ok(())
+}
+
+/// `BindsTo` on the device is what unmounts the drive when it is yanked, so a
+/// stale mount point never outlives the disk behind it.
+const AUTOMOUNT_UNIT: &str = "[Unit]\n\
+     Description=lite_record automount for /dev/%i\n\
+     Requires=systemd-udevd.service\n\
+     BindsTo=dev-%i.device\n\
+     After=dev-%i.device\n\
+     \n\
+     [Service]\n\
+     Type=oneshot\n\
+     RemainAfterExit=yes\n\
+     ExecStart=/usr/local/lib/lite_record/usb_mount add %i\n\
+     ExecStop=/usr/local/lib/lite_record/usb_mount remove %i\n";
+
+/// `ENV{SYSTEMD_WANTS}` rather than `RUN{program}`, because udev kills anything
+/// slow it runs itself and mounting a cold spinning drive is not fast.
+/// `ID_FS_USAGE` skips the whole-disk node and any partition with no filesystem.
+const AUTOMOUNT_RULE: &str = "ACTION==\"add\", SUBSYSTEM==\"block\", ENV{ID_BUS}==\"usb\", \
+     ENV{ID_FS_USAGE}==\"filesystem\", TAG+=\"systemd\", \
+     ENV{SYSTEMD_WANTS}+=\"lite_record-usb-mount@%k.service\"\n";
+
+/// The owning uid is baked in at install time: the recorder writes as its own
+/// user, and exfat and vfat have no permission bits to inherit, so without
+/// `uid=` a drive mounts root-owned and every recording fails to save.
+fn usb_mount_helper(user: &str) -> String {
+    format!(
+        "#!/bin/bash\n\
+         # Installed by `lite_record install-service`. Mounts a USB partition\n\
+         # under /media, which is where the page's storage dropdown looks.\n\
+         set -u\n\
+         action=\"${{1:-}}\"\n\
+         device=\"${{2:-}}\"\n\
+         node=\"/dev/$device\"\n\
+         [ -n \"$device\" ] || exit 1\n\
+         \n\
+         owner=$(id -u {user} 2>/dev/null || echo 0)\n\
+         group=$(id -g {user} 2>/dev/null || echo 0)\n\
+         \n\
+         # The label is what a person recognises in the dropdown, but it is\n\
+         # optional and may hold anything, so keep only characters that are\n\
+         # unambiguous in a path and fall back to the kernel name.\n\
+         label=$(lsblk -no LABEL \"$node\" 2>/dev/null | head -1)\n\
+         label=$(printf '%s' \"$label\" | tr -c 'A-Za-z0-9._-' '_')\n\
+         [ -n \"$label\" ] || label=\"$device\"\n\
+         target=\"/media/$label\"\n\
+         \n\
+         if [ \"$action\" = remove ]; then\n\
+         \x20   # The disk is already gone, so its label cannot be read back and\n\
+         \x20   # the guess above may not be where it actually went. The kernel\n\
+         \x20   # still lists the stale mount against the node, so ask it.\n\
+         \x20   mounted=$(findmnt -n -o TARGET -S \"$node\" 2>/dev/null | head -1)\n\
+         \x20   [ -n \"$mounted\" ] && target=\"$mounted\"\n\
+         \x20   # A yanked drive can leave a plain umount blocking on dead IO,\n\
+         \x20   # and the detach is what frees /media for the next one.\n\
+         \x20   mountpoint -q \"$target\" && {{ umount \"$target\" || umount -l \"$target\"; }}\n\
+         \x20   case \"$target\" in /media/*) rmdir \"$target\" 2>/dev/null ;; esac\n\
+         \x20   exit 0\n\
+         fi\n\
+         \n\
+         # Already mounted somewhere (an fstab entry, or a rerun of this) is a\n\
+         # success, not a second mount point for the same disk.\n\
+         findmnt -n -S \"$node\" >/dev/null 2>&1 && exit 0\n\
+         \n\
+         # Two unlabelled drives, or two labelled the same, must not collide.\n\
+         suffix=2\n\
+         while mountpoint -q \"$target\"; do\n\
+         \x20   target=\"/media/$label-$suffix\"\n\
+         \x20   suffix=$((suffix + 1))\n\
+         done\n\
+         mkdir -p \"$target\"\n\
+         \n\
+         # vfat, exfat and ntfs carry no ownership of their own and reject the\n\
+         # permission options that the ones that do carry it require.\n\
+         fstype=$(lsblk -no FSTYPE \"$node\" 2>/dev/null | head -1)\n\
+         case \"$fstype\" in\n\
+         \x20   vfat|exfat|ntfs|ntfs3)\n\
+         \x20       options=\"uid=$owner,gid=$group,umask=022\" ;;\n\
+         \x20   *)\n\
+         \x20       options=\"\" ;;\n\
+         esac\n\
+         \n\
+         if [ -n \"$options\" ]; then\n\
+         \x20   mount -o \"$options\" \"$node\" \"$target\"\n\
+         else\n\
+         \x20   mount \"$node\" \"$target\"\n\
+         fi || {{ rmdir \"$target\" 2>/dev/null; exit 1; }}\n\
+         \n\
+         # An ext4 stick formatted elsewhere is root-owned; the recorder has to\n\
+         # be able to write to it without a password prompt nobody will see.\n\
+         [ -n \"$options\" ] || chown \"$owner:$group\" \"$target\"\n\
+         exit 0\n"
     )
 }
 
@@ -209,6 +331,61 @@ fn launchd_plist(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usb_rule_pulls_in_the_unit_only_for_a_usb_partition_with_a_filesystem() {
+        // Matching the whole-disk node too would try to mount /dev/sda and fail
+        // on every plug, and a non-usb match would grab the boot sd card.
+        assert!(AUTOMOUNT_RULE.contains("ENV{ID_BUS}==\"usb\""));
+        assert!(AUTOMOUNT_RULE.contains("ENV{ID_FS_USAGE}==\"filesystem\""));
+        assert!(AUTOMOUNT_RULE.contains("lite_record-usb-mount@%k.service"));
+        // udev kills its own RUN children, which is why this hands off to systemd.
+        assert!(!AUTOMOUNT_RULE.contains("RUN"));
+    }
+
+    #[test]
+    fn usb_unit_unmounts_when_the_device_disappears() {
+        assert!(AUTOMOUNT_UNIT.contains("BindsTo=dev-%i.device"));
+        assert!(AUTOMOUNT_UNIT.contains("ExecStop=/usr/local/lib/lite_record/usb_mount remove %i"));
+        assert!(AUTOMOUNT_UNIT.contains("RemainAfterExit=yes"));
+    }
+
+    #[test]
+    fn usb_helper_gives_the_drive_to_the_service_user_and_mounts_under_media() {
+        let helper = usb_mount_helper("dimos");
+        assert!(helper.starts_with("#!/bin/bash\n"));
+        // The uid is resolved on the pi, not baked in as a number, so an image
+        // reused on a rig with a different user still writes as that user.
+        assert!(helper.contains("owner=$(id -u dimos 2>/dev/null || echo 0)"));
+        // `likely_removable_mounts` only scans /media, /mnt and /run/media.
+        assert!(helper.contains("target=\"/media/$label\""));
+        // exfat and vfat reject nothing-to-inherit ownership; ext4 rejects uid=.
+        assert!(helper.contains("vfat|exfat|ntfs|ntfs3)"));
+        assert!(helper.contains("uid=$owner,gid=$group,umask=022"));
+    }
+
+    #[test]
+    fn usb_helper_keeps_a_label_from_escaping_its_mount_point() {
+        let helper = usb_mount_helper("dimos");
+        // A drive labelled `../../etc` must not become a mount point there.
+        assert!(helper.contains("tr -c 'A-Za-z0-9._-' '_'"));
+        // An unlabelled drive still needs a name.
+        assert!(helper.contains("[ -n \"$label\" ] || label=\"$device\""));
+        // Two drives sharing a label must not land on one point.
+        assert!(helper.contains("while mountpoint -q \"$target\""));
+    }
+
+    #[test]
+    fn usb_helper_unmounts_where_the_drive_actually_went() {
+        let helper = usb_mount_helper("dimos");
+        // On removal the label cannot be read back off a disk that is gone, so
+        // deriving the mount point from it again would unmount nothing.
+        assert!(helper.contains("findmnt -n -o TARGET -S \"$node\""));
+        // Dead IO on a yanked drive blocks a plain umount forever.
+        assert!(helper.contains("umount \"$target\" || umount -l \"$target\""));
+        // Whatever findmnt reports, only our own mount points get removed.
+        assert!(helper.contains("case \"$target\" in /media/*) rmdir"));
+    }
 
     #[test]
     fn systemd_arguments_survive_spaces_and_quotes() {
