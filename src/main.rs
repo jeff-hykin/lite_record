@@ -242,7 +242,29 @@ fn absolute(path: &Path) -> PathBuf {
 
 /// Runs `work` while printing `describe()` once a minute, so a stage that runs
 /// for an hour on a large recording never looks hung.
-fn with_ticker<T>(describe: impl Fn() -> String + Send + 'static, work: impl FnOnce() -> T) -> T {
+/// How often a run that is not on a terminal says it is still alive. A log wants
+/// a readable trail, not a line a second, but a minute of silence reads as hung.
+const LOG_TICK_SECONDS: u64 = 15;
+
+/// Runs `work`, saying what stage is in progress from the moment it starts and
+/// then how far in it is, so a long recording never looks like a hung process.
+///
+/// On a terminal that is one line redrawn every second. Piped to a file or to
+/// journald a carriage return would produce one enormous line, so there it is a
+/// fresh line every `LOG_TICK_SECONDS`.
+fn with_ticker<T>(
+    label: &str,
+    describe: impl Fn() -> String + Send + 'static,
+    work: impl FnOnce() -> T,
+) -> T {
+    use std::io::{IsTerminal, Write};
+
+    let interactive = std::io::stdout().is_terminal();
+    // Printed before the work starts rather than at the first tick: the point is
+    // that something appears the instant the stage begins.
+    println!("{label}...");
+    let _ = std::io::stdout().flush();
+
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let stopping = Arc::clone(&running);
     let ticker = std::thread::spawn(move || {
@@ -250,15 +272,53 @@ fn with_ticker<T>(describe: impl Fn() -> String + Send + 'static, work: impl FnO
         while stopping.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_secs(1));
             seconds += 1;
-            if seconds % 60 == 0 {
-                println!("  {:>6}s  {}", seconds, describe());
+            if interactive {
+                // \r and no newline, so the count updates in place. The trailing
+                // spaces wipe whatever a longer previous line left behind.
+                print!("\r  {seconds:>6}s  {}     ", describe());
+                let _ = std::io::stdout().flush();
+            } else if seconds % LOG_TICK_SECONDS == 0 {
+                println!("  {seconds:>6}s  {}", describe());
             }
         }
     });
     let result = work();
     running.store(false, std::sync::atomic::Ordering::Relaxed);
     let _ = ticker.join();
+    if interactive {
+        // The redrawn line is progress, not a result; leave the scrollback to
+        // the summary the caller prints next.
+        print!("\r\x1b[2K");
+        let _ = std::io::stdout().flush();
+    }
     result
+}
+
+#[cfg(test)]
+mod ticker_tests {
+    use super::*;
+
+    #[test]
+    fn the_label_appears_before_the_work_runs() {
+        // The complaint this answers was silence at the start, so the ordering
+        // is the point: the stage announces itself, then the work begins.
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&order);
+        with_ticker("stage", String::new, || seen.lock().unwrap().push("work"));
+        assert_eq!(*order.lock().unwrap(), vec!["work"]);
+    }
+
+    #[test]
+    fn a_log_tick_is_frequent_enough_to_not_look_hung() {
+        // A minute of nothing is what made a working run look dead.
+        let seconds = LOG_TICK_SECONDS;
+        assert!(seconds <= 30, "{seconds}s between log lines is too quiet");
+    }
+
+    #[test]
+    fn the_work_result_is_handed_back_untouched() {
+        assert_eq!(with_ticker("stage", String::new, || 7), 7);
+    }
 }
 
 fn load_urdf(path: Option<&Path>) -> Result<Option<lite_record::urdf::Urdf>> {
@@ -282,6 +342,10 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
     let deskew_only = *deskew_only;
     // Already there is a reason to skip, not to duplicate: appending cannot
     // remove the first set.
+    // These two survey the whole file before anything is written, which on a
+    // multi-gigabyte recording is a long time to show nothing at all -- the
+    // stage tickers below do not start until this is finished.
+    println!("reading {} ...", recording.display());
     let already_deskewed = lite_record::deskew::already_present(recording)?;
     let wants_deskew = !no_deskew && !dry_run && already_deskewed == 0;
     if already_deskewed > 0 && !no_deskew {
@@ -304,6 +368,8 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
     // Surveyed before anything is written, so the report describes the file as
     // it was handed over rather than as this run leaves it.
     let clocks = lite_record::restamp::survey_path(recording)?;
+    let size = std::fs::metadata(recording).map(|at| at.len()).unwrap_or(0);
+    println!("  {:.2} GB, {} streams", size as f64 / 1e9, clocks.len());
     print!("{}", lite_record::restamp::describe(&clocks));
     let shifts: std::collections::BTreeMap<u16, i64> = match *fix_clocks && !dry_run {
         true => clocks
@@ -324,6 +390,7 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
     let progress = Arc::new(convert::Progress::default());
     let watched = Arc::clone(&progress);
     let converted = with_ticker(
+        "recoding images and refitting camera infos",
         move || {
             format!(
                 "{} messages  {:.2} GB written",
@@ -427,23 +494,23 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
                 None
             }
             Some((lidar, imu)) => {
-                println!("estimating odometry from {lidar} + {imu} (this takes a while)");
                 if wants_deskew {
                     spool = Some(lite_record::deskew::Spool::beside(recording)?);
                 }
                 let scans = Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let watched = Arc::clone(&scans);
                 let estimate = with_ticker(
+                    &format!("estimating odometry from {lidar} + {imu}"),
                     move || format!("{} scans", watched.load(std::sync::atomic::Ordering::Relaxed)),
                     || lite_record::odometry::estimate(&mapped, &lidar, &imu, &scans, *max_speed, spool.as_mut()),
                 )?;
                 println!(
-                    "  {} poses, {:.1} m of path, {} scans rejected by the {} m/s cap, log clock {:+.3} s from the lidar's stamps",
+                    "  {} poses, {:.1} m of path, {} scans rejected by the {} m/s cap, first scan reached the recorder {:.3} s after it began",
                     estimate.poses.len(),
                     estimate.path_length_metres,
                     estimate.rejected_scans,
                     max_speed,
-                    estimate.log_offset_seconds
+                    estimate.delivery_latency_seconds
                 );
                 if let Some(spool) = spool.as_ref() {
                     println!(
@@ -563,10 +630,10 @@ fn raytrace_stage(recording: &Path) -> Result<()> {
         return Ok(());
     }
     let started = std::time::Instant::now();
-    println!("building the voxel map (this takes a while)");
     let scans = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let watched = Arc::clone(&scans);
     let map = with_ticker(
+        "building the voxel map",
         move || format!("{} scans", watched.load(std::sync::atomic::Ordering::Relaxed)),
         || {
             lite_record::raytrace::build(
