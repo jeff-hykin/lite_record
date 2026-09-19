@@ -90,7 +90,13 @@
                         mv jpegxl-src-0.12.0/libjxl $out
                     '';
 
+                    # build.rs bakes this into `--version`; the sandbox has no .git to ask.
+                    gitHash = self.shortRev or self.dirtyShortRev or "unknown";
+
                     commonCrateOverrides = targetPkgs: {
+                        lite_record = attrs: {
+                            LR_GIT_HASH = gitHash;
+                        };
                         gamut-jxl-sys = attrs: {
                             nativeBuildInputs = (attrs.nativeBuildInputs or [ ]) ++ [ pkgs.cmake ];
                             DEP_JXL_PATH = "${jpegxlSource}";
@@ -119,6 +125,7 @@
                     # Only cross targets need it; a Mac really does have libc++.
                     crossCrateOverrides = targetPkgs: (commonCrateOverrides targetPkgs) // {
                         lite_record = attrs: {
+                            LR_GIT_HASH = gitHash;
                             extraRustcOpts = (attrs.extraRustcOpts or [ ])
                                 ++ [ "-L native=${cxxRuntimeShim}/lib" ];
                         };
@@ -171,6 +178,7 @@
                                 extraLinkFlags = [ "-L${pkgs.lib.getLib aarch64Gnu.librealsense}/lib" ];
                             };
                             lite_record = attrs: {
+                                LR_GIT_HASH = gitHash;
                                 extraRustcOpts = (attrs.extraRustcOpts or [ ])
                                     ++ [ "-L native=${cxxRuntimeShim}/lib" ];
                                 DEPTHAI_DIR = depthaiCoreFor aarch64Gnu;

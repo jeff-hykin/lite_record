@@ -8,8 +8,33 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    build_id();
     orbbec();
     oakd();
+}
+
+/// Bakes the commit into `--version`, so which build a machine is running is
+/// answerable from the binary alone. A nix sandbox has no `.git`, so the flake
+/// hands the revision in as `LR_GIT_HASH` instead.
+fn build_id() {
+    println!("cargo:rerun-if-env-changed=LR_GIT_HASH");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    let id = std::env::var("LR_GIT_HASH")
+        .ok()
+        .filter(|hash| !hash.is_empty())
+        .unwrap_or_else(|| match git(&["rev-parse", "--short=9", "HEAD"]) {
+            None => "unknown".into(),
+            Some(hash) => {
+                let dirty = git(&["status", "--porcelain"]).is_some_and(|status| !status.is_empty());
+                if dirty { format!("{hash}-dirty") } else { hash }
+            }
+        });
+    println!("cargo:rustc-env=LR_BUILD_ID={id}");
+}
+
+fn git(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git").args(args).output().ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn orbbec() {

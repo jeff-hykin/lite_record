@@ -8,7 +8,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "lite_record", about = "Sensor recorder for handheld rigs")]
+#[command(
+    name = "lite_record",
+    about = "Sensor recorder for handheld rigs",
+    version = concat!(env!("CARGO_PKG_VERSION"), " ", env!("LR_BUILD_ID"))
+)]
 struct Args {
     #[arg(long, global = true, default_value_t = 8099)]
     port: u16,
