@@ -350,7 +350,9 @@ file or journald the same figures arrive as plain lines every 15 s with no escap
 `NO_COLOR` switches colour off on a terminal too.
 
 Every stage streams. The recording is mapped, never read into memory, and read in log-time
-order one chunk at a time; the recode writes its output as it goes; corrected clouds and map
+order one chunk at a time; the recode decodes a window of chunks on every core (as many
+chunks as there are cores, or 32 MiB of source, whichever is less — a few hundred megabytes
+decoded at once) and writes its output as it goes; corrected clouds and map
 snapshots are spooled to disk beside the recording and appended from there in chunks of
 4 MiB; the clock survey keeps a fixed-size sample per stream rather than one number per
 message. What remains proportional to the *recording* is bounded by its content, not its

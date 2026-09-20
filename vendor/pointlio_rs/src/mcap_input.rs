@@ -211,8 +211,15 @@ pub fn decode_cloud(data: &[u8], cfg: &Config) -> Option<Scan> {
 /// So merge the chunks by log time, opening each only when a message could come
 /// out of it, and keep the linear read for a file with no summary — one the
 /// recorder was killed part way through.
+///
+/// Only chunks that hold a message on one of `topics` are opened at all. A
+/// recording is mostly camera frames, in chunks the lidar and IMU never share,
+/// and decompressing those to find nothing was most of the estimator's time
+/// on a big file. A chunk with no message index says nothing about what it
+/// holds and is opened regardless, so a file without indexes reads as before.
 fn for_each_message(
     mapped: &[u8],
+    topics: &[&str],
     mut handle: impl FnMut(&mcap::Message<'_>) -> Result<bool, Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let indexed = match mcap::Summary::read(mapped) {
@@ -228,7 +235,21 @@ fn for_each_message(
         return Ok(());
     };
 
-    let mut chunks = summary.chunk_indexes.clone();
+    let wanted: std::collections::HashSet<u16> = summary
+        .channels
+        .values()
+        .filter(|channel| topics.contains(&channel.topic.as_str()))
+        .map(|channel| channel.id)
+        .collect();
+    let mut chunks: Vec<_> = summary
+        .chunk_indexes
+        .iter()
+        .filter(|chunk| {
+            chunk.message_index_offsets.is_empty()
+                || chunk.message_index_offsets.keys().any(|id| wanted.contains(id))
+        })
+        .cloned()
+        .collect();
     chunks.sort_by_key(|chunk| (chunk.message_start_time, chunk.chunk_start_offset));
 
     type Rest<'a> = Box<dyn Iterator<Item = mcap::McapResult<mcap::Message<'a>>> + 'a>;
@@ -285,7 +306,7 @@ pub fn log_time_offset(
     lidar_topic: &str,
 ) -> Result<Option<f64>, Box<dyn std::error::Error>> {
     let mut offset = None;
-    for_each_message(mapped, |message| {
+    for_each_message(mapped, &[lidar_topic], |message| {
         if message.channel.topic != lidar_topic {
             return Ok(true);
         }
@@ -335,7 +356,7 @@ pub fn for_each_package_raw(
     let mut first: Option<f64> = None;
     let mut scans = 0;
 
-    for_each_message(mapped, |message| {
+    for_each_message(mapped, &[lidar_topic, imu_topic], |message| {
         let topic = message.channel.topic.as_str();
         if topic == imu_topic {
             if let Some(sample) = decode_imu(&message.data) {

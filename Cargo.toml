@@ -39,6 +39,8 @@ h264 = ["dep:openh264"]
 all-sensors = ["realsense", "livox", "orbbec", "oakd"]
 
 [dependencies]
+# The recode decodes a window of chunks' frames on every core (convert.rs).
+rayon = "1"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 bytes = "1"

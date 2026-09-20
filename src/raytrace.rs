@@ -58,7 +58,10 @@ pub fn default_config(world_frame: &str) -> Config {
         region_percentile: 95.0,
         world_frame: world_frame.to_string(),
         tf_match_tolerance_s: 0.1,
-        worker_threads: 4,
+        // dimos pins this to four for a robot sharing its cores with everything
+        // else; a recording is mapped on a machine that has nothing better to
+        // do, and the raycasting scales with the threads it gets.
+        worker_threads: std::thread::available_parallelism().map_or(4, |cores| cores.get() as u32),
     }
 }
 

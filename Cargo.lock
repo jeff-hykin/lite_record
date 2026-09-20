@@ -1271,6 +1271,7 @@ dependencies = [
  "png",
  "pointlio_rs",
  "quick-xml",
+ "rayon",
  "re_rvl",
  "realsense-sys",
  "serde",

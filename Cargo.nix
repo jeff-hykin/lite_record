@@ -3846,6 +3846,10 @@ rec {
             packageId = "quick-xml";
           }
           {
+            name = "rayon";
+            packageId = "rayon";
+          }
+          {
             name = "realsense-sys";
             packageId = "realsense-sys";
             optional = true;

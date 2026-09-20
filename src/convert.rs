@@ -36,6 +36,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use mcap::sans_io::linear_reader::{LinearReadEvent, LinearReader, LinearReaderOptions};
+use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::cdr::{self, CdrReader};
@@ -152,6 +153,39 @@ fn viewable_format(encoding: &str) -> ImageFormat {
         "rgb8" | "bgr8" | "rgba8" | "bgra8" => ImageFormat::Png,
         _ => ImageFormat::Png,
     }
+}
+
+/// The part of a rewrite that is pure work on one message's bytes, so frames
+/// can be decoded on every core before the writer books them in order.
+/// Everything that touches the writer or the report stays sequential in
+/// `Rewriter::write_prepared`.
+enum Prepared {
+    /// A CompressedImage: the re-encoded frame, an error for one that would
+    /// not decode, or `None` for a frame already in a codec both viewers read.
+    Frame(Option<Result<cdr::Encoded>>),
+    /// Anything else, which the writer handles itself.
+    Other,
+}
+
+fn prepare(message: &mcap::Message) -> Prepared {
+    let schema_name = message.channel.schema.as_ref().map(|schema| schema.name.as_str());
+    if schema_name != Some(crate::msgs::COMPRESSED_IMAGE_TYPE) {
+        return Prepared::Other;
+    }
+    Prepared::Frame(decoded_frame(&message.data).map(|decoded| {
+        let image = decoded?;
+        Ok(match viewable_format(&image.encoding) {
+            ImageFormat::Raw => cdr::raw_image(&RawImage {
+                encoding: depth_encoding(&image.encoding).to_string(),
+                ..image
+            }),
+            // `viewable_format` exists to keep every layout on a format that
+            // can hold it, so the failure is only reachable if that slips.
+            format => cdr::compressed_image(
+                &compress(&image, format).context("no viewable format holds this pixel layout")?,
+            ),
+        })
+    }))
 }
 
 /// Reads the CompressedImage far enough to name its codec, then decodes it.
@@ -380,36 +414,24 @@ impl Rewriter {
     }
 
     fn write(&mut self, message: &mcap::Message) -> Result<()> {
+        self.write_prepared(message, prepare(message))
+    }
+
+    /// Books a message whose heavy work `prepare` has already done.
+    fn write_prepared(&mut self, message: &mcap::Message, prepared: Prepared) -> Result<()> {
         let channel = &message.channel;
         let schema_name = channel.schema.as_ref().map(|schema| schema.name.as_str());
 
-        let rewritten = if schema_name == Some(crate::msgs::COMPRESSED_IMAGE_TYPE) {
-            match decoded_frame(&message.data) {
-                Some(Ok(image)) => match viewable_format(&image.encoding) {
-                    ImageFormat::Raw => {
-                        self.report.decoded += 1;
-                        Some(cdr::raw_image(&RawImage {
-                            encoding: depth_encoding(&image.encoding).to_string(),
-                            ..image
-                        }))
-                    }
-                    format => match compress(&image, format) {
-                        Some(encoded) => {
-                            self.report.decoded += 1;
-                            Some(cdr::compressed_image(&encoded))
-                        }
-                        // Only reachable if a layout reaches a format that cannot
-                        // hold it, which `viewable_format` exists to prevent. Failing
-                        // here leaves the recording untouched rather than thinning it.
-                        None => {
-                            self.report.failed += 1;
-                            return Ok(());
-                        }
-                    },
-                },
+        let rewritten = if let Prepared::Frame(frame) = prepared {
+            match frame {
+                Some(Ok(encoded)) => {
+                    self.report.decoded += 1;
+                    Some(encoded)
+                }
+                // A frame that will not decode is dropped rather than written as
+                // broken pixels, and shows up in the report — which leaves the
+                // recording untouched rather than thinning it.
                 Some(Err(_)) => {
-                    // A frame that will not decode is dropped rather than written as
-                    // broken pixels, and shows up in the report.
                     self.report.failed += 1;
                     return Ok(());
                 }
@@ -610,11 +632,11 @@ fn whole_file(
 /// Converts one source chunk at a time, and — when asked — hands each source
 /// chunk back to the filesystem as soon as its replacement is on disk.
 ///
-/// The order matters and is the whole safety argument: a chunk is converted,
-/// flushed so it is a complete chunk record rather than a half-written
-/// compression stream, read back off the disk to prove it parses, and only then
-/// is the source's copy punched out. Nothing is ever released on the strength of
-/// a write that has not been verified.
+/// The order matters and is the whole safety argument: a window of chunks is
+/// converted, flushed so it ends on a complete chunk record rather than a
+/// half-written compression stream, read back off the disk to prove it parses,
+/// and only then are the source's copies punched out. Nothing is ever released
+/// on the strength of a write that has not been verified.
 ///
 /// What this cannot do is put the rewritten chunk back where the old one was.
 /// It is bigger — that is the point of the conversion — and every offset after
@@ -626,6 +648,9 @@ fn whole_file(
 /// longer a whole recording. If the job dies midway the messages all still
 /// exist, but split across the partial output and the un-punched tail of the
 /// source, and putting them back together is a manual job.
+/// Source bytes a decode window holds at once, see `by_chunk`.
+const WINDOW_BYTES: u64 = 32 << 20;
+
 fn by_chunk(
     mapped: &[u8],
     source: &File,
@@ -655,48 +680,97 @@ fn by_chunk(
     let mut checked = file_size(output);
     let mut reclaimed = 0;
 
-    for chunk in &chunks {
-        let before = rewriter.written();
-        for message in summary.stream_chunk(mapped, chunk)? {
-            let message = message?;
-            progress.gauge.at(message.log_time);
-            rewriter.write(&message)?;
-            // Per message rather than per chunk: one chunk of jxl is minutes of
-            // decoding on the Pi, and a progress line that reads zero for all of
-            // it is indistinguishable from a hung job. Bytes still only move at
-            // the flush below, because until then nothing is on the disk.
+    // The frames are decoded and re-encoded on every core -- that is nearly all
+    // of a rewrite's time, and a frame is independent of every other -- then
+    // booked in the writer one at a time, in the order they were read, so the
+    // output is the same file the sequential walk wrote. A recorder flushing
+    // many times a second leaves chunks of a handful of frames, too few to
+    // occupy the cores one chunk at a time, so a window of chunks is decoded
+    // together: as many as there are threads, or as many as fit
+    // `WINDOW_BYTES` of source, whichever comes first, which keeps what is
+    // held decoded at once to a few hundred megabytes.
+    let threads = rayon::current_num_threads().max(1);
+    let mut windows: Vec<&[mcap::records::ChunkIndex]> = Vec::new();
+    let mut start = 0;
+    while start < chunks.len() {
+        let mut end = start;
+        let mut bytes = 0;
+        while end < chunks.len()
+            && end - start < threads
+            && (end == start || bytes + chunks[end].chunk_length <= WINDOW_BYTES)
+        {
+            bytes += chunks[end].chunk_length;
+            end += 1;
+        }
+        windows.push(&chunks[start..end]);
+        start = end;
+    }
+    // The output is flushed, read back and released once per window rather
+    // than once per chunk: ending the output's compression stream thousands
+    // of times a file left the writer waiting on zstd for most of the rewrite,
+    // and the next window is decoded on the pool while this one is written,
+    // so the cores stay busy through the write as well.
+    type Decoded<'a> = Vec<Result<(Vec<mcap::Message<'a>>, Vec<Prepared>)>>;
+    let decode = |window: &[mcap::records::ChunkIndex]| -> Decoded<'_> {
+        window
+            .par_iter()
+            .map(|chunk| {
+                let messages: Vec<mcap::Message> =
+                    summary.stream_chunk(mapped, chunk)?.collect::<Result<_, _>>()?;
+                let prepared = messages.par_iter().map(prepare).collect();
+                Ok((messages, prepared))
+            })
+            .collect()
+    };
+    let mut upcoming = windows.first().map(|window| decode(window));
+    for (index, window) in windows.iter().enumerate() {
+        let decoded = upcoming.take().context("a window was decoded ahead")?;
+        let write = || -> Result<()> {
+            let before = rewriter.written();
+            for decoded in decoded {
+                let (messages, prepared) = decoded?;
+                for (message, prepared) in messages.iter().zip(prepared) {
+                    progress.gauge.at(message.log_time);
+                    rewriter.write_prepared(message, prepared)?;
+                    // Per message rather than per window: one window of jxl is
+                    // minutes of decoding on the Pi, and a progress line that
+                    // reads zero for all of it is indistinguishable from a hung
+                    // job. Bytes still only move at the flush below, because
+                    // until then nothing is on the disk.
+                    progress.messages.store(rewriter.written(), Ordering::Relaxed);
+                }
+            }
+            // Ends the output chunk and pushes it through the BufWriter, so
+            // what we are about to read back is actually on the disk.
+            rewriter.writer.flush()?;
+
+            let first = window[0].chunk_start_offset;
+            let grown = file_size(output);
+            let found = verify(output, checked, grown)
+                .with_context(|| format!("the output written for the chunks from {first} did not read back"))?;
+            let expected = rewriter.written() - before;
+            if found != expected {
+                anyhow::bail!("the chunks from {first} wrote {expected} messages but only {found} read back");
+            }
+            checked = grown;
+
+            if reclaim == Reclaim::AsItGoes {
+                for chunk in window.iter() {
+                    // The message index records sit right behind the chunk and
+                    // are just as dead once it has been converted, so they go too.
+                    let length = chunk.chunk_length + chunk.message_index_length;
+                    reclaimed += release(source, chunk.chunk_start_offset, length, block)?;
+                }
+            }
+
             progress.messages.store(rewriter.written(), Ordering::Relaxed);
-        }
-        // Ends the output chunk and pushes it through the BufWriter, so what we
-        // are about to read back is actually on the disk.
-        rewriter.writer.flush()?;
-
-        let grown = file_size(output);
-        let found = verify(output, checked, grown).with_context(|| {
-            format!(
-                "the output written for the chunk at {} did not read back",
-                chunk.chunk_start_offset
-            )
-        })?;
-        let expected = rewriter.written() - before;
-        if found != expected {
-            anyhow::bail!(
-                "the chunk at {} wrote {expected} messages but only {found} read back",
-                chunk.chunk_start_offset
-            );
-        }
-        checked = grown;
-
-        if reclaim == Reclaim::AsItGoes {
-            // The message index records sit right behind the chunk and are just
-            // as dead once it has been converted, so they go too.
-            let length = chunk.chunk_length + chunk.message_index_length;
-            reclaimed += release(source, chunk.chunk_start_offset, length, block)?;
-        }
-
-        progress.messages.store(rewriter.written(), Ordering::Relaxed);
-        progress.bytes.store(grown, Ordering::Relaxed);
-        progress.gauge.detail(format!("{} messages  {:.2} GB written", rewriter.written(), grown as f64 / 1e9));
+            progress.bytes.store(grown, Ordering::Relaxed);
+            progress.gauge.detail(format!("{} messages  {:.2} GB written", rewriter.written(), grown as f64 / 1e9));
+            Ok(())
+        };
+        let (next, written) = rayon::join(|| windows.get(index + 1).map(|window| decode(window)), write);
+        written?;
+        upcoming = next;
     }
 
     rewriter.writer.finish()?;
