@@ -20,7 +20,8 @@ use nalgebra::{Quaternion, UnitQuaternion, Vector3};
 
 use crate::voxel_ray_tracer::{
     batch_local_bounds, coarse_of_fine, emit_points, emit_points_fine, global_normal_fits,
-    metric_voxel_keys, update_map, Config, Cylinder, FrameHits, LocalBounds, VoxelMap,
+    metric_voxel_keys, update_map, voxel_center, Config, Cylinder, FrameHits, LocalBounds,
+    VoxelKey, VoxelMap,
 };
 
 pub type Point = (f32, f32, f32);
@@ -218,6 +219,37 @@ impl Mapper {
         self.map.clear_voxels(keys)
     }
 
+    /// Drop the voxels that never became healthy and that `keep`, given the
+    /// voxel's centre, says nothing will touch again. Returns how many went.
+    ///
+    /// A hit creates a voxel at `min_health + weight`, which with the default
+    /// weight of 1 and `min_health` of -1 is exactly 0: not yet healthy. Only a
+    /// second hit lifts it, and only a ray passing through it deletes it. A
+    /// sweep at long range leaves thousands of such single-hit voxels per frame,
+    /// and over a long run they become most of the map's memory while
+    /// contributing nothing to its output. One that no later ray can reach is
+    /// dead weight: it is never emitted, never counted as a neighbour's support,
+    /// and no miss will ever come for it. Healthy voxels are never touched.
+    ///
+    /// The caller decides reachability; a voxel dropped that a later ray does
+    /// reach would need its hits again, so `keep` should be conservative.
+    ///
+    /// Not part of the original module: added for mapping a whole recording
+    /// after the fact, where the trajectory is known in advance and the map
+    /// must fit in memory however long the run.
+    pub fn prune_dormant(&mut self, keep: impl Fn(Point) -> bool) -> usize {
+        let voxel_size = self.config.voxel_size;
+        let dormant: Vec<VoxelKey> = self
+            .map
+            .voxels
+            .iter()
+            .filter(|(_, voxel)| voxel.health <= 0.0)
+            .map(|(&key, _)| key)
+            .filter(|&key| !keep(voxel_center(key, voxel_size)))
+            .collect();
+        self.map.clear_voxels(dormant)
+    }
+
     /// Reset to an empty map, keeping the config.
     pub fn clear(&mut self) {
         self.map.clear();
@@ -279,6 +311,40 @@ mod tests {
         assert!((world[0].1 - 3.5).abs() < 1e-5);
         let global = mapper.global_points();
         assert_eq!(global, vec![10.5, 3.5, 0.5]);
+    }
+
+    #[test]
+    fn prune_dormant_drops_single_hit_voxels_the_caller_gives_up_and_keeps_the_healthy_ones() {
+        let mut cfg = config();
+        cfg.min_health = -1;
+        cfg.max_health = 5;
+        let mut mapper = Mapper::new(cfg);
+        let origin = (0.0, 0.0, 0.0);
+        // (5, 0, 0) is hit twice and becomes healthy; the two 40 m returns are
+        // hit once each and sit at health 0. Off-axis so no ray crosses another
+        // return's voxel.
+        mapper.add_frame_world(vec![(5.5, 0.5, 0.5), (0.5, 40.5, 0.5)], origin);
+        mapper.add_frame_world(vec![(5.5, 0.5, 0.5), (0.5, -40.5, 0.5)], origin);
+        assert_eq!(mapper.map().voxels.len(), 3);
+        assert_eq!(mapper.map().healthy_count(), 1);
+        let within = |of: Point, radius: f32| {
+            move |c: Point| {
+                let (dx, dy, dz) = (c.0 - of.0, c.1 - of.1, c.2 - of.2);
+                dx * dx + dy * dy + dz * dz <= radius * radius
+            }
+        };
+        // Everything is within 50 m of the origin: nothing to prune.
+        assert_eq!(mapper.prune_dormant(within(origin, 50.0)), 0);
+        // From (0, 15, 0) the +y return is 25.5 m away and the -y one 55.5 m.
+        mapper.add_frame_world(vec![(5.5, 0.5, 0.5)], (0.0, 15.0, 0.0));
+        assert_eq!(mapper.prune_dormant(within((0.0, 15.0, 0.0), 50.0)), 1);
+        assert!(mapper.map().voxels.contains_key(&(0, 40, 0)));
+        assert!(!mapper.map().voxels.contains_key(&(0, -41, 0)));
+        // The healthy voxel survives even a keep that gives everything up.
+        assert_eq!(mapper.prune_dormant(|_| false), 1);
+        assert_eq!(mapper.map().voxels.len(), 1);
+        assert_eq!(mapper.map().healthy_count(), 1);
+        assert_eq!(mapper.global_points(), vec![5.5, 0.5, 0.5]);
     }
 
     #[test]

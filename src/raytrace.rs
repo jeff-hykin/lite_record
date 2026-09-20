@@ -88,6 +88,94 @@ pub const SNAPSHOT_EVERY_SCANS: usize = 10;
 /// series a fraction of the recording whatever its length.
 pub const MAX_SNAPSHOTS: usize = 120;
 
+/// How often the map sheds the never-healthy voxels no later scan can reach
+/// (`Mapper::prune_dormant`). A Livox scan at 30 m leaves ~10k such voxels
+/// behind every frame -- ~1.5 MB -- and most are never touched again, so
+/// without this the map stage grows without bound: the 960 s bike recording
+/// ran out of an 8 GB cgroup at 61% while its finished map was 3.1 M voxels.
+/// The whole trajectory is known before the first scan is mapped, so a voxel
+/// is dropped only once every remaining sensor position is out of ray reach
+/// of it, which leaves the finished map exactly as it would have been. A prune
+/// walks every held voxel, so it is done every ten seconds of recording rather
+/// than every scan.
+pub const PRUNE_EVERY_SCANS: usize = 100;
+
+/// Sensor positions closer than this are one for reachability's purposes;
+/// the reach radius grows by the same amount to stay conservative.
+const REACH_SPACING_M: f32 = 4.0;
+/// The grid the remaining trajectory's reach is rasterised on.
+const REACH_CELL_M: f32 = 8.0;
+
+/// The part of the world some remaining scan can still touch: every grid cell
+/// within the reach radius of any later sensor position.
+struct Reach {
+    cells: std::collections::HashSet<(i32, i32, i32)>,
+}
+
+impl Reach {
+    /// `origins` are the later scans' sensor positions in the world (None for
+    /// a scan that will not be mapped); `radius` how far a ray can act.
+    fn of(origins: &[Option<[f32; 3]>], radius: f32) -> Reach {
+        let mut cells = std::collections::HashSet::new();
+        let radius = radius + REACH_SPACING_M;
+        let mut last: Option<[f32; 3]> = None;
+        for origin in origins.iter().flatten() {
+            if let Some(previous) = last {
+                let d = [origin[0] - previous[0], origin[1] - previous[1], origin[2] - previous[2]];
+                if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < REACH_SPACING_M * REACH_SPACING_M {
+                    continue;
+                }
+            }
+            last = Some(*origin);
+            let lo = origin.map(|c| ((c - radius) / REACH_CELL_M).floor() as i32);
+            let hi = origin.map(|c| ((c + radius) / REACH_CELL_M).floor() as i32);
+            for x in lo[0]..=hi[0] {
+                for y in lo[1]..=hi[1] {
+                    for z in lo[2]..=hi[2] {
+                        // Nearest point of the cell's cube to the origin.
+                        let gap = |i: i32, c: f32| {
+                            let (from, to) = (i as f32 * REACH_CELL_M, (i + 1) as f32 * REACH_CELL_M);
+                            (from - c).max(c - to).max(0.0)
+                        };
+                        let (gx, gy, gz) = (gap(x, origin[0]), gap(y, origin[1]), gap(z, origin[2]));
+                        if gx * gx + gy * gy + gz * gz <= radius * radius {
+                            cells.insert((x, y, z));
+                        }
+                    }
+                }
+            }
+        }
+        Reach { cells }
+    }
+
+    fn contains(&self, point: (f32, f32, f32)) -> bool {
+        let cell = |c: f32| (c / REACH_CELL_M).floor() as i32;
+        self.cells.contains(&(cell(point.0), cell(point.1), cell(point.2)))
+    }
+}
+
+/// Where the sensor is for every message on the cloud topic, in the order the
+/// mapping loop will see them, from the header alone: None where tf cannot
+/// place the frame in `world_frame`, which the loop skips too.
+fn sensor_origins(
+    recording: &Recording,
+    channel_id: u16,
+    transforms: &crate::heatmap::TfHistory,
+    world_frame: &str,
+) -> Result<Vec<Option<[f32; 3]>>> {
+    let mut origins = Vec::new();
+    for message in recording.messages(channel_id, None)? {
+        let message = message?;
+        let Some(header) = crate::cdr::decode_header(&message.data) else {
+            origins.push(None);
+            continue;
+        };
+        let (placement, root) = transforms.chain_to_root(&header.frame_id, stamp_seconds(&header, message.log_time));
+        origins.push((root == world_frame).then(|| placement.translation.map(|c| c as f32)));
+    }
+    Ok(origins)
+}
+
 /// Scans between snapshots for a run of `scans` scans.
 pub fn snapshot_every(scans: usize) -> usize {
     scans.div_ceil(MAX_SNAPSHOTS).max(SNAPSHOT_EVERY_SCANS)
@@ -169,8 +257,13 @@ pub fn build(
 ) -> Result<Map> {
     let config = default_config(world_frame);
     let voxel_size = config.voxel_size;
+    // Past this distance from the sensor no ray of a scan touches a voxel, so
+    // a never-healthy voxel this far from every remaining sensor position is
+    // dead weight (see `Mapper::prune_dormant`).
+    let reach_radius = config.max_range + config.shadow_depth + config.grace_depth + 2.0 * config.voxel_size;
     let transforms = crate::heatmap::TfHistory::read(recording, tf_topic)?;
     let channel = recording.channel(cloud_topic)?;
+    let origins = sensor_origins(recording, channel.id, &transforms, world_frame)?;
     let every = snapshot_every(recording.message_count(channel.id).unwrap_or(0) as usize);
     let mut mapper = Mapper::new(config);
     let (mut scans, mut unplaced) = (0usize, 0usize);
@@ -178,7 +271,7 @@ pub fn build(
     let mut last_stamp_nanos = 0u64;
     let mut last_snapshot_stamp = None;
 
-    for message in recording.messages(channel.id, None)? {
+    for (index, message) in recording.messages(channel.id, None)?.enumerate() {
         let message = message?;
         let cloud = crate::cdr::decode_point_cloud2(&message.data)
             .with_context(|| format!("message {} on {cloud_topic}", message.sequence))?;
@@ -228,8 +321,12 @@ pub fn build(
         );
         scans += 1;
         scans_done.fetch_add(1, Ordering::Relaxed);
+        if scans.is_multiple_of(PRUNE_EVERY_SCANS) {
+            let reach = Reach::of(&origins[index + 1..], reach_radius);
+            mapper.prune_dormant(|centre| reach.contains(centre));
+        }
         if let Some(gauge) = gauge.filter(|_| scans.is_multiple_of(10)) {
-            gauge.detail(format!("{scans} scans"));
+            gauge.detail(format!("{scans} scans, {} voxels held", mapper.map().voxels.len()));
         }
         if scans % every == 0 {
             let snapshot = cloud_of(&mapper.global_points(), message.log_time, world_frame);
@@ -302,4 +399,30 @@ pub fn already_present(recording: &std::path::Path) -> Result<u64> {
         return Ok(0);
     };
     Ok(opened.message_count(channel.id).unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reach_covers_what_a_later_scan_can_touch_and_nothing_far_from_the_rest_of_the_path() {
+        // A path along +x from 0 to 100 m, one position a metre, two unmapped
+        // scans in the middle.
+        let mut origins: Vec<Option<[f32; 3]>> = (0..=100).map(|x| Some([x as f32, 0.0, 0.0])).collect();
+        origins[50] = None;
+        origins[51] = None;
+        let reach = Reach::of(&origins[60..], 30.0);
+        // Ahead of the remaining path, within range.
+        assert!(reach.contains((80.0, 20.0, 0.0)));
+        // Behind the remaining path, within 30 m of its first position.
+        assert!(reach.contains((45.0, 0.0, 0.0)));
+        // Well behind it: only a scan already mapped could have reached this.
+        assert!(!reach.contains((10.0, 0.0, 0.0)));
+        // Far off to the side.
+        assert!(!reach.contains((80.0, 60.0, 0.0)));
+        // Nothing left to map reaches nothing.
+        assert!(!Reach::of(&[], 30.0).contains((0.0, 0.0, 0.0)));
+        assert!(!Reach::of(&[None, None], 30.0).contains((0.0, 0.0, 0.0)));
+    }
 }

@@ -354,10 +354,17 @@ order one chunk at a time; the recode writes its output as it goes; corrected cl
 snapshots are spooled to disk beside the recording and appended from there in chunks of
 4 MiB; the clock survey keeps a fixed-size sample per stream rather than one number per
 message. What remains proportional to the *recording* is bounded by its content, not its
-length: Point-LIO's map and the voxel map grow with the volume explored, the tf history with
-the number of transforms, the trajectory with the number of scans — megabytes for an hour of
-walking. An 80 GB recording post-processes on a 16 GB machine; the page cache fills with the
-file as it is read, which is the operating system's memory to reclaim, not this program's.
+length: Point-LIO's map grows with the volume explored, the tf history with the number of
+transforms, the trajectory with the number of scans. The voxel map is the one that needs
+care. A first return creates a voxel that only a second return makes part of the map, and a
+sweep at 30 m leaves some ten thousand such single-return voxels behind every scan that
+nothing ever touches again — about 1.5 MB a scan, which is what ran a 16-minute bike
+recording out of an 8 GB machine while its finished map was 3 M voxels. `post_process` knows
+the whole trajectory before it maps the first scan, so every ten seconds of recording it
+drops the never-confirmed voxels that no later scan can reach; the finished map is exactly
+what it would have been, and what is held is bounded by what the rest of the trajectory can
+still see. An 80 GB recording post-processes on a 16 GB machine; the page cache fills with
+the file as it is read, which is the operating system's memory to reclaim, not this program's.
 
 ### The command line
 

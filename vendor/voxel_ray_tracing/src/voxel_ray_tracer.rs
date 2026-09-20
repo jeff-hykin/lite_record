@@ -45,7 +45,7 @@ fn chunk_of(key: VoxelKey) -> ChunkKey {
 }
 
 #[inline]
-fn voxel_center(key: VoxelKey, voxel_size: f32) -> (f32, f32, f32) {
+pub(crate) fn voxel_center(key: VoxelKey, voxel_size: f32) -> (f32, f32, f32) {
     let half = voxel_size * 0.5;
     (
         key.0 as f32 * voxel_size + half,
