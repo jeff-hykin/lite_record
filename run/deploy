@@ -23,6 +23,9 @@ out=$(nix build .#linux-arm64 --out-link result-linux-arm64 --print-out-paths | 
 echo "Copying to $HOST ..."
 # Writing onto the running binary fails with ETXTBSY, so land it beside the
 # target and rename: the running process keeps its own unlinked inode.
+# scp copies the store file's read-only mode, so a transfer that was cut off
+# leaves a .new that the next transfer cannot open for writing.
+ssh "$HOST" "rm -f '$REMOTE_BIN.new'"
 scp -q "$out/bin/lite_record" "$HOST:$REMOTE_BIN.new"
 ssh "$HOST" "chmod 755 '$REMOTE_BIN.new' && mv -f '$REMOTE_BIN.new' '$REMOTE_BIN'"
 
