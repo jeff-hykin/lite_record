@@ -37,6 +37,11 @@ orbbec = []
 oakd = ["dep:cc"]
 h264 = ["dep:openh264"]
 all-sensors = ["realsense", "livox", "orbbec", "oakd"]
+# Loop closure in post_process: AprilTag pose-graph optimisation and ICP
+# closures from icp_stitch, whose solver is GTSAM (C++). GTSAM only builds
+# natively, so this is a desktop feature: on for the Mac and x86 builds, off
+# for the cross-built Pi binary. See README "Loop closure".
+loop-closure = ["dep:icp_stitch"]
 
 [dependencies]
 # The recode decodes a window of chunks' frames on every core (convert.rs).
@@ -59,6 +64,9 @@ png = "0.18.1"
 pointlio_rs = { path = "vendor/pointlio_rs" }
 # dimos' raycast-clearing voxel mapper, same arrangement. See vendor/voxel_ray_tracing/src/lib.rs.
 voxel_ray_tracing = { path = "vendor/voxel_ray_tracing" }
+# Tag PGO + ICP loop closure, as a library. Its rerun output is not wanted
+# here, and it needs GTSAM in the build environment (nix develop .#loop-closure).
+icp_stitch = { git = "https://github.com/jeff-hykin/icp_stitch", rev = "efc2351a73a1c52f7157be8bceca701d9c016a22", optional = true, default-features = false }
 quick-xml = "0.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

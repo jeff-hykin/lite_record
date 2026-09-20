@@ -384,6 +384,24 @@ impl Spool {
         result
     }
 
+    /// Hands every spooled cloud to `sink`, oldest first, leaving the spool as
+    /// it was: for a stage that needs the clouds before they are appended.
+    pub fn for_each(&mut self, mut sink: impl FnMut(u64, &[u8]) -> Result<()>) -> Result<u64> {
+        self.file.flush()?;
+        let mut reader = BufReader::with_capacity(1 << 20, std::fs::File::open(&self.path)?);
+        let mut data = Vec::new();
+        for _ in 0..self.clouds {
+            let mut stamp = [0u8; 8];
+            reader.read_exact(&mut stamp)?;
+            let mut length = [0u8; 4];
+            reader.read_exact(&mut length)?;
+            data.resize(u32::from_le_bytes(length) as usize, 0);
+            reader.read_exact(&mut data)?;
+            sink(u64::from_le_bytes(stamp), &data)?;
+        }
+        Ok(self.clouds)
+    }
+
     /// Throws the spool away without appending it.
     pub fn discard(self) {
         let Spool { path, file, .. } = self;

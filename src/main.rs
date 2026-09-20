@@ -206,6 +206,27 @@ struct PostProcessArgs {
     #[arg(long)]
     no_raytrace: bool,
 
+    /// Close loops before anything is appended: AprilTag landmarks (when the
+    /// recording has a colour camera with intrinsics) and point-to-plane ICP
+    /// between revisited places pull the drifting trajectory into shape, and
+    /// the odometry, the tf edge and the map are written from the corrected
+    /// one. Nothing gets a `_corrected` copy. Needs a fresh estimate: strip
+    /// old odometry first. Desktop builds only (the solver is GTSAM).
+    #[arg(long)]
+    loop_closure: bool,
+
+    /// Side length of the AprilTags in the recording, in metres.
+    #[arg(long, default_value_t = 0.1)]
+    tag_size: f64,
+
+    /// With --loop-closure: skip the AprilTag stage.
+    #[arg(long)]
+    no_tags: bool,
+
+    /// With --loop-closure: skip the ICP closures.
+    #[arg(long)]
+    no_icp: bool,
+
     /// Append a transform even when the recording already places that frame.
     ///
     /// Off by default, because appending cannot remove: writing a second value
@@ -284,6 +305,10 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
     let PostProcessArgs {
         recording, reclaim, no_odom, urdf, lidar_topic, imu_topic, dry_run, trajectory, fix_clocks,
         no_raytrace,
+        loop_closure,
+        tag_size,
+        no_tags,
+        no_icp,
         fix_static_tf, max_speed, no_deskew, deskew_only, allow_tf_conflict,
     } = args;
     let (recording, reclaim, no_odom, dry_run) = (recording.as_path(), *reclaim, *no_odom, *dry_run);
@@ -314,9 +339,25 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
     let recode_needed = convert::needs_conversion(recording)? || *fix_static_tf;
     let will_recode = !dry_run && (recode_needed || *fix_clocks);
     let will_estimate = !no_odom && (existing_odometry.is_none() || deskew_only);
+    let will_loop_close = *loop_closure && !dry_run;
+    if will_loop_close && (!will_estimate || deskew_only) {
+        anyhow::bail!(
+            "--loop-closure corrects the trajectory before it is written, so it needs a fresh estimate. \
+             Strip the old one first: `dtk data topic delete <file> /pointlio_odometry /pointlio_lidar /global_map --force` \
+             and `mcap_edit --drop-tf-edge odom:<body>`, then run this again."
+        );
+    }
+    #[cfg(not(feature = "loop-closure"))]
+    if will_loop_close {
+        anyhow::bail!(
+            "this build has no loop closure: it needs GTSAM, which only builds natively. \
+             Build with `cargo build --features loop-closure` inside `nix develop .#loop-closure`, \
+             or run `nix run github:jeff-hykin/lite_record#loop-closure -- post_process --loop-closure ...`."
+        );
+    }
     let will_append = !dry_run;
     let will_map = !dry_run && !*no_raytrace && lite_record::raytrace::already_present(recording)? == 0;
-    let steps = 1 + [will_recode, will_estimate, will_append, will_map].iter().filter(|step| **step).count();
+    let steps = 1 + [will_recode, will_estimate, will_loop_close, will_append, will_map].iter().filter(|step| **step).count();
     let mut display = Display::new(steps);
 
     let gauge = Gauge::new();
@@ -473,6 +514,31 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
                         }
                     ));
                 }
+                #[cfg(feature = "loop-closure")]
+                let estimate = if will_loop_close {
+                    let mut estimate = estimate;
+                    let gauge = Gauge::new();
+                    let opened = lite_record::topics::Recording::open(recording)?;
+                    let options = lite_record::loop_closure::Options { tag_size_m: *tag_size, tags: !*no_tags, icp: !*no_icp };
+                    let report = display.step("closing loops", span, &gauge, || {
+                        lite_record::loop_closure::close_loops(&opened, &mut estimate, spool.as_mut(), &plan.tree, &options, &gauge)
+                    })?;
+                    let tags = match &report.camera {
+                        Some(camera) => format!(
+                            "{} tag factors from {} sightings of {} tag(s) in {} frames of {camera}",
+                            report.tag_factors, report.detections, report.tags_seen, report.images
+                        ),
+                        None if options.tags => "no colour camera with intrinsics, so no tags".to_string(),
+                        None => "tags off".to_string(),
+                    };
+                    display.note(format!(
+                        "{} keyframes; {tags}; {} ICP closures; largest correction {:.2} m",
+                        report.keyframes, report.closures_accepted, report.max_shift_m
+                    ));
+                    estimate
+                } else {
+                    estimate
+                };
                 if let Some(path) = trajectory {
                     lite_record::odometry::write_tum(&estimate, path)?;
                     display.note(format!("trajectory -> {}", path.display()));

@@ -24,6 +24,8 @@ pub mod mcap_append;
 pub mod msgs;
 pub mod network;
 pub mod odometry;
+#[cfg(feature = "loop-closure")]
+pub mod loop_closure;
 pub mod privileged;
 pub mod progress;
 pub mod raytrace;

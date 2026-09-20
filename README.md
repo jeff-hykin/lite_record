@@ -368,6 +368,28 @@ what it would have been, and what is held is bounded by what the rest of the tra
 still see. An 80 GB recording post-processes on a 16 GB machine; the page cache fills with
 the file as it is read, which is the operating system's memory to reclaim, not this program's.
 
+### Loop closure
+
+Point-LIO drifts a little per metre, so a walk that returns to its start ends with the same
+wall twice, some centimetres apart. `post_process --loop-closure` corrects that before anything
+is appended: it runs icp_stitch's pose-graph solve over keyframes along the trajectory — AprilTag
+landmark factors when the recording has a colour camera with intrinsics (`--tag-size` is the tag's
+side in metres, `--no-tags` skips them), and point-to-plane ICP between revisited keyframes
+(`--no-icp` skips those) — and applies the interpolated correction to every pose. What the
+recording then carries as `/pointlio_odometry`, as the `odom -> <body>` tf edge and as the map is
+the corrected trajectory; nothing gets a `_corrected` copy. The motion-compensated clouds are in
+the lidar's own frame and place through tf, so they are untouched.
+
+It needs a fresh estimate. A recording that already carries odometry has to have it stripped
+first (`dtk data topic delete <file> /pointlio_odometry /pointlio_lidar /global_map --force`, then
+`mcap_edit --drop-tf-edge odom:<body>`), because appending cannot replace.
+
+The solver is GTSAM, which only builds natively, so this is a desktop feature: it is in the
+`loop-closure` cargo feature, built by `cargo build --features loop-closure` inside
+`nix develop .#loop-closure` (which provides GTSAM), or run straight from the flake with
+`nix run github:jeff-hykin/lite_record#loop-closure -- post_process --loop-closure <file.mcap>`.
+The Pi's cross-built binary and the plain release binaries do not have it, and say so.
+
 ### The command line
 
 Everything the Post process button does, plus what it cannot, is one command that runs

@@ -5,9 +5,12 @@
         nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
         rust-overlay.url = "github:oxalica/rust-overlay";
         rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
+        # GTSAM, for the loop-closure feature. Native only: it does not cross-build,
+        # which is why the Pi's binary is built without the feature.
+        gtsam_shim.url = "github:jeff-hykin/gtsam_shim";
     };
 
-    outputs = { self, nixpkgs, rust-overlay }:
+    outputs = { self, nixpkgs, rust-overlay, gtsam_shim }:
         let
             systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
             forEachSystem = function: nixpkgs.lib.genAttrs systems (system: function system);
@@ -489,6 +492,34 @@
                     default = nativeC2N;
 
                     linux-x86 = linuxX86C2N;
+
+                    # The desktop post-processing build: `post_process --loop-closure`
+                    # needs GTSAM, so this is the native package plus the feature, with
+                    # gtsam_shim's build script pointed at nix's GTSAM/Eigen/Boost/TBB.
+                    #   nix run .#loop-closure -- post_process --loop-closure <file.mcap>
+                    loop-closure =
+                        let
+                            gtsam = gtsam_shim.packages.${system}.gtsam;
+                            gtsamEnv = gtsam_shim.lib.${system}.buildEnv;
+                        in
+                        crate2nixFor {
+                            targetPkgs = pkgs;
+                            rootFeatures = [ "default" "loop-closure" ];
+                            crateOverrides = (commonCrateOverrides pkgs) // {
+                                gtsam_shim = attrs: {
+                                    nativeBuildInputs = (attrs.nativeBuildInputs or [ ]) ++ [ pkgs.pkg-config ];
+                                    buildInputs = (attrs.buildInputs or [ ]) ++ [ gtsam pkgs.eigen pkgs.boost pkgs.tbb ];
+                                } // gtsamEnv;
+                                lite_record = attrs: ((commonCrateOverrides pkgs).lite_record attrs) // {
+                                    buildInputs = (attrs.buildInputs or [ ]) ++ [ gtsam pkgs.tbb ];
+                                    # darwin's fixup strips LC_RPATH, and the binary finds
+                                    # libgtsam through @rpath.
+                                    postFixup = pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
+                                        install_name_tool -add_rpath ${gtsam}/lib $out/bin/lite_record
+                                    '';
+                                };
+                            };
+                        };
                     linux-arm64 = linuxArm64C2N;
                     linux-arm64-bench = linuxArm64BenchC2N;
                     depthai-arm64 = depthaiCoreFor aarch64Gnu;
@@ -502,6 +533,8 @@
             devShells = forEachSystem (system:
                 let
                     pkgs = import nixpkgs { inherit system; overlays = [ (import rust-overlay) ]; };
+                    gtsam = gtsam_shim.packages.${system}.gtsam;
+                    gtsamEnv = gtsam_shim.lib.${system}.buildEnv;
                     rustToolchain = pkgs.rust-bin.stable.latest.default.override {
                         targets = [
                             "x86_64-unknown-linux-musl"
@@ -515,6 +548,22 @@
                         in "${crossPkgs.stdenv.cc}/bin/${crossPkgs.stdenv.cc.targetPrefix}cc";
                 in
                 {
+                    # `cargo build --features loop-closure` and its tests: GTSAM and
+                    # friends on the build script's path, and the dylib on the runtime
+                    # path so a cargo-built binary can find it.
+                    loop-closure = pkgs.mkShell ({
+                        packages = [ rustToolchain pkgs.pkg-config ];
+                        buildInputs = [ gtsam pkgs.eigen pkgs.boost pkgs.tbb ];
+                        # Linked in as an rpath rather than set at run time: macOS strips
+                        # DYLD_* from the environment of anything it execs through a
+                        # system binary (`/usr/bin/time`, say), and a post-link
+                        # install_name_tool edit is refused on a signed arm64 binary.
+                        RUSTFLAGS = "-C link-arg=-Wl,-rpath,${gtsam}/lib -C link-arg=-Wl,-rpath,${pkgs.tbb}/lib";
+                        shellHook = ''
+                            echo "lite_record loop-closure shell: cargo build --release --features loop-closure"
+                        '';
+                    } // gtsamEnv);
+
                     default = pkgs.mkShell {
                         packages = [ rustToolchain pkgs.pkg-config ];
 

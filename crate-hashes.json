@@ -1,0 +1,5 @@
+{
+  "git+https://github.com/dimensionalOS/dimos-lcm.git?rev=3555e97704ec4c727d96a7ac0769d5735bb44feb#lcm-msgs@0.1.0": "09gl1mm9qlchp2ry2gwxk2iqkgzqahg40gkj0y1rqrk2364brkx6",
+  "git+https://github.com/jeff-hykin/gtsam_shim#0.1.0": "03a6x9w1qyj6gw0iipi9ff9yxycsq19mpxpaiiy24dbcyxcv9w8c",
+  "git+https://github.com/jeff-hykin/icp_stitch?rev=efc2351a73a1c52f7157be8bceca701d9c016a22#0.1.0": "1cmf36jji10vsakr484qhaa09x5989ps2w4hnpvsq5zk5ff0hrda"
+}

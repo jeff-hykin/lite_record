@@ -141,7 +141,7 @@ pub struct Estimate {
     pub rejected_scans: usize,
     /// Lidar-in-IMU, from the estimator's configuration: the estimator tracks
     /// the IMU, the tree hangs off the lidar.
-    lidar_in_imu: Pose,
+    pub lidar_in_imu: Pose,
 }
 
 impl Estimate {
@@ -167,7 +167,7 @@ impl Estimate {
 }
 
 /// The IMU pose in `odom` a `PoseSample` describes.
-fn pose_of(sample: &PoseSample) -> Pose {
+pub fn pose_of(sample: &PoseSample) -> Pose {
     let rotation: [f64; 9] = std::array::from_fn(|index| sample.rot[(index / 3, index % 3)]);
     Pose::from_matrix(rotation, [sample.pos[0], sample.pos[1], sample.pos[2]])
 }
