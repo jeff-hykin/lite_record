@@ -129,6 +129,9 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/app.js", get(script))
         .route("/style.css", get(stylesheet))
+        .route("/vendor/three.module.min.js", get(three_module))
+        .route("/vendor/OrbitControls.js", get(orbit_controls))
+        .route("/vendor/three.core.min.js", get(three_core))
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/status", get(status))
         .route("/api/settings", put(put_settings))
@@ -173,6 +176,34 @@ async fn script() -> Response {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../web/app.js"),
+    )
+        .into_response()
+}
+
+/// three.js is carried in the binary rather than fetched from a CDN, because
+/// the phone driving a rig in the field has the rig's hotspot and nothing
+/// else. The import map in index.html points the bare `three` specifier here.
+async fn three_module() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/vendor/three.module.min.js"),
+    )
+        .into_response()
+}
+
+/// The half of three.js its module entry point imports as `./three.core.min.js`.
+async fn three_core() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/vendor/three.core.min.js"),
+    )
+        .into_response()
+}
+
+async fn orbit_controls() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/vendor/OrbitControls.js"),
     )
         .into_response()
 }

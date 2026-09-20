@@ -1,6 +1,7 @@
 /**
  * The recorder's browser front end. No build step: plain modules, and three.js
- * comes straight off esm.sh so the Pi never has to run a bundler.
+ * is a vendored file the binary serves, so the Pi never runs a bundler and the
+ * phone never needs the internet.
  */
 
 const element = (id) => document.getElementById(id)
@@ -1003,8 +1004,8 @@ const startPreviewSocket = () => {
  * so the axes are swapped on the way in, the same as the URDF viewer.
  */
 const loadCloudViewer = async (canvas) => {
-    const three = await import("https://esm.sh/three@0.180.0")
-    const { OrbitControls } = await import("https://esm.sh/three@0.180.0/examples/jsm/controls/OrbitControls.js")
+    const three = await import("three")
+    const { OrbitControls } = await import("three/addons/OrbitControls.js")
     const frame = canvas.parentElement
     const renderer = new three.WebGLRenderer({ canvas, antialias: false })
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2))
@@ -1150,7 +1151,7 @@ const startCloudView = () => {
             try {
                 viewer = await loadCloudViewer(canvas)
             } catch (error) {
-                toast(`the 3D view needs internet access for three.js: ${error.message}`, true)
+                toast(`could not load the 3D view: ${error.message}`, true)
                 toggle.checked = false
                 idle.textContent = "Off."
                 return
@@ -1189,9 +1190,9 @@ const loadUrdfViewer = async () => {
     host.textContent = "loading viewer..."
     let three = null
     try {
-        three = await import("https://esm.sh/three@0.180.0")
+        three = await import("three")
     } catch (error) {
-        host.textContent = "3D viewer unavailable (no internet on this device)."
+        host.textContent = "3D viewer unavailable."
         return
     }
     let xml = ""

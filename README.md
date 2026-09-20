@@ -226,7 +226,7 @@ subnet, then filter `arp -an` by the vendor prefix — a Pi 5 is `2c:cf:67` or `
   turning it off leaves the recording completely untouched.
 - **Lidar** — the live scan as a 3D point view, thinned on the Pi to a few thousand points
   per frame and coloured by height. Off by default; while off the Pi never touches the
-  scans. Needs internet on the phone for three.js, like the URDF viewer.
+  scans. three.js is built into the binary (`web/vendor`), so the phone needs no internet.
 - **Files** — every recording, with per-topic summary, download, post-processing, rename,
   copy or move to another drive, and delete.
 - **Monitor** — a collapsible panel showing per-stream Hz and drop counts, total and

@@ -331,6 +331,10 @@
 
 <div id="toast" class="toast" hidden></div>
 
+<!-- three.js ships inside the binary; this is what lets `import("three")` find it. -->
+
+<script type="importmap">{"imports":{"three":"/vendor/three.module.min.js","three/addons/":"/vendor/"}}</script>
+
 <script type="module" src="/app.js"></script>
 </body>
 </html>
