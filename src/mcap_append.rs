@@ -93,7 +93,16 @@ pub struct Appender {
     metadata_indexes: Vec<records::MetadataIndex>,
     statistics: Option<records::Statistics>,
     sequences: HashMap<u16, u32>,
+    /// Messages queued with [`Appender::write`], held until they can be
+    /// merged in log-time order with whatever is streamed.
     pending: Vec<Pending>,
+    /// Set once streaming has begun: `pending` is sorted and `held_next` is
+    /// the first of it not yet placed.
+    streaming: bool,
+    held_next: usize,
+    /// The chunk being assembled, in log-time order, and its size so far.
+    chunk: Vec<Pending>,
+    chunk_bytes: usize,
     appended: u64,
     appended_chunks: usize,
 }
@@ -164,6 +173,10 @@ impl Appender {
             statistics: summary.stats,
             sequences,
             pending: Vec::new(),
+            streaming: false,
+            held_next: 0,
+            chunk: Vec::new(),
+            chunk_bytes: 0,
             appended: 0,
             appended_chunks: 0,
         })
@@ -245,50 +258,101 @@ impl Appender {
         id
     }
 
-    /// Queues one message. Everything queued is held until [`Appender::finish`]
-    /// and then written in log-time order, split into chunks of roughly
-    /// `CHUNK_TARGET_BYTES`; the things appended here — odometry, transforms —
-    /// are megabytes, and holding them is what lets the appended chunks be
-    /// ordered among themselves.
+    /// Queues one small message -- odometry, a transform -- to be held in
+    /// memory and written in log-time order among everything else. Holding
+    /// is what lets the appended chunks be ordered among themselves; keep it
+    /// to the streams that are megabytes, and hand the big ones to
+    /// [`Appender::write_stream`]. Not allowed once streaming has begun.
     pub fn write(&mut self, channel_id: u16, log_time: u64, data: Vec<u8>) -> Result<()> {
+        if self.streaming {
+            bail!("write after write_stream would break the chunks' time order");
+        }
+        let message = self.pending_message(channel_id, log_time, data)?;
+        self.pending.push(message);
+        Ok(())
+    }
+
+    /// Writes one message of a stream that arrives in log-time order and is
+    /// too large to hold -- a whole corrected lidar topic. Nothing of it stays
+    /// in memory beyond the chunk being assembled: everything held by
+    /// [`Appender::write`] that is due before this message is placed first,
+    /// so the chunks come out in time order, and a chunk goes to disk as soon
+    /// as it reaches its size or span.
+    pub fn write_stream(&mut self, channel_id: u16, log_time: u64, data: Vec<u8>) -> Result<()> {
+        let message = self.pending_message(channel_id, log_time, data)?;
+        if !self.streaming {
+            self.pending.sort_by_key(|message| message.log_time);
+            self.streaming = true;
+            self.held_next = 0;
+        }
+        self.place_held_through(log_time)?;
+        self.place(message)
+    }
+
+    fn pending_message(&mut self, channel_id: u16, log_time: u64, data: Vec<u8>) -> Result<Pending> {
         if !self.channels.contains_key(&channel_id) {
             bail!("no channel {channel_id}");
         }
         let sequence = self.sequences.entry(channel_id).or_insert(0);
         *sequence = sequence.wrapping_add(1);
-        self.pending.push(Pending {
+        Ok(Pending {
             channel_id,
             sequence: *sequence,
             log_time,
             publish_time: log_time,
             data,
-        });
+        })
+    }
+
+    /// Moves every held message stamped at or before `log_time` into the
+    /// chunk, in order. `pending` is not shrunk from the front on each call --
+    /// that would be quadratic -- it is walked by index and freed at the end.
+    fn place_held_through(&mut self, log_time: u64) -> Result<()> {
+        while self.held_next < self.pending.len() && self.pending[self.held_next].log_time <= log_time {
+            let message = std::mem::replace(
+                &mut self.pending[self.held_next],
+                Pending { channel_id: 0, sequence: 0, log_time: 0, publish_time: 0, data: Vec::new() },
+            );
+            self.held_next += 1;
+            self.place(message)?;
+        }
         Ok(())
     }
 
-    fn flush_all(&mut self) -> Result<()> {
-        let mut messages = std::mem::take(&mut self.pending);
-        messages.sort_by_key(|message| message.log_time);
-        let mut chunk: Vec<Pending> = Vec::new();
-        let mut chunk_bytes = 0;
-        for message in messages {
-            // Cut on either limit. The span is measured from the chunk's first
-            // message, so a burst that fits in the window still gets one chunk.
-            let spans_too_long = chunk
-                .first()
-                .is_some_and(|first| message.log_time.saturating_sub(first.log_time) >= CHUNK_TARGET_NANOS);
-            if spans_too_long {
-                self.flush_chunk(std::mem::take(&mut chunk))?;
-                chunk_bytes = 0;
-            }
-            chunk_bytes += message.data.len() + 22 + 9;
-            chunk.push(message);
-            if chunk_bytes >= CHUNK_TARGET_BYTES {
-                self.flush_chunk(std::mem::take(&mut chunk))?;
-                chunk_bytes = 0;
-            }
+    /// Adds one message, in log-time order, to the chunk being assembled,
+    /// cutting a chunk on either limit. The span is measured from the chunk's
+    /// first message, so a burst that fits in the window still gets one chunk.
+    fn place(&mut self, message: Pending) -> Result<()> {
+        let spans_too_long = self
+            .chunk
+            .first()
+            .is_some_and(|first| message.log_time.saturating_sub(first.log_time) >= CHUNK_TARGET_NANOS);
+        if spans_too_long {
+            self.flush_current_chunk()?;
         }
+        self.chunk_bytes += message.data.len() + 22 + 9;
+        self.chunk.push(message);
+        if self.chunk_bytes >= CHUNK_TARGET_BYTES {
+            self.flush_current_chunk()?;
+        }
+        Ok(())
+    }
+
+    fn flush_current_chunk(&mut self) -> Result<()> {
+        self.chunk_bytes = 0;
+        let chunk = std::mem::take(&mut self.chunk);
         self.flush_chunk(chunk)
+    }
+
+    /// Everything still held goes out in order, after whatever was streamed.
+    fn flush_all(&mut self) -> Result<()> {
+        if !self.streaming {
+            self.pending.sort_by_key(|message| message.log_time);
+        }
+        self.place_held_through(u64::MAX)?;
+        self.pending = Vec::new();
+        self.held_next = 0;
+        self.flush_current_chunk()
     }
 
     pub fn appended(&self) -> u64 {
@@ -635,6 +699,83 @@ pub fn header(mapped: &[u8]) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a small finished recording with one channel, so an appender can
+    /// be opened on it.
+    fn finished_recording(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("lite_append_{name}_{}.mcap", crate::record::now_nanos()));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = mcap::Writer::new(std::io::BufWriter::new(file)).unwrap();
+        let schema = writer.add_schema("std_msgs/msg/String", "ros2msg", b"string data").unwrap();
+        let channel = writer.add_channel(schema, "/seed", "cdr", &std::collections::BTreeMap::new()).unwrap();
+        writer
+            .write_to_known_channel(
+                &mcap::records::MessageHeader { channel_id: channel, sequence: 1, log_time: 1_000, publish_time: 1_000 },
+                b"seed",
+            )
+            .unwrap();
+        writer.finish().unwrap();
+        path
+    }
+
+    fn appended_in_order(path: &std::path::Path) -> Vec<(String, u64)> {
+        let file = std::fs::File::open(path).unwrap();
+        let mapped = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        let summary = mcap::Summary::read(&mapped).unwrap().unwrap();
+        let mut chunks = summary.chunk_indexes.clone();
+        chunks.sort_by_key(|chunk| chunk.chunk_start_offset);
+        let mut out = Vec::new();
+        for chunk in &chunks {
+            for message in summary.stream_chunk(&mapped, chunk).unwrap() {
+                let message = message.unwrap();
+                out.push((message.channel.topic.clone(), message.log_time));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_streamed_topic_is_merged_in_time_with_the_held_ones_and_chunks_stay_ordered() {
+        let path = finished_recording("stream");
+        let mut appender = Appender::open(&path).unwrap();
+        let schema = appender.schema("std_msgs/msg/String", "ros2msg", b"string data");
+        let small = appender.channel("/small", schema, "cdr", &std::collections::BTreeMap::new());
+        let big = appender.channel("/big", schema, "cdr", &std::collections::BTreeMap::new());
+        // Held: every 2 s across the run, written out of arrival order on purpose.
+        for stamp in [8_000_000_000u64, 2_000_000_000, 6_000_000_000, 4_000_000_000] {
+            appender.write(small, stamp, b"s".to_vec()).unwrap();
+        }
+        // Streamed: one message a second, each a megabyte, so several chunks
+        // are cut before the stream ends.
+        for second in 1..=9u64 {
+            appender.write_stream(big, second * 1_000_000_000, vec![b'b'; 1 << 20]).unwrap();
+        }
+        // Held messages may not be added once the stream has begun.
+        assert!(appender.write(small, 5, b"late".to_vec()).is_err());
+        let appended = appender.finish().unwrap();
+        assert_eq!(appended, 13);
+
+        let messages = appended_in_order(&path);
+        let stamps: Vec<u64> = messages.iter().skip(1).map(|(_, stamp)| *stamp).collect();
+        let mut sorted = stamps.clone();
+        sorted.sort_unstable();
+        assert_eq!(stamps, sorted, "appended messages must come out in log-time order");
+        assert_eq!(messages.iter().filter(|(topic, _)| topic == "/small").count(), 4);
+        assert_eq!(messages.iter().filter(|(topic, _)| topic == "/big").count(), 9);
+
+        // Appended chunks are disjoint in time: no chunk starts before the
+        // previous one ends.
+        let file = std::fs::File::open(&path).unwrap();
+        let mapped = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        let summary = mcap::Summary::read(&mapped).unwrap().unwrap();
+        let mut chunks = summary.chunk_indexes.clone();
+        chunks.sort_by_key(|chunk| chunk.chunk_start_offset);
+        assert!(chunks.len() >= 3, "expected several appended chunks, got {}", chunks.len());
+        for pair in chunks[1..].windows(2) {
+            assert!(pair[1].message_start_time >= pair[0].message_end_time, "{pair:?}");
+        }
+        std::fs::remove_file(&path).ok();
+    }
     use std::collections::BTreeMap;
 
     fn scratch(name: &str) -> PathBuf {

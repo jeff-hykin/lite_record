@@ -187,6 +187,7 @@ pub fn estimate(
     scans: &Arc<AtomicU64>,
     max_velocity: f64,
     mut deskew_into: Option<&mut Spool>,
+    gauge: Option<&crate::progress::Gauge>,
 ) -> Result<Estimate> {
     let config = Config { max_velocity, ..handheld_config() };
     let lidar_frame = first_frame(mapped, lidar_topic)?
@@ -201,7 +202,13 @@ pub fn estimate(
     let mut states = Vec::new();
     mcap_input::for_each_package_raw(mapped, &config, 0.0, lidar_topic, imu_topic, |package, raw| {
         lio.process(&package);
-        scans.fetch_add(1, Ordering::Relaxed);
+        let done = scans.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(gauge) = gauge {
+            gauge.at(raw.log_time);
+            if done.is_multiple_of(10) {
+                gauge.detail(format!("{done} scans"));
+            }
+        }
         let (Some(spool), None) = (deskew_into.as_deref_mut(), spool_failure.as_ref()) else {
             return;
         };

@@ -15,6 +15,52 @@ Supported sensors:
 The Mid-360 needs no SDK to record: it multicasts its point and IMU datagrams, and
 `lite_record` decodes them off the wire directly.
 
+## Setting up a new Raspberry Pi
+
+A Pi 5 (or 4) with a fresh 64-bit Raspberry Pi OS becomes a recorder in four steps. No
+toolchain, no nix, no vendor SDK on the Pi: the release carries everything it loads.
+
+1. **Flash the card** with Raspberry Pi Imager: *Raspberry Pi OS Lite (64-bit)*. In the
+   Imager's settings give it a hostname, a user, your wifi, and turn ssh on — that is
+   what lets you do the rest from a laptop. Boot it and `ssh <user>@<hostname>.local`.
+
+2. **Install lite_record.** This fetches the latest release plus the libraries it loads,
+   puts them where the binary expects them, and works again later as the update command:
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/jeff-hykin/lite_record/main/install.sh | bash
+   ```
+
+3. **Make it a service** with the sensors you have, so it comes back after every power
+   cut, and add the record button if you wired one (see *A record button* below):
+
+   ```sh
+   lite_record survive_reboot --engage realsense,livox --button 17 --led ACT
+   ```
+
+   Besides the systemd unit this installs everything a bare Pi lacks: the udev rules that
+   let a plain user open a RealSense or an OAK-D, USB drives that mount themselves under
+   `/media`, and the GPIO/LED access for the button. It asks for sudo once.
+
+4. **Wire the lidar and the wifi.** A Mid-360 talks over ethernet with a fixed address, and
+   a rig with no screen needs its wifi profiles saved before it leaves the desk:
+
+   ```sh
+   sudo lite_record network                 # menu: add wifi networks, set up eth0 for the lidar
+   sudo lite_record network status          # non-zero when something is wrong
+   ```
+
+Then open `http://<hostname>.local:8099` from a phone on the same wifi: the capture tab
+shows every sensor and its rate, the settings tab takes the rig's URDF and topic names,
+and *Files* holds the recordings. `journalctl -u lite_record -f` is the log.
+
+Two things the Pi 5 itself needs, neither done for you: a supply that can actually feed
+the sensors (the official 27 W one; a camera plus a lidar over USB will brown out a phone
+charger, and the page's *System* tab shows the throttle bits when it happens), and
+`usb_max_current_enable=1` in `/boot/firmware/config.txt` *only* with such a supply,
+because it lifts the USB budget from 600 mA to 1.6 A on the promise that the supply can
+deliver it.
+
 ## Build
 
 Every vendor SDK is behind a cargo feature, so the crate builds and its whole test suite
@@ -30,14 +76,16 @@ cargo build --release --features realsense,livox   # needs librealsense2 via pkg
 ### Cross-compiling to a Pi or Jetson
 
 ```sh
-nix build .#linux-arm64      # aarch64, static musl, no camera SDKs
-nix build .#linux-x86        # x86_64, static musl, no camera SDKs
+nix build .#linux-arm64      # aarch64 gnu, every camera SDK + livox; what the Pi runs
+nix build .#linux-x86        # x86_64, static musl, no camera SDKs; lidar still works
 ```
 
-Those are static and depend on nothing on the target. A build **with a camera SDK** cannot
-be static, because the vendor `.so` is dynamically linked (and Orbbec's is closed source),
-so it targets `aarch64-unknown-linux-gnu` and needs the target's own `librealsense2.so`
-plus a `realsense2.pc` describing it:
+The arm64 build is what the release ships and what `install.sh` installs: the binary
+plus a tarball of the `/nix/store` paths it loads (`.github/export-closure.sh`), which
+unpack at `/` on a Pi that has no nix. A build **with a camera SDK** cannot be static,
+because the vendor `.so` is dynamically linked (and Orbbec's is closed source), so it
+targets `aarch64-unknown-linux-gnu`; done by hand rather than through the flake it needs
+the target's own `librealsense2.so` plus a `realsense2.pc` describing it:
 
 ```sh
 rustup target add aarch64-unknown-linux-gnu
@@ -289,6 +337,27 @@ The catch, and it is why this takes a deliberate yes: once punching starts the o
 longer a whole recording. Nothing is released before its replacement is verified, so no messages
 are lost, but if the job is interrupted they are split across the partial output and the untouched
 tail of the original, and putting them back together is a manual job.
+
+### What it prints, and what it holds in memory
+
+Each stage is announced as `[Step i of N]`, with N settled before the first one from the
+file's summary, and while it runs one line is redrawn with how far through the recording it
+is, an ETA, and the pace as a multiple of real time (`1.4x rt` means 1.4 recorded seconds
+per second of work — the number that says whether a rig can afford to post-process in the
+field). The first step, reading the whole file to survey its clocks, gets the same line;
+it used to run silent. Colour and in-place redrawing happen only on a terminal: piped to a
+file or journald the same figures arrive as plain lines every 15 s with no escape codes, and
+`NO_COLOR` switches colour off on a terminal too.
+
+Every stage streams. The recording is mapped, never read into memory, and read in log-time
+order one chunk at a time; the recode writes its output as it goes; corrected clouds and map
+snapshots are spooled to disk beside the recording and appended from there in chunks of
+4 MiB; the clock survey keeps a fixed-size sample per stream rather than one number per
+message. What remains proportional to the *recording* is bounded by its content, not its
+length: Point-LIO's map and the voxel map grow with the volume explored, the tf history with
+the number of transforms, the trajectory with the number of scans — megabytes for an hour of
+walking. An 80 GB recording post-processes on a 16 GB machine; the page cache fills with the
+file as it is read, which is the operating system's memory to reclaim, not this program's.
 
 ### The command line
 

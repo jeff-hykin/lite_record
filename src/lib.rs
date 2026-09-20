@@ -25,6 +25,7 @@ pub mod msgs;
 pub mod network;
 pub mod odometry;
 pub mod privileged;
+pub mod progress;
 pub mod raytrace;
 pub mod record;
 pub mod restamp;

@@ -81,11 +81,14 @@ impl ChannelClock {
 /// Channels whose messages carry no `std_msgs/Header` first are skipped: there
 /// is nothing to compare, and nothing this can repair. `/tf` is skipped too —
 /// its stamps are written by this program, on the log clock by construction.
-pub fn survey(mapped: &[u8]) -> Result<BTreeMap<u16, ChannelClock>> {
+pub fn survey(mapped: &[u8], gauge: Option<&crate::progress::Gauge>) -> Result<BTreeMap<u16, ChannelClock>> {
     mcap::Summary::read(mapped)?.context("the recording has no summary section")?;
     let mut topics: BTreeMap<u16, String> = BTreeMap::new();
-    let mut offsets: BTreeMap<u16, Vec<i64>> = BTreeMap::new();
+    let mut offsets: BTreeMap<u16, OffsetSample> = BTreeMap::new();
     crate::walk::for_each_message(mapped, |message| {
+        if let Some(gauge) = gauge {
+            gauge.at(message.log_time);
+        }
         if !repairable(&message.channel) {
             return Ok(std::ops::ControlFlow::Continue(()));
         }
@@ -103,20 +106,64 @@ pub fn survey(mapped: &[u8]) -> Result<BTreeMap<u16, ChannelClock>> {
     })?;
 
     let mut clocks = BTreeMap::new();
-    for (id, mut seen) in offsets {
-        seen.sort_unstable();
-        let at = |fraction: f64| seen[((seen.len() - 1) as f64 * fraction).round() as usize];
+    for (id, seen) in offsets {
         clocks.insert(
             id,
             ChannelClock {
                 topic: topics.remove(&id).unwrap_or_default(),
-                offset_nanos: seen[0],
-                spread_nanos: at(0.99) - at(0.01),
-                messages: seen.len() as u64,
+                offset_nanos: seen.min,
+                spread_nanos: seen.spread(),
+                messages: seen.count,
             },
         );
     }
     Ok(clocks)
+}
+
+/// How many offsets per channel are kept for the percentiles. A recording
+/// has millions of messages and one number per message is hundreds of
+/// megabytes for a survey whose answer is two percentiles; a sample this
+/// size puts them within a fraction of a percent, which is far inside the
+/// tolerance the answer is compared against.
+const SAMPLE_SIZE: usize = 1 << 16;
+
+/// One channel's offsets: the exact minimum and count, and a uniform sample
+/// of the rest (reservoir sampling, so every message has the same chance of
+/// being in it whatever the stream's length).
+#[derive(Default)]
+struct OffsetSample {
+    min: i64,
+    count: u64,
+    sample: Vec<i64>,
+    /// A small deterministic generator: the survey must give the same answer
+    /// twice, and it does not need anything better than a linear congruence.
+    seed: u64,
+}
+
+impl OffsetSample {
+    fn push(&mut self, offset: i64) {
+        if self.count == 0 || offset < self.min {
+            self.min = offset;
+        }
+        self.count += 1;
+        if self.sample.len() < SAMPLE_SIZE {
+            self.sample.push(offset);
+            return;
+        }
+        self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let slot = (self.seed >> 33) % self.count;
+        if (slot as usize) < SAMPLE_SIZE {
+            self.sample[slot as usize] = offset;
+        }
+    }
+
+    /// The 1st to 99th percentile spread of the sample.
+    fn spread(&self) -> i64 {
+        let mut sorted = self.sample.clone();
+        sorted.sort_unstable();
+        let at = |fraction: f64| sorted[((sorted.len() - 1) as f64 * fraction).round() as usize];
+        at(0.99) - at(0.01)
+    }
 }
 
 /// Whether a channel's stamps can be compared and shifted: it carries a
@@ -206,10 +253,10 @@ pub fn describe(clocks: &BTreeMap<u16, ChannelClock>) -> String {
 }
 
 /// A survey of `path`, for a caller that has not mapped the file itself.
-pub fn survey_path(path: &Path) -> Result<BTreeMap<u16, ChannelClock>> {
+pub fn survey_path(path: &Path, gauge: Option<&crate::progress::Gauge>) -> Result<BTreeMap<u16, ChannelClock>> {
     let file = std::fs::File::open(path).with_context(|| format!("could not open {}", path.display()))?;
     let mapped = unsafe { memmap2::Mmap::map(&file)? };
-    survey(&mapped)
+    survey(&mapped, gauge)
 }
 
 #[cfg(test)]
@@ -273,7 +320,7 @@ mod tests {
         let behind = 2_005 * NANOS_PER_SEC;
         split_clock_recording(&path, behind);
         let bytes = std::fs::read(&path).unwrap();
-        let clocks = survey(&bytes).unwrap();
+        let clocks = survey(&bytes, None).unwrap();
 
         let late = clocks.values().find(|clock| clock.topic == "/livox/imu").unwrap();
         let good = clocks.values().find(|clock| clock.topic == "/camera/imu").unwrap();
@@ -328,7 +375,7 @@ mod tests {
         writer.finish().unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
-        let clocks = survey(&bytes).unwrap();
+        let clocks = survey(&bytes, None).unwrap();
         let stream = clocks.values().next().unwrap();
         assert!(stream.moved(), "a 120 s step went unnoticed");
         assert!((stream.spread_seconds() - 120.0).abs() < 0.01);
@@ -375,7 +422,7 @@ mod tests {
         writer.finish().unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
-        let clocks = survey(&bytes).unwrap();
+        let clocks = survey(&bytes, None).unwrap();
         let stream = clocks.values().next().unwrap();
         assert!(!stream.moved(), "one late frame condemned the stream: {} s", stream.spread_seconds());
         assert!(!stream.needs_shift(), "the stream is on the clock, {} s", stream.seconds());
@@ -388,7 +435,7 @@ mod tests {
         let path = scratch("clean");
         split_clock_recording(&path, 0);
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(describe(&survey(&bytes).unwrap()), "");
+        assert_eq!(describe(&survey(&bytes, None).unwrap()), "");
         std::fs::remove_file(&path).ok();
     }
 
@@ -449,7 +496,7 @@ mod tests {
         }
         writer.finish().unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        assert!(survey(&bytes).unwrap().is_empty());
+        assert!(survey(&bytes, None).unwrap().is_empty());
         std::fs::remove_file(&path).ok();
     }
 }

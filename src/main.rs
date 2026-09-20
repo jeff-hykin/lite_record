@@ -4,6 +4,7 @@ use lite_record::hub::{Hub, Settings};
 use lite_record::sensors::SensorKind;
 use lite_record::button::{self, Led};
 use lite_record::{convert, heatmap, network, service, video, web};
+use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -263,87 +264,6 @@ fn absolute(path: &Path) -> PathBuf {
     })
 }
 
-/// Runs `work` while printing `describe()` once a minute, so a stage that runs
-/// for an hour on a large recording never looks hung.
-/// How often a run that is not on a terminal says it is still alive. A log wants
-/// a readable trail, not a line a second, but a minute of silence reads as hung.
-const LOG_TICK_SECONDS: u64 = 15;
-
-/// Runs `work`, saying what stage is in progress from the moment it starts and
-/// then how far in it is, so a long recording never looks like a hung process.
-///
-/// On a terminal that is one line redrawn every second. Piped to a file or to
-/// journald a carriage return would produce one enormous line, so there it is a
-/// fresh line every `LOG_TICK_SECONDS`.
-fn with_ticker<T>(
-    label: &str,
-    describe: impl Fn() -> String + Send + 'static,
-    work: impl FnOnce() -> T,
-) -> T {
-    use std::io::{IsTerminal, Write};
-
-    let interactive = std::io::stdout().is_terminal();
-    // Printed before the work starts rather than at the first tick: the point is
-    // that something appears the instant the stage begins.
-    println!("{label}...");
-    let _ = std::io::stdout().flush();
-
-    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let stopping = Arc::clone(&running);
-    let ticker = std::thread::spawn(move || {
-        let mut seconds = 0;
-        while stopping.load(std::sync::atomic::Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            seconds += 1;
-            if interactive {
-                // \r and no newline, so the count updates in place. The trailing
-                // spaces wipe whatever a longer previous line left behind.
-                print!("\r  {seconds:>6}s  {}     ", describe());
-                let _ = std::io::stdout().flush();
-            } else if seconds % LOG_TICK_SECONDS == 0 {
-                println!("  {seconds:>6}s  {}", describe());
-            }
-        }
-    });
-    let result = work();
-    running.store(false, std::sync::atomic::Ordering::Relaxed);
-    let _ = ticker.join();
-    if interactive {
-        // The redrawn line is progress, not a result; leave the scrollback to
-        // the summary the caller prints next.
-        print!("\r\x1b[2K");
-        let _ = std::io::stdout().flush();
-    }
-    result
-}
-
-#[cfg(test)]
-mod ticker_tests {
-    use super::*;
-
-    #[test]
-    fn the_label_appears_before_the_work_runs() {
-        // The complaint this answers was silence at the start, so the ordering
-        // is the point: the stage announces itself, then the work begins.
-        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = Arc::clone(&order);
-        with_ticker("stage", String::new, || seen.lock().unwrap().push("work"));
-        assert_eq!(*order.lock().unwrap(), vec!["work"]);
-    }
-
-    #[test]
-    fn a_log_tick_is_frequent_enough_to_not_look_hung() {
-        // A minute of nothing is what made a working run look dead.
-        let seconds = LOG_TICK_SECONDS;
-        assert!(seconds <= 30, "{seconds}s between log lines is too quiet");
-    }
-
-    #[test]
-    fn the_work_result_is_handed_back_untouched() {
-        assert_eq!(with_ticker("stage", String::new, || 7), 7);
-    }
-}
-
 fn load_urdf(path: Option<&Path>) -> Result<Option<lite_record::urdf::Urdf>> {
     let Some(path) = path else {
         return Ok(None);
@@ -352,104 +272,111 @@ fn load_urdf(path: Option<&Path>) -> Result<Option<lite_record::urdf::Urdf>> {
     Ok(Some(lite_record::urdf::parse(&xml).with_context(|| format!("{} is not a urdf", path.display()))?))
 }
 
-/// The three stages that turn a fresh recording into one that is viewable,
-/// placed and localised: recode the images (a rewrite, skipped when there is none),
-/// then complete the frame tree and estimate odometry (both appended).
+/// The steps that turn a fresh recording into one that is viewable, placed
+/// and localised: survey it, recode the images (a rewrite, skipped when there
+/// is nothing to recode), estimate odometry, append what that produced, and
+/// build the map. Every step is announced with its number out of the total,
+/// which is settled up front from cheap looks at the file's summary, so the
+/// display never has to revise it.
 fn post_process(args: &PostProcessArgs) -> Result<()> {
+    use lite_record::progress::{Display, Gauge};
+
     let PostProcessArgs {
         recording, reclaim, no_odom, urdf, lidar_topic, imu_topic, dry_run, trajectory, fix_clocks,
         no_raytrace,
         fix_static_tf, max_speed, no_deskew, deskew_only, allow_tf_conflict,
     } = args;
     let (recording, reclaim, no_odom, dry_run) = (recording.as_path(), *reclaim, *no_odom, *dry_run);
+    let (lidar_topic, imu_topic) = (lidar_topic.as_deref(), imu_topic.as_deref());
     let deskew_only = *deskew_only;
+    let urdf = load_urdf(urdf.as_deref())?;
+
+    // Summary-only looks, so the step count is known before anything starts.
     // Already there is a reason to skip, not to duplicate: appending cannot
     // remove the first set.
-    // These two survey the whole file before anything is written, which on a
-    // multi-gigabyte recording is a long time to show nothing at all -- the
-    // stage tickers below do not start until this is finished.
-    println!("reading {} ...", recording.display());
+    let span = recording_span(recording)?;
     let already_deskewed = lite_record::deskew::already_present(recording)?;
-    let wants_deskew = !no_deskew && !dry_run && already_deskewed == 0;
-    if already_deskewed > 0 && !no_deskew {
-        println!(
-            "{} already carries {already_deskewed} messages on {}; not correcting again",
-            recording.display(),
-            lite_record::deskew::DESKEWED_TOPIC
-        );
-    }
+    let wants_deskew = !*no_deskew && !dry_run && already_deskewed == 0;
     if deskew_only && !wants_deskew {
         anyhow::bail!(
             "--deskew-only has nothing to do: {}",
-            match (no_deskew, dry_run, already_deskewed) {
+            match (*no_deskew, dry_run, already_deskewed) {
                 (true, _, _) => "--no-deskew was also given".to_string(),
                 (_, true, _) => "--dry-run writes nothing".to_string(),
                 (_, _, count) => format!("the recording already has {count} corrected clouds"),
             }
         );
     }
-    // Surveyed before anything is written, so the report describes the file as
-    // it was handed over rather than as this run leaves it.
-    let clocks = lite_record::restamp::survey_path(recording)?;
-    let size = std::fs::metadata(recording).map(|at| at.len()).unwrap_or(0);
-    println!("  {:.2} GB, {} streams", size as f64 / 1e9, clocks.len());
+    let existing_odometry = match no_odom {
+        true => None,
+        false => lite_record::odometry::already_present(recording)?,
+    };
+    let recode_needed = convert::needs_conversion(recording)? || *fix_static_tf;
+    let will_recode = !dry_run && (recode_needed || *fix_clocks);
+    let will_estimate = !no_odom && (existing_odometry.is_none() || deskew_only);
+    let will_append = !dry_run;
+    let will_map = !dry_run && !*no_raytrace && lite_record::raytrace::already_present(recording)? == 0;
+    let steps = 1 + [will_recode, will_estimate, will_append, will_map].iter().filter(|step| **step).count();
+    let mut display = Display::new(steps);
+
+    let gauge = Gauge::new();
+    let clocks = display.step("reading the recording", span, &gauge, || {
+        let size = std::fs::metadata(recording).map(|meta| meta.len()).unwrap_or(0);
+        gauge.detail(format!("{:.2} GB", size as f64 / 1e9));
+        lite_record::restamp::survey_path(recording, Some(&gauge))
+    })?;
+    display.note(format!(
+        "{:.2} GB, {} streams",
+        std::fs::metadata(recording).map(|meta| meta.len()).unwrap_or(0) as f64 / 1e9,
+        clocks.len()
+    ));
     print!("{}", lite_record::restamp::describe(&clocks));
-    let shifts: std::collections::BTreeMap<u16, i64> = match *fix_clocks && !dry_run {
+    if already_deskewed > 0 && !*no_deskew {
+        display.note(format!(
+            "already carries {already_deskewed} messages on {}; not correcting again",
+            lite_record::deskew::DESKEWED_TOPIC
+        ));
+    }
+    let shifts: BTreeMap<u16, i64> = match fix_clocks {
         true => clocks
             .iter()
             .filter(|(_, clock)| clock.needs_shift())
-            .map(|(id, clock)| (*id, clock.offset_nanos))
+            .map(|(id, clock)| (*id, -clock.offset_nanos))
             .collect(),
-        false => Default::default(),
+        false => BTreeMap::new(),
     };
-    let (lidar_topic, imu_topic, trajectory) = (lidar_topic.as_deref(), imu_topic.as_deref(), trajectory.as_deref());
-    let started = std::time::Instant::now();
-    let urdf = load_urdf(urdf.as_deref())?;
 
     let reclaim = match reclaim {
         true => convert::Reclaim::AsItGoes,
         false => convert::Reclaim::No,
     };
-    let progress = Arc::new(convert::Progress::default());
-    let watched = Arc::clone(&progress);
-    let converted = with_ticker(
-        "recoding images and refitting camera infos",
-        move || {
-            format!(
-                "{} messages  {:.2} GB written",
-                watched.messages.load(std::sync::atomic::Ordering::Relaxed),
-                watched.bytes.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
-            )
-        },
-        || match (dry_run, convert::needs_conversion(recording).map(|needed| needed || *fix_static_tf)) {
-            (true, Ok(true)) => {
-                println!("{}: would recode images / refit camera infos (dry run)", recording.display());
-                Err(convert::NothingToConvert.into())
+    if will_recode {
+        let progress = Arc::new(convert::Progress::default());
+        let converted = display.step("recoding images and refitting camera infos", span, &progress.gauge, || {
+            if !recode_needed && shifts.is_empty() {
+                return Err(convert::NothingToConvert.into());
             }
-            (true, Ok(false)) => Err(convert::NothingToConvert.into()),
-            (true, Err(error)) => Err(error),
-            (false, Ok(false)) if shifts.is_empty() => Err(convert::NothingToConvert.into()),
-            (false, _) => convert::in_place(recording, &progress, reclaim, &shifts),
-        },
-    );
-    match converted {
-        Ok(report) => println!(
-            "{}: {} decoded, {} refitted, {} restamped, {} transforms inverted, {} copied, {} failed, {:.2} GB, {:.2} GB reclaimed, {}s",
-            recording.display(),
-            report.decoded,
-            report.refitted,
-            report.restamped,
-            report.inverted_transforms,
-            report.copied,
-            report.failed,
-            report.bytes as f64 / 1e9,
-            report.reclaimed as f64 / 1e9,
-            started.elapsed().as_secs(),
-        ),
-        Err(error) if error.downcast_ref::<convert::NothingToConvert>().is_some() => {
-            println!("{}: already viewable, nothing to convert", recording.display());
+            convert::in_place(recording, &progress, reclaim, &shifts)
+        });
+        match converted {
+            Ok(report) => display.note(format!(
+                "{} decoded, {} refitted, {} restamped, {} transforms inverted, {} copied, {} failed, {:.2} GB, {:.2} GB reclaimed",
+                report.decoded,
+                report.refitted,
+                report.restamped,
+                report.inverted_transforms,
+                report.copied,
+                report.failed,
+                report.bytes as f64 / 1e9,
+                report.reclaimed as f64 / 1e9,
+            )),
+            Err(error) if error.downcast_ref::<convert::NothingToConvert>().is_some() => {
+                display.note("already viewable, nothing to convert");
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
+    } else if dry_run && recode_needed {
+        display.note("would recode images / refit camera infos (dry run)");
     }
 
     // The frame tree first, since the odometry describes its root.
@@ -458,44 +385,43 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
     let inspected = lite_record::fixup::inspect(&mapped)?;
     let plan = lite_record::fixup::plan(&inspected, urdf.as_ref());
     if !no_odom && urdf.is_none() && plan.tree.roots().len() > 1 {
-        println!(
+        display.note(format!(
             "note: the frame tree has {} roots and no --urdf was given, so the odometry will describe \
              the lidar's own link; pass --urdf now if the rig has one, since odometry cannot be re-rooted later",
             plan.tree.roots().len()
-        );
+        ));
     }
 
     // Filled by the estimator's walk when a corrected lidar was asked for, and
     // emptied into the file after the appender is open.
     let mut spool = None;
-    let estimate = if no_odom {
-        None
-    } else if let (Some(existing), false) = (lite_record::odometry::already_present(recording)?, deskew_only) {
-        println!(
-            "{} already carries {} messages on {}; not estimating again",
-            recording.display(),
-            existing.messages,
-            lite_record::odometry::ODOMETRY_TOPIC
-        );
-        // Odometry describes the tree's root, computed with the lidar-to-root
-        // transform of the day it was written. A urdf that has since moved the
-        // lidar makes those poses describe a rig that does not exist, and
-        // nothing about the file looks wrong.
-        if let Some((metres, radians)) = existing.geometry.as_deref().and_then(|marker| {
-            let lidar = inspected
-                .frame_of_topic
-                .values()
-                .find(|frame| plan.tree.contains(frame) && frame.contains("livox"))
-                .or_else(|| inspected.frame_of_topic.values().next())?;
-            lite_record::odometry::geometry_drift(marker, &plan.tree, lidar)
-        }) {
-            if metres > 1e-3 || radians > 1e-3 {
-                println!(
-                    "warning: that odometry was estimated with the lidar {metres:.3} m and {:.2} deg \
-                     from where this urdf puts it, so it describes a different rig — re-estimate on \
-                     a copy that has no odometry yet",
-                    radians.to_degrees()
-                );
+    let estimate = if !will_estimate {
+        if let Some(existing) = existing_odometry.as_ref() {
+            display.note(format!(
+                "already carries {} messages on {}; not estimating again",
+                existing.messages,
+                lite_record::odometry::ODOMETRY_TOPIC
+            ));
+            // Odometry describes the tree's root, computed with the lidar-to-root
+            // transform of the day it was written. A urdf that has since moved the
+            // lidar makes those poses describe a rig that does not exist, and
+            // nothing about the file looks wrong.
+            if let Some((metres, radians)) = existing.geometry.as_deref().and_then(|marker| {
+                let lidar = inspected
+                    .frame_of_topic
+                    .values()
+                    .find(|frame| plan.tree.contains(frame) && frame.contains("livox"))
+                    .or_else(|| inspected.frame_of_topic.values().next())?;
+                lite_record::odometry::geometry_drift(marker, &plan.tree, lidar)
+            }) {
+                if metres > 1e-3 || radians > 1e-3 {
+                    display.warn(format!(
+                        "that odometry was estimated with the lidar {metres:.3} m and {:.2} deg \
+                         from where this urdf puts it, so it describes a different rig — re-estimate on \
+                         a copy that has no odometry yet",
+                        radians.to_degrees()
+                    ));
+                }
             }
         }
         None
@@ -513,7 +439,9 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
             .or_else(|| Some((lidar_topic?.to_string(), imu_topic?.to_string())));
         match topics {
             None => {
-                println!("no lidar + imu pair in the recording, so no odometry to estimate");
+                let gauge = Gauge::new();
+                display.step("estimating odometry", None, &gauge, || {});
+                display.note("no lidar + imu pair in the recording, so no odometry to estimate");
                 None
             }
             Some((lidar, imu)) => {
@@ -521,23 +449,21 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
                     spool = Some(lite_record::deskew::Spool::beside(recording)?);
                 }
                 let scans = Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let watched = Arc::clone(&scans);
-                let estimate = with_ticker(
-                    &format!("estimating odometry from {lidar} + {imu}"),
-                    move || format!("{} scans", watched.load(std::sync::atomic::Ordering::Relaxed)),
-                    || lite_record::odometry::estimate(&mapped, &lidar, &imu, &scans, *max_speed, spool.as_mut()),
-                )?;
-                println!(
-                    "  {} poses, {:.1} m of path, {} scans rejected by the {} m/s cap, first scan reached the recorder {:.3} s after it began",
+                let gauge = Gauge::new();
+                let estimate = display.step(&format!("estimating odometry from {lidar} + {imu}"), span, &gauge, || {
+                    lite_record::odometry::estimate(&mapped, &lidar, &imu, &scans, *max_speed, spool.as_mut(), Some(&gauge))
+                })?;
+                display.note(format!(
+                    "{} poses, {:.1} m of path, {} scans rejected by the {} m/s cap, first scan reached the recorder {:.3} s after it began",
                     estimate.poses.len(),
                     estimate.path_length_metres,
                     estimate.rejected_scans,
                     max_speed,
                     estimate.delivery_latency_seconds
-                );
+                ));
                 if let Some(spool) = spool.as_ref() {
-                    println!(
-                        "  {} motion-compensated scans -> {} ({:.2} GB){}",
+                    display.note(format!(
+                        "{} motion-compensated scans -> {} ({:.2} GB){}",
                         spool.clouds(),
                         lite_record::deskew::DESKEWED_TOPIC,
                         spool.bytes() as f64 / 1e9,
@@ -545,11 +471,11 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
                             0 => String::new(),
                             skipped => format!(", {skipped} scan(s) the estimator could not place left out"),
                         }
-                    );
+                    ));
                 }
                 if let Some(path) = trajectory {
                     lite_record::odometry::write_tum(&estimate, path)?;
-                    println!("  trajectory -> {}", path.display());
+                    display.note(format!("trajectory -> {}", path.display()));
                 }
                 Some(estimate)
             }
@@ -563,20 +489,21 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
         }
         print!("{}", lite_record::fixup::describe(&plan, 0));
         if dry_run {
-            println!(
-                "dry run: would append {} static edge(s) and {} odometry poses; {}s",
+            display.note(format!(
+                "dry run: would append {} static edge(s) and {} odometry poses",
                 plan.new_edges.len(),
                 estimate.as_ref().map_or(0, |estimate| estimate.poses.len()),
-                started.elapsed().as_secs()
-            );
-        } else {
-            println!("nothing to append; {}s", started.elapsed().as_secs());
+            ));
+        } else if will_append {
+            let gauge = Gauge::new();
+            display.step("appending transforms, odometry and corrected clouds", None, &gauge, || {});
+            display.note("nothing to append");
         }
         // Having nothing to append says nothing about the map: a recording that
         // already carries its odometry and clouds reaches here every time, and
         // it is exactly the one a second run is meant to add a map to.
-        if !dry_run && !*no_raytrace {
-            raytrace_stage(recording)?;
+        if will_map {
+            raytrace_stage(recording, &mut display, span)?;
         }
         return Ok(());
     }
@@ -587,43 +514,68 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
             plan.conflicting.len()
         );
     }
-    let mut appender = lite_record::mcap_append::Appender::open(recording)?;
-    let static_messages = lite_record::fixup::append_static_transforms(
-        &mut appender,
-        &plan.new_edges,
-        inspected.start_nanos,
-        inspected.end_nanos,
-    )?;
-    let appended = match (&estimate, deskew_only) {
-        (Some(estimate), false) => Some(lite_record::odometry::append(&mut appender, estimate, &plan.tree)?),
-        _ => None,
-    };
-    let deskewed = match (spool, &estimate) {
-        (Some(spool), Some(estimate)) => spool.drain_into(&mut appender, &estimate.lidar_frame)?,
-        (Some(spool), None) => {
-            spool.discard();
-            0
-        }
-        (None, _) => 0,
-    };
-    let total = appender.finish()?;
+    let gauge = Gauge::new();
+    let (static_messages, appended, deskewed, total) =
+        display.step("appending transforms, odometry and corrected clouds", span, &gauge, || -> Result<_> {
+            let mut appender = lite_record::mcap_append::Appender::open(recording)?;
+            let static_messages = lite_record::fixup::append_static_transforms(
+                &mut appender,
+                &plan.new_edges,
+                inspected.start_nanos,
+                inspected.end_nanos,
+            )?;
+            let appended = match (&estimate, deskew_only) {
+                (Some(estimate), false) => {
+                    Some(lite_record::odometry::append(&mut appender, estimate, &plan.tree)?)
+                }
+                _ => None,
+            };
+            let deskewed = match (spool, &estimate) {
+                (Some(spool), Some(estimate)) => {
+                    gauge.detail(format!("{} corrected clouds", spool.clouds()));
+                    spool.drain_into(&mut appender, &estimate.lidar_frame, Some(&gauge))?
+                }
+                (Some(spool), None) => {
+                    spool.discard();
+                    0
+                }
+                (None, _) => 0,
+            };
+            gauge.detail("writing the index");
+            let total = appender.finish()?;
+            Ok((static_messages, appended, deskewed, total))
+        })?;
     print!("{}", lite_record::fixup::describe(&plan, static_messages));
     if let Some(appended) = appended {
-        println!(
+        display.note(format!(
             "appended {} {} messages (odom -> {}) and as many /tf edges",
             appended.odometry_messages,
             lite_record::odometry::ODOMETRY_TOPIC,
             appended.child_frame
-        );
+        ));
     }
     if deskewed > 0 {
-        println!("appended {deskewed} {} clouds", lite_record::deskew::DESKEWED_TOPIC);
+        display.note(format!("appended {deskewed} {} clouds", lite_record::deskew::DESKEWED_TOPIC));
     }
-    println!("{total} messages appended to {}; {}s", recording.display(), started.elapsed().as_secs());
-    if !*no_raytrace {
-        raytrace_stage(recording)?;
+    display.note(format!("{total} messages appended to {}", recording.display()));
+    if will_map {
+        raytrace_stage(recording, &mut display, span)?;
     }
     Ok(())
+}
+
+/// The recording's log-time span from its statistics record, which is what
+/// every step measures its progress against. None for a file without one.
+fn recording_span(recording: &Path) -> Result<Option<lite_record::progress::Span>> {
+    let file = std::fs::File::open(recording).with_context(|| format!("could not open {}", recording.display()))?;
+    let mapped = unsafe { memmap2::Mmap::map(&file)? };
+    let Some(summary) = mcap::Summary::read(&mapped)? else {
+        return Ok(None);
+    };
+    Ok(summary.stats.as_ref().map(|stats| lite_record::progress::Span {
+        start_nanos: stats.message_start_time,
+        end_nanos: stats.message_end_time,
+    }))
 }
 
 /// Builds the raycast voxel map and writes it back, once the clouds and poses
@@ -632,58 +584,59 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
 /// This runs as its own pass rather than riding along with the estimator,
 /// because it reads the motion-compensated clouds the estimator only finishes
 /// writing at the append above.
-fn raytrace_stage(recording: &Path) -> Result<()> {
-    let already = lite_record::raytrace::already_present(recording)?;
-    if already > 0 {
-        println!(
-            "{} already carries {already} {} message(s); not mapping again",
-            recording.display(),
-            lite_record::raytrace::GLOBAL_MAP_TOPIC,
-        );
-        return Ok(());
-    }
+fn raytrace_stage(
+    recording: &Path,
+    display: &mut lite_record::progress::Display,
+    span: Option<lite_record::progress::Span>,
+) -> Result<()> {
+    use lite_record::progress::Gauge;
+
+    let gauge = Gauge::new();
     let opened = lite_record::topics::Recording::open(recording)?;
     // A recording with no odometry has nothing to place scans by. That is a
     // reason to say so and move on, not to fail a run whose other stages worked.
     if opened.channel(lite_record::odometry::ODOMETRY_TOPIC).is_err() {
-        println!(
+        display.step("building the voxel map", None, &gauge, || {});
+        display.note(format!(
             "no {} in the recording, so there is nothing to build a map from",
             lite_record::odometry::ODOMETRY_TOPIC,
-        );
+        ));
         return Ok(());
     }
-    let started = std::time::Instant::now();
     let scans = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let watched = Arc::clone(&scans);
-    let map = with_ticker(
-        "building the voxel map",
-        move || format!("{} scans", watched.load(std::sync::atomic::Ordering::Relaxed)),
-        || {
-            lite_record::raytrace::build(
+    let (points, voxel_size, scans_used, unplaced, beside) =
+        display.step("building the voxel map", span, &gauge, || -> Result<_> {
+            let map = lite_record::raytrace::build(
                 &opened,
                 lite_record::deskew::DESKEWED_TOPIC,
                 lite_record::record::TF_TOPIC,
                 lite_record::odometry::ODOM_FRAME,
                 &scans,
-            )
-        },
-    )?;
-    let beside = lite_record::raytrace::write(recording, &map)?;
-    println!(
-        "  {} voxels at {} m from {} scans{} -> {} and {}",
-        map.points(),
-        map.voxel_size,
-        map.scans,
-        match map.unplaced {
+                Some(&gauge),
+            )?;
+            let (points, voxel_size, scans_used, unplaced) = (map.points(), map.voxel_size, map.scans, map.unplaced);
+            gauge.detail(format!("writing {} snapshots", map.snapshot_count()));
+            // The file beside the recording is written inside `write`, after
+            // the last snapshot is in and the index is rebuilt: a .pc2.lcm on
+            // disk always means the whole map went in.
+            let beside = lite_record::raytrace::write(recording, map, None)?;
+            Ok((points, voxel_size, scans_used, unplaced, beside))
+        })?;
+    display.note(format!(
+        "{} voxels at {} m from {} scans{} -> {} and {}",
+        points,
+        voxel_size,
+        scans_used,
+        match unplaced {
             0 => String::new(),
             n => format!(", {n} scan(s) with no pose left out"),
         },
         lite_record::raytrace::GLOBAL_MAP_TOPIC,
         beside.display(),
-    );
-    println!("  voxel map in {}s", started.elapsed().as_secs());
+    ));
     Ok(())
 }
+
 
 fn tf_fixup(recording: &Path, urdf: Option<&Path>) -> Result<()> {
     let urdf = load_urdf(urdf)?;

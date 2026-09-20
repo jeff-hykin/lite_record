@@ -700,7 +700,7 @@ async fn convert_recording(
         // The button repairs a split clock as well as decoding jxl: a recording
         // whose streams disagree cannot be drawn at all, and the operator
         // pressing this has no other way to fix it. See `crate::restamp`.
-        let shifts = crate::restamp::survey_path(&source)
+        let shifts = crate::restamp::survey_path(&source, None)
             .map(|clocks| {
                 clocks
                     .iter()

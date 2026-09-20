@@ -282,14 +282,35 @@ impl Spool {
         })
     }
 
+    /// A spool for something other than corrected scans, named by `suffix`
+    /// next to the recording. Same format, same reasons.
+    pub fn beside_named(recording: &Path, suffix: &str) -> Result<Spool> {
+        let mut name = recording.as_os_str().to_os_string();
+        name.push(suffix);
+        let path = PathBuf::from(name);
+        let file = std::fs::File::create(&path)
+            .with_context(|| format!("could not open the spool {}", path.display()))?;
+        Ok(Spool {
+            path,
+            file: BufWriter::with_capacity(1 << 20, file),
+            clouds: 0,
+            bytes: 0,
+            passed_through: 0,
+        })
+    }
+
     pub fn push(&mut self, log_time: u64, cloud: &Deskewed) -> Result<()> {
-        let data = match cloud {
-            Deskewed::Corrected(data) => data,
+        match cloud {
+            Deskewed::Corrected(data) => self.push_bytes(log_time, data),
             Deskewed::Unchanged(_) => {
                 self.passed_through += 1;
-                return Ok(());
+                Ok(())
             }
-        };
+        }
+    }
+
+    /// One already-encoded message, stamped `log_time`.
+    pub fn push_bytes(&mut self, log_time: u64, data: &[u8]) -> Result<()> {
         self.file.write_all(&log_time.to_le_bytes())?;
         self.file.write_all(&(data.len() as u32).to_le_bytes())?;
         self.file.write_all(data)?;
@@ -314,25 +335,37 @@ impl Spool {
     /// Copies the spool into the recording and removes it. `frame` is the
     /// lidar's frame, recorded on the channel so a reader knows the clouds are
     /// placed by the same tf edge as the originals.
-    pub fn drain_into(self, appender: &mut Appender, frame: &str) -> Result<u64> {
+    pub fn drain_into(self, appender: &mut Appender, frame: &str, gauge: Option<&crate::progress::Gauge>) -> Result<u64> {
+        let sample = crate::cdr::point_cloud2(&PointCloud2 {
+            header: crate::msgs::Header::new(0, frame),
+            height: 1,
+            width: 0,
+            fields: Vec::new(),
+            is_bigendian: false,
+            point_step: 0,
+            row_step: 0,
+            data: Vec::new(),
+            is_dense: true,
+        });
+        let schema = appender.schema(sample.schema_name, "ros2msg", sample.schema_text.as_bytes());
+        let channel = appender.channel(DESKEWED_TOPIC, schema, "cdr", &channel_metadata(DESKEWED_TOPIC));
+        self.drain(|log_time, data| {
+            if let Some(gauge) = gauge {
+                gauge.at(log_time);
+            }
+            appender.write_stream(channel, log_time, data)
+        })
+    }
+
+    /// Reads the spool back in the order it was written, one message at a
+    /// time, handing each to `sink`, then removes it -- on failure too, since
+    /// a spool is worthless once its pass is over. Streamed, never held: the
+    /// spool exists because its contents do not fit in memory.
+    pub fn drain(self, mut sink: impl FnMut(u64, Vec<u8>) -> Result<()>) -> Result<u64> {
         let Spool { path, mut file, clouds, .. } = self;
         file.flush()?;
         drop(file);
         let result = (|| -> Result<u64> {
-            let sample = crate::cdr::point_cloud2(&PointCloud2 {
-                header: crate::msgs::Header::new(0, frame),
-                height: 1,
-                width: 0,
-                fields: Vec::new(),
-                is_bigendian: false,
-                point_step: 0,
-                row_step: 0,
-                data: Vec::new(),
-                is_dense: true,
-            });
-            let schema = appender.schema(sample.schema_name, "ros2msg", sample.schema_text.as_bytes());
-            let channel = appender.channel(DESKEWED_TOPIC, schema, "cdr", &channel_metadata(DESKEWED_TOPIC));
-
             let mut reader = BufReader::with_capacity(1 << 20, std::fs::File::open(&path)?);
             let mut written = 0;
             for _ in 0..clouds {
@@ -342,12 +375,11 @@ impl Spool {
                 reader.read_exact(&mut length)?;
                 let mut data = vec![0u8; u32::from_le_bytes(length) as usize];
                 reader.read_exact(&mut data)?;
-                appender.write(channel, u64::from_le_bytes(stamp), data)?;
+                sink(u64::from_le_bytes(stamp), data)?;
                 written += 1;
             }
             Ok(written)
         })();
-        // The spool is worthless once the pass is over, including on failure.
         let _ = std::fs::remove_file(&path);
         result
     }

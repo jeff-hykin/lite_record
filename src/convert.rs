@@ -100,6 +100,9 @@ pub struct Report {
 pub struct Progress {
     pub messages: AtomicU64,
     pub bytes: AtomicU64,
+    /// Where in the recording the rewrite has got, for the command line's
+    /// step display; the web page reads the two counters above instead.
+    pub gauge: Arc<crate::progress::Gauge>,
 }
 
 fn file_size(path: &Path) -> u64 {
@@ -587,7 +590,9 @@ fn whole_file(
 ) -> Result<Report> {
     let mut rewriter = Rewriter::new(output, shifts)?;
     for message in mcap::MessageStream::new(mapped)? {
-        rewriter.write(&message?)?;
+        let message = message?;
+        progress.gauge.at(message.log_time);
+        rewriter.write(&message)?;
         progress.messages.store(rewriter.written(), Ordering::Relaxed);
         // Stat rather than sum the payloads, so the browser shows room going off
         // the card. Occasionally, because it is a syscall in the message loop.
@@ -653,7 +658,9 @@ fn by_chunk(
     for chunk in &chunks {
         let before = rewriter.written();
         for message in summary.stream_chunk(mapped, chunk)? {
-            rewriter.write(&message?)?;
+            let message = message?;
+            progress.gauge.at(message.log_time);
+            rewriter.write(&message)?;
             // Per message rather than per chunk: one chunk of jxl is minutes of
             // decoding on the Pi, and a progress line that reads zero for all of
             // it is indistinguishable from a hung job. Bytes still only move at
@@ -689,6 +696,7 @@ fn by_chunk(
 
         progress.messages.store(rewriter.written(), Ordering::Relaxed);
         progress.bytes.store(grown, Ordering::Relaxed);
+        progress.gauge.detail(format!("{} messages  {:.2} GB written", rewriter.written(), grown as f64 / 1e9));
     }
 
     rewriter.writer.finish()?;

@@ -13,6 +13,7 @@
 //! and a `.pc2.lcm` beside it, which is what `dimos map view` and that tooling
 //! open.
 
+use crate::deskew::Spool;
 use anyhow::{bail, Context, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -70,8 +71,8 @@ fn stamp_seconds(header: &Header, log_time: u64) -> f64 {
     header.stamp_sec as f64 + header.stamp_nsec as f64 / 1e9
 }
 
-/// How often the accumulating map is written out, in scans. The lidar runs at
-/// 10 Hz, so every tenth scan is one snapshot a second.
+/// The fewest scans between two snapshots of the accumulating map. The lidar
+/// runs at 10 Hz, so this is one snapshot a second on a short recording.
 ///
 /// The map is worth watching build, not just seeing finished: a single message
 /// covering the whole run would only ever draw at whatever instant it carried,
@@ -80,11 +81,26 @@ fn stamp_seconds(header: &Header, log_time: u64) -> f64 {
 /// this is a second rather than every frame.
 pub const SNAPSHOT_EVERY_SCANS: usize = 10;
 
-/// What a run produced.
+/// The most snapshots a recording gets, however long it is. Each snapshot is
+/// the whole map so far, so a fixed cadence makes the series quadratic in the
+/// recording's length: an hour at one a second would append thousands of
+/// copies of a city block. Spreading a bounded count over the run keeps the
+/// series a fraction of the recording whatever its length.
+pub const MAX_SNAPSHOTS: usize = 120;
+
+/// Scans between snapshots for a run of `scans` scans.
+pub fn snapshot_every(scans: usize) -> usize {
+    scans.div_ceil(MAX_SNAPSHOTS).max(SNAPSHOT_EVERY_SCANS)
+}
+
+/// What a run produced. The snapshots are on disk in `snapshots`, encoded and
+/// in log-time order, because on a long recording they are many times the
+/// size of the finished map; only the finished map itself is in memory.
 pub struct Map {
-    /// The accumulating map over time, oldest first, each stamped at the scan
-    /// that completed it. The last is the whole run.
-    pub snapshots: Vec<(u64, PointCloud2)>,
+    pub snapshots: Spool,
+    /// The whole run, stamped at its last placed scan.
+    pub final_cloud: PointCloud2,
+    pub final_stamp_nanos: u64,
     pub scans: usize,
     /// Scans with no pose within tolerance, which are left out rather than
     /// placed somewhere wrong.
@@ -95,16 +111,16 @@ pub struct Map {
 impl Map {
     /// Points in the finished map.
     pub fn points(&self) -> usize {
-        self.snapshots.last().map_or(0, |(_, cloud)| cloud.width as usize)
+        self.final_cloud.width as usize
     }
 
-    /// The finished map, which is what goes in the `.pc2.lcm`.
-    pub fn final_cloud(&self) -> Option<&PointCloud2> {
-        self.snapshots.last().map(|(_, cloud)| cloud)
+    /// Snapshots spooled so far, the finished map included.
+    pub fn snapshot_count(&self) -> u64 {
+        self.snapshots.clouds()
     }
 
-    pub fn bytes(&self) -> usize {
-        self.snapshots.iter().map(|(_, cloud)| cloud.data.len()).sum()
+    pub fn bytes(&self) -> u64 {
+        self.snapshots.bytes()
     }
 }
 
@@ -149,15 +165,18 @@ pub fn build(
     tf_topic: &str,
     world_frame: &str,
     scans_done: &Arc<AtomicU64>,
+    gauge: Option<&crate::progress::Gauge>,
 ) -> Result<Map> {
     let config = default_config(world_frame);
     let voxel_size = config.voxel_size;
     let transforms = crate::heatmap::TfHistory::read(recording, tf_topic)?;
     let channel = recording.channel(cloud_topic)?;
+    let every = snapshot_every(recording.message_count(channel.id).unwrap_or(0) as usize);
     let mut mapper = Mapper::new(config);
     let (mut scans, mut unplaced) = (0usize, 0usize);
-    let mut snapshots: Vec<(u64, PointCloud2)> = Vec::new();
+    let mut snapshots = Spool::beside_named(&recording.path, ".map-spool")?;
     let mut last_stamp_nanos = 0u64;
+    let mut last_snapshot_stamp = None;
 
     for message in recording.messages(channel.id, None)? {
         let message = message?;
@@ -172,6 +191,9 @@ pub fn build(
             continue;
         }
         last_stamp_nanos = message.log_time;
+        if let Some(gauge) = gauge {
+            gauge.at(message.log_time);
+        }
         // A Livox sweep is a fixed 20064 slots and the ones that got no return
         // are written as (0, 0, 0). Deskewing rotates those off the origin
         // rather than dropping them, so they arrive as a shell of points within
@@ -206,24 +228,29 @@ pub fn build(
         );
         scans += 1;
         scans_done.fetch_add(1, Ordering::Relaxed);
-        if scans % SNAPSHOT_EVERY_SCANS == 0 {
-            snapshots.push((message.log_time, cloud_of(&mapper.global_points(), message.log_time, world_frame)));
+        if let Some(gauge) = gauge.filter(|_| scans.is_multiple_of(10)) {
+            gauge.detail(format!("{scans} scans"));
+        }
+        if scans % every == 0 {
+            let snapshot = cloud_of(&mapper.global_points(), message.log_time, world_frame);
+            snapshots.push_bytes(message.log_time, &crate::cdr::point_cloud2(&snapshot).data)?;
+            last_snapshot_stamp = Some(message.log_time);
         }
     }
     if scans == 0 {
+        snapshots.discard();
         bail!("tf never placed {cloud_topic}'s frame in {world_frame}");
     }
 
-    // The last scan rarely lands on the snapshot cadence, and the finished map
-    // is the one thing that must be in there -- it is what the .pc2.lcm carries
-    // and what anyone scrubbing to the end expects to see.
-    if snapshots.last().is_none_or(|(stamp, _)| *stamp != last_stamp_nanos) {
-        snapshots.push((
-            last_stamp_nanos,
-            cloud_of(&mapper.global_points(), last_stamp_nanos, world_frame),
-        ));
+    // Only now, with every scan folded in and every ray cast, is the map
+    // finished: this cloud is what the .pc2.lcm carries and what anyone
+    // scrubbing to the end expects to see. The last scan rarely lands on the
+    // snapshot cadence, so it is usually one more snapshot too.
+    let final_cloud = cloud_of(&mapper.global_points(), last_stamp_nanos, world_frame);
+    if last_snapshot_stamp != Some(last_stamp_nanos) {
+        snapshots.push_bytes(last_stamp_nanos, &crate::cdr::point_cloud2(&final_cloud).data)?;
     }
-    Ok(Map { snapshots, scans, unplaced, voxel_size })
+    Ok(Map { snapshots, final_cloud, final_stamp_nanos: last_stamp_nanos, scans, unplaced, voxel_size })
 }
 
 /// Writes the map into the recording as [`GLOBAL_MAP_TOPIC`] and beside it as a
@@ -232,11 +259,12 @@ pub fn build(
 /// The two carry the same cloud in different encodings on purpose: the topic is
 /// CDR so anything reading the mcap sees it, the file is LCM because that is
 /// what dimos' map tooling opens.
-pub fn write(recording: &std::path::Path, map: &Map) -> Result<std::path::PathBuf> {
-    let Some(final_cloud) = map.final_cloud() else {
+pub fn write(recording: &std::path::Path, map: Map, gauge: Option<&crate::progress::Gauge>) -> Result<std::path::PathBuf> {
+    if map.final_cloud.width == 0 {
+        map.snapshots.discard();
         bail!("the map came out empty");
-    };
-    let sample = crate::cdr::point_cloud2(final_cloud);
+    }
+    let sample = crate::cdr::point_cloud2(&map.final_cloud);
     let mut appender = crate::mcap_append::Appender::open(recording)?;
     let schema = appender.schema(sample.schema_name, "ros2msg", sample.schema_text.as_bytes());
     let channel = appender.channel(
@@ -247,15 +275,21 @@ pub fn write(recording: &std::path::Path, map: &Map) -> Result<std::path::PathBu
     );
     // In log-time order, which is the order a reader will want them, and each at
     // the scan that completed it so the map grows as the recording plays.
-    for (stamp, cloud) in &map.snapshots {
-        appender.write(channel, *stamp, crate::cdr::point_cloud2(cloud).data)?;
-    }
+    // Streamed straight from the spool: the series is far larger than memory.
+    map.snapshots.drain(|stamp, data| {
+        if let Some(gauge) = gauge {
+            gauge.at(stamp);
+        }
+        appender.write_stream(channel, stamp, data)
+    })?;
     appender.finish()?;
 
     // The file beside it is the finished map, not the series: it is a single
     // cloud by definition, and what anybody opening it wants is the whole thing.
+    // Written last, after the recording is complete, so a .pc2.lcm on disk
+    // always means the whole run went in.
     let beside = recording.with_extension("pc2.lcm");
-    std::fs::write(&beside, crate::lcm::point_cloud2(final_cloud))
+    std::fs::write(&beside, crate::lcm::point_cloud2(&map.final_cloud))
         .with_context(|| format!("could not write {}", beside.display()))?;
     Ok(beside)
 }
