@@ -781,16 +781,46 @@ async fn main() -> Result<()> {
     println!("lite_record on http://{}:{}", local_address(), args.port);
     println!("  recordings -> {}", hub.settings().record_dir.display());
 
+    // An mcap left unfinalised has no index and no summary, so every reader
+    // rejects it. Closing the recorder on the way out is what makes ctrl-c,
+    // and a `systemctl restart` (SIGTERM), safe for a recording in progress.
+    // The recorder is closed before the server winds down rather than after:
+    // a phone left on the page holds a websocket open, and a graceful server
+    // shutdown waits on that until systemd loses patience and kills us.
     let serving = axum::serve(listener, web::router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+        .with_graceful_shutdown({
+            let hub = Arc::clone(&hub);
+            async move {
+                termination().await;
+                hub.shutdown();
+            }
         })
         .await;
-    // An mcap left unfinalised has no index and no summary, so every reader
-    // rejects it. Closing on the way out is what makes ctrl-c safe.
     hub.shutdown();
     serving?;
     Ok(())
+}
+
+/// Ctrl-C at a terminal, or the SIGTERM a service manager sends.
+async fn termination() {
+    #[cfg(unix)]
+    {
+        let mut terminate = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn local_address() -> IpAddr {

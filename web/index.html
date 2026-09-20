@@ -98,6 +98,22 @@
 </section>
 
 <section class="card">
+    <h2>Lidar</h2>
+    <div class="row">
+        <label class="check">
+            <input id="cloud-enabled" type="checkbox">
+            <span>On</span>
+        </label>
+        <span id="cloud-points" class="hint"></span>
+    </div>
+    <div class="preview-frame cloud-frame">
+        <canvas id="cloud-canvas" hidden></canvas>
+        <p id="cloud-idle" class="preview-idle">Off.</p>
+    </div>
+    <p class="hint">A thinned copy of the live scan, a few thousand points at up to ten a second, coloured by height. Off by default: while off the Pi never touches it. Drag to orbit, pinch or scroll to zoom.</p>
+</section>
+
+<section class="card">
     <h2>Sensors</h2>
     <!-- Engage/disengage exists so another process can borrow a camera or the
          lidar without restarting the recorder. -->

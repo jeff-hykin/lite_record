@@ -139,6 +139,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/recordings/{name}/summary", get(recording_summary))
         .route("/api/recordings/{name}/move", post(move_recording))
         .route("/api/recordings/{name}/copy", post(copy_recording))
+        .route("/api/recordings/{name}/rename", post(rename_recording))
         .route("/api/move", get(move_status))
         .route("/api/storage/volumes", get(storage_volumes))
         .route("/api/storage/browse", get(storage_browse))
@@ -156,6 +157,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/network/mid360", post(configure_lidar_network))
         .route("/ws/monitor", get(monitor_socket))
         .route("/ws/preview", get(preview_socket))
+        .route("/ws/cloud", get(cloud_socket))
         .with_state(state)
 }
 
@@ -388,6 +390,46 @@ async fn copy_recording(
     axum::Json(request): axum::Json<MoveRequest>,
 ) -> Response {
     start_transfer(state, name, request.destination, "copy").await
+}
+
+#[derive(Deserialize)]
+struct RenameRequest {
+    name: String,
+}
+
+/// A new name in the same folder. Another folder is a move, which copies and
+/// verifies; this only touches the directory entry, so it is instant and the
+/// file is never at risk.
+async fn rename_recording(
+    Path(name): Path<String>,
+    State(state): State<AppState>,
+    axum::Json(request): axum::Json<RenameRequest>,
+) -> Response {
+    let directory = state.hub.settings().record_dir;
+    let source = match record::resolve(&directory, &name) {
+        Ok(path) => path,
+        Err(error) => return bad_request(error),
+    };
+    let target = match record::resolve(&directory, request.name.trim()) {
+        Ok(path) => path,
+        Err(error) => return bad_request(error),
+    };
+    if is_being_recorded(&state, &source) {
+        return bad_request("that file is being recorded right now");
+    }
+    if !source.is_file() {
+        return bad_request(format!("no recording named {name}"));
+    }
+    let renamed = target.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    if target != source {
+        if target.exists() {
+            return bad_request(format!("{renamed} already exists"));
+        }
+        if let Err(error) = std::fs::rename(&source, &target) {
+            return bad_request(error);
+        }
+    }
+    axum::Json(json!({ "ok": true, "name": renamed })).into_response()
 }
 
 async fn start_transfer(
@@ -1103,6 +1145,42 @@ async fn run_preview_socket(mut socket: WebSocket, state: AppState) {
     }
 }
 
+/// How often a watching browser is offered the newest thinned scan. The lidar
+/// delivers ten a second; this only has to be quicker than that.
+const CLOUD_POLL: Duration = Duration::from_millis(50);
+
+async fn cloud_socket(upgrade: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    upgrade.on_upgrade(move |socket| run_cloud_socket(socket, state))
+}
+
+/// Like the image preview: the newest scan whenever the socket is free, and a
+/// ping when nothing arrives so a vanished phone is noticed. The watch guard
+/// is what makes the hub thin scans at all, and closing the socket ends it.
+async fn run_cloud_socket(mut socket: WebSocket, state: AppState) {
+    let _watching = state.hub.watch_cloud();
+    let mut since_frame = Duration::ZERO;
+    loop {
+        tokio::time::sleep(CLOUD_POLL).await;
+        match state.hub.take_cloud_preview() {
+            Some(points) => {
+                since_frame = Duration::ZERO;
+                if socket.send(Message::Binary(points)).await.is_err() {
+                    break;
+                }
+            }
+            None => {
+                since_frame += CLOUD_POLL;
+                if since_frame >= Duration::from_secs(5) {
+                    since_frame = Duration::ZERO;
+                    if socket.send(Message::Ping(Bytes::new())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1189,6 +1267,43 @@ mod tests {
         assert_eq!(requested_range(Some("items=0-9"), 100), None);
         assert_eq!(requested_range(Some("bytes=80-40"), 100), None);
         assert_eq!(requested_range(Some("bytes=0-9"), 0), None);
+    }
+
+    #[tokio::test]
+    async fn a_recording_is_renamed_in_place_and_never_over_another() {
+        let state = scratch_state();
+        let directory = std::env::temp_dir().join(format!("lite_web_rn_{}", record::now_nanos()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut settings = state.hub.settings();
+        settings.record_dir = directory.clone();
+        state.hub.update_settings(settings).unwrap();
+        std::fs::write(directory.join("clip.mcap"), b"one").unwrap();
+        std::fs::write(directory.join("taken.mcap"), b"two").unwrap();
+
+        let rename = |from: &str, to: &str| {
+            rename_recording(
+                Path(from.to_string()),
+                State(state.clone()),
+                axum::Json(RenameRequest { name: to.to_string() }),
+            )
+        };
+
+        // The extension is implied, and a trailing space is nobody's intent.
+        assert_eq!(rename("clip.mcap", "walk ").await.status(), StatusCode::OK);
+        assert!(!directory.join("clip.mcap").exists());
+        assert_eq!(std::fs::read(directory.join("walk.mcap")).unwrap(), b"one");
+
+        assert_eq!(rename("walk.mcap", "taken").await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(std::fs::read(directory.join("taken.mcap")).unwrap(), b"two");
+        assert!(directory.join("walk.mcap").exists());
+
+        assert_eq!(rename("walk.mcap", "../walk").await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(rename("walk.mcap", "").await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(rename("gone.mcap", "x").await.status(), StatusCode::BAD_REQUEST);
+        assert!(directory.join("walk.mcap").exists());
+
+        std::fs::remove_dir_all(&directory).ok();
+        std::fs::remove_file(state.hub.settings_file()).ok();
     }
 
     #[tokio::test]

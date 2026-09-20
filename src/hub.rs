@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -296,6 +296,60 @@ impl RateCounter {
     }
 }
 
+/// See [`Hub::watch_cloud`].
+pub struct CloudWatch {
+    hub: Arc<Hub>,
+}
+
+impl Drop for CloudWatch {
+    fn drop(&mut self) {
+        if self.hub.cloud_watchers.fetch_sub(1, Ordering::Relaxed) == 1 {
+            *self.hub.cloud_preview.lock().unwrap() = None;
+        }
+    }
+}
+
+/// How many points the page's 3D view gets per scan. A Mid-360 frame is about
+/// twenty thousand; a phone draws a few thousand at ten a second without
+/// warming up, and the shape of a room is plain at that density.
+pub const CLOUD_PREVIEW_POINTS: usize = 4000;
+
+/// Every nth point of a scan as little-endian `x y z intensity` f32 quads, for
+/// the browser to hand straight to a vertex buffer. The zero points a Mid-360
+/// leaves in its slots for returns it did not get are skipped, so they do not
+/// pile up at the origin.
+pub fn cloud_preview(cloud: &crate::msgs::PointCloud2, max_points: usize) -> bytes::Bytes {
+    let offset = |name: &str| {
+        cloud
+            .fields
+            .iter()
+            .find(|field| field.name == name && field.datatype == crate::msgs::POINT_FIELD_FLOAT32)
+            .map(|field| field.offset as usize)
+    };
+    let (Some(x), Some(y), Some(z)) = (offset("x"), offset("y"), offset("z")) else {
+        return bytes::Bytes::new();
+    };
+    let intensity = offset("intensity");
+    let step = cloud.point_step as usize;
+    if step == 0 {
+        return bytes::Bytes::new();
+    }
+    let total = cloud.data.len() / step;
+    let stride = total.div_ceil(max_points.max(1)).max(1);
+    let read = |point: &[u8], at: usize| f32::from_le_bytes(point[at..at + 4].try_into().unwrap());
+    let mut out = Vec::with_capacity(total.div_ceil(stride) * 16);
+    for point in cloud.data.chunks_exact(step).step_by(stride) {
+        let (px, py, pz) = (read(point, x), read(point, y), read(point, z));
+        if px == 0.0 && py == 0.0 && pz == 0.0 {
+            continue;
+        }
+        for value in [px, py, pz, intensity.map_or(0.0, |at| read(point, at))] {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    bytes::Bytes::from(out)
+}
+
 #[derive(Serialize, Clone)]
 pub struct StreamStats {
     pub topic: String,
@@ -336,6 +390,11 @@ pub struct Hub {
     encode_senders: Vec<Sender<Produced>>,
     /// Latest preview frame, as jpeg bytes ready to push down the websocket.
     preview: Mutex<Option<PreviewFrame>>,
+    /// The newest scan, thinned for the page's 3D view. Filled only while a
+    /// browser is watching, see `cloud_watchers`.
+    cloud_preview: Mutex<Option<bytes::Bytes>>,
+    /// Open `/ws/cloud` sockets. Zero means the scans are never touched here.
+    cloud_watchers: AtomicUsize,
     /// Counts preview encodes so switching the preview off can be shown to
     /// actually stop the work rather than just hide the result.
     preview_encodes: AtomicU64,
@@ -393,6 +452,8 @@ impl Hub {
             latest_intrinsics: Mutex::new(BTreeMap::new()),
             encode_senders,
             preview: Mutex::new(None),
+            cloud_preview: Mutex::new(None),
+            cloud_watchers: AtomicUsize::new(0),
             preview_encodes: AtomicU64::new(0),
             record_encodes: AtomicU64::new(0),
             monitor: Mutex::new(sysmon::Monitor::default()),
@@ -508,7 +569,10 @@ impl Hub {
             // exception — the hub remembers those to replay into a recording
             // that has not started yet, so they are never shed.
             let announcement = matches!(produced, Produced::CameraInfo { .. });
+            let watched_scan = matches!(produced, Produced::Cloud { .. })
+                && hub.cloud_watchers.load(Ordering::Relaxed) > 0;
             if !announcement
+                && !watched_scan
                 && !hub.recording_active.load(Ordering::Relaxed)
                 && !hub.preview_matches(produced.topic())
             {
@@ -579,7 +643,15 @@ impl Hub {
                 self.offer(&topic, crate::cdr::imu(&imu));
             }
             Produced::Cloud { topic, cloud } => {
-                self.offer(&topic, crate::cdr::point_cloud2(&cloud));
+                if self.cloud_watchers.load(Ordering::Relaxed) > 0 {
+                    *self.cloud_preview.lock().unwrap() =
+                        Some(cloud_preview(&cloud, CLOUD_PREVIEW_POINTS));
+                }
+                // A scan that is here only for the 3D view is not serialised
+                // for a recorder that does not exist.
+                if self.recording_active.load(Ordering::Relaxed) {
+                    self.offer(&topic, crate::cdr::point_cloud2(&cloud));
+                }
             }
         }
     }
@@ -633,6 +705,17 @@ impl Hub {
 
     pub fn take_preview(&self) -> Option<PreviewFrame> {
         self.preview.lock().unwrap().take()
+    }
+
+    /// Registers a browser watching the 3D view. While the guard lives, each
+    /// scan is thinned into `take_cloud_preview`; drop it and the work stops.
+    pub fn watch_cloud(self: &Arc<Self>) -> CloudWatch {
+        self.cloud_watchers.fetch_add(1, Ordering::Relaxed);
+        CloudWatch { hub: Arc::clone(self) }
+    }
+
+    pub fn take_cloud_preview(&self) -> Option<bytes::Bytes> {
+        self.cloud_preview.lock().unwrap().take()
     }
 
     fn offer(&self, topic: &str, encoded: crate::cdr::Encoded) {
@@ -757,6 +840,33 @@ impl Hub {
                 (kind.as_str().to_string(), status)
             })
             .collect()
+    }
+
+    /// The data topics the enabled sensors should be producing that nobody has
+    /// heard from lately: never started, or started and gone quiet. Intrinsics
+    /// are left out, they publish once. This is what the record light flashes
+    /// about, so a rig recording without its camera or lidar is noticed with
+    /// the phone in a pocket.
+    pub fn missing_streams(&self) -> Vec<String> {
+        let settings = self.settings();
+        let mut expected = Vec::new();
+        for config in [&settings.realsense, &settings.orbbec, &settings.oakd] {
+            if config.enabled {
+                expected.extend(config.streams().into_iter().map(|stream| match stream {
+                    StreamId::Imu => config.naming.imu_topic(),
+                    other => config.naming.image_topic(other),
+                }));
+            }
+        }
+        if settings.livox.enabled {
+            expected.extend(settings.livox.streams().into_iter().map(|stream| match stream {
+                StreamId::Imu => settings.livox.naming.imu_topic(),
+                _ => settings.livox.naming.points_topic(),
+            }));
+        }
+        let rates = self.rates.lock().unwrap();
+        expected.retain(|topic| rates.get(topic).is_none_or(|counter| counter.hz() <= 0.0));
+        expected
     }
 
     /// Topics under `prefix` that produced messages once and have since gone
@@ -1585,6 +1695,98 @@ mod tests {
         assert!(wait_for(|| hub.record_encode_count() == 20));
         hub.stop_recording().unwrap();
         std::fs::remove_dir_all(&directory).ok();
+        std::fs::remove_file(hub.settings_file()).ok();
+    }
+
+    #[test]
+    fn the_cloud_preview_thins_a_scan_and_drops_the_empty_slots() {
+        let points = [
+            (1.0f32, 2.0f32, 3.0f32, 40.0f32),
+            (0.0, 0.0, 0.0, 0.0),
+            (4.0, 5.0, 6.0, 70.0),
+            (7.0, 8.0, 9.0, 100.0),
+            (0.0, 0.0, 0.0, 0.0),
+            (10.0, 11.0, 12.0, 130.0),
+        ];
+        let mut data = Vec::new();
+        for (x, y, z, i) in points {
+            for value in [x, y, z, i] {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            data.extend_from_slice(&[0u8; 16]);
+        }
+        let cloud = crate::msgs::PointCloud2 {
+            header: crate::msgs::Header::new(0, "livox_frame"),
+            height: 1,
+            width: points.len() as u32,
+            fields: crate::livox::point_fields(),
+            is_bigendian: false,
+            point_step: crate::livox::POINT_STEP,
+            row_step: crate::livox::POINT_STEP * points.len() as u32,
+            data,
+            is_dense: true,
+        };
+        let thinned = cloud_preview(&cloud, 3);
+        // Stride 2: slots 0, 2, 4 — and slot 4 is empty, so two points survive.
+        let floats: Vec<f32> = thinned
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        assert_eq!(floats, vec![1.0, 2.0, 3.0, 40.0, 4.0, 5.0, 6.0, 70.0]);
+        // Whole scan asked for: every real point, none of the empty ones.
+        assert_eq!(cloud_preview(&cloud, 100).len(), 4 * 16);
+        // No x/y/z fields: nothing rather than garbage.
+        let mut bare = cloud.clone();
+        bare.fields.clear();
+        assert!(cloud_preview(&bare, 100).is_empty());
+    }
+
+    #[test]
+    fn scans_are_only_thinned_while_a_browser_watches() {
+        let hub = scratch_hub();
+        let cloud = crate::livox::point_fields();
+        assert!(!cloud.is_empty());
+        let scan = || Produced::Cloud {
+            topic: "/livox/lidar".into(),
+            cloud: crate::msgs::PointCloud2 {
+                header: crate::msgs::Header::new(0, "livox_frame"),
+                height: 1,
+                width: 1,
+                fields: crate::livox::point_fields(),
+                is_bigendian: false,
+                point_step: crate::livox::POINT_STEP,
+                row_step: crate::livox::POINT_STEP,
+                data: {
+                    let mut d = Vec::new();
+                    for v in [1.0f32, 2.0, 3.0, 4.0] {
+                        d.extend_from_slice(&v.to_le_bytes());
+                    }
+                    d.extend_from_slice(&[0u8; 16]);
+                    d
+                },
+                is_dense: true,
+            },
+        };
+        // With nobody watching and nothing recording the sink sheds the scan
+        // on the capture thread; it never reaches the encode pool at all.
+        let sink = hub.sink();
+        let encoded = hub.record_encode_count();
+        sink(scan());
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(hub.record_encode_count(), encoded);
+        assert!(hub.take_cloud_preview().is_none());
+        // A watcher lets it through to the pool, which thins it.
+        let watch = hub.watch_cloud();
+        sink(scan());
+        assert!(wait_for(|| hub.take_cloud_preview().is_some_and(|b| b.len() == 16)));
+        assert_eq!(hub.record_encode_count(), encoded + 1);
+        drop(watch);
+        sink(scan());
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(hub.record_encode_count(), encoded + 1);
+        assert!(hub.take_cloud_preview().is_none());
         std::fs::remove_file(hub.settings_file()).ok();
     }
 

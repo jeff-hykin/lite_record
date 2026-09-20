@@ -120,6 +120,17 @@ header pin through a resistor to ground. The installer puts the service's user i
 through `survive_reboot` rather than by editing the unit. Linux only; a permission or pin
 problem is printed at startup and the recorder carries on without the button.
 
+The light also complains:
+
+- **fast flash** (5 Hz): recording, but a stream an enabled sensor should be producing is
+  not arriving — the camera or lidar is unplugged, unpowered, or came back without one of
+  its streams.
+- **slow flash** (1 Hz): under five minutes of space left at the pace the current
+  recording is being written. The pace is measured from the recorder's own byte count
+  every five seconds and the free space comes from the health monitor, so this costs
+  nothing extra. Between recordings the last pace stands, so a card already too full
+  for another take flashes before the button is pressed.
+
 ## Network setup
 
 ```sh
@@ -213,6 +224,11 @@ subnet, then filter `arp -an` by the vendor prefix — a Pi 5 is `2c:cf:67` or `
 - **Preview** — a dropdown of every image topic the engaged sensors publish. It decodes and
   re-encodes one stream for the browser, which costs CPU, so it has its own on/off toggle;
   turning it off leaves the recording completely untouched.
+- **Lidar** — the live scan as a 3D point view, thinned on the Pi to a few thousand points
+  per frame and coloured by height. Off by default; while off the Pi never touches the
+  scans. Needs internet on the phone for three.js, like the URDF viewer.
+- **Files** — every recording, with per-topic summary, download, post-processing, rename,
+  copy or move to another drive, and delete.
 - **Monitor** — a collapsible panel showing per-stream Hz and drop counts, total and
   per-core CPU, memory, temperature, free space on the recording disk, and the Pi's
   throttle word (it warns on under-voltage, current throttling, and soft temperature

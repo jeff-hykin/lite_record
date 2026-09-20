@@ -994,6 +994,189 @@ const startPreviewSocket = () => {
     })
 }
 
+// -- lidar view -----------------------------------------------------------
+
+/**
+ * The live scan as points, thinned on the Pi (see `/ws/cloud`). Each frame is
+ * a flat little-endian f32 array of x y z intensity, handed to one buffer
+ * that is reused rather than rebuilt. The lidar is z-up and three.js is y-up,
+ * so the axes are swapped on the way in, the same as the URDF viewer.
+ */
+const loadCloudViewer = async (canvas) => {
+    const three = await import("https://esm.sh/three@0.180.0")
+    const { OrbitControls } = await import("https://esm.sh/three@0.180.0/examples/jsm/controls/OrbitControls.js")
+    const frame = canvas.parentElement
+    const renderer = new three.WebGLRenderer({ canvas, antialias: false })
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2))
+    const scene = new three.Scene()
+    scene.background = new three.Color(0x000000)
+    const camera = new three.PerspectiveCamera(55, 1, 0.05, 200)
+    camera.position.set(0, 4, 8)
+    const controls = new OrbitControls(camera, canvas)
+    controls.enableDamping = true
+    controls.target.set(0, 0, 0)
+    scene.add(new three.GridHelper(20, 20, 0x333a45, 0x222831))
+    scene.add(new three.AxesHelper(0.5))
+
+    const capacity = 8192
+    const positions = new Float32Array(capacity * 3)
+    const colors = new Float32Array(capacity * 3)
+    const geometry = new three.BufferGeometry()
+    geometry.setAttribute("position", new three.BufferAttribute(positions, 3).setUsage(three.DynamicDrawUsage))
+    geometry.setAttribute("color", new three.BufferAttribute(colors, 3).setUsage(three.DynamicDrawUsage))
+    geometry.setDrawRange(0, 0)
+    const material = new three.PointsMaterial({ size: 0.04, vertexColors: true })
+    const points = new three.Points(geometry, material)
+    points.frustumCulled = false
+    scene.add(points)
+
+    const resize = () => {
+        const width = frame.clientWidth || 320
+        const height = frame.clientHeight || 320
+        renderer.setSize(width, height, false)
+        camera.aspect = width / height
+        camera.updateProjectionMatrix()
+    }
+    new ResizeObserver(resize).observe(frame)
+    resize()
+
+    // Floor dark blue, head height yellow, above that white.
+    const shade = (z, out) => {
+        const t = Math.min(Math.max((z + 1) / 3, 0), 1)
+        out[0] = 0.15 + 0.85 * t
+        out[1] = 0.25 + 0.6 * t
+        out[2] = 0.9 - 0.7 * t
+    }
+
+    let paused = false
+    let dirty = true
+    const draw = () => {
+        requestAnimationFrame(draw)
+        if (paused) {
+            return
+        }
+        controls.update()
+        if (dirty || controls.enableDamping) {
+            renderer.render(scene, camera)
+            dirty = false
+        }
+    }
+    draw()
+
+    const rgb = [0, 0, 0]
+    return {
+        update(floats) {
+            const count = Math.min(Math.floor(floats.length / 4), capacity)
+            for (let i = 0; i < count; i++) {
+                const x = floats[i * 4]
+                const y = floats[i * 4 + 1]
+                const z = floats[i * 4 + 2]
+                positions[i * 3] = x
+                positions[i * 3 + 1] = z
+                positions[i * 3 + 2] = -y
+                shade(z, rgb)
+                colors[i * 3] = rgb[0]
+                colors[i * 3 + 1] = rgb[1]
+                colors[i * 3 + 2] = rgb[2]
+            }
+            geometry.setDrawRange(0, count)
+            geometry.attributes.position.needsUpdate = true
+            geometry.attributes.color.needsUpdate = true
+            dirty = true
+            return count
+        },
+        setPaused(value) {
+            paused = value
+        },
+    }
+}
+
+/**
+ * Off by default and off whenever the page is hidden: the socket is what
+ * makes the Pi thin scans, so closing it is what saves the work.
+ */
+const startCloudView = () => {
+    const toggle = element("cloud-enabled")
+    const canvas = element("cloud-canvas")
+    const idle = element("cloud-idle")
+    const count = element("cloud-points")
+    let viewer = null
+    let socket = null
+
+    const disconnect = () => {
+        if (socket) {
+            const closing = socket
+            socket = null
+            closing.close()
+        }
+    }
+    const connect = () => {
+        if (socket || !toggle.checked || document.hidden) {
+            return
+        }
+        const opened = new WebSocket(socketUrl("/ws/cloud"))
+        opened.binaryType = "arraybuffer"
+        socket = opened
+        opened.addEventListener("message", (event) => {
+            if (typeof event.data === "string") {
+                return
+            }
+            const shown = viewer.update(new Float32Array(event.data))
+            count.textContent = `${shown} points`
+            canvas.hidden = false
+            idle.hidden = true
+        })
+        opened.addEventListener("close", () => {
+            if (socket === opened) {
+                socket = null
+                setTimeout(connect, 1000)
+            }
+        })
+        opened.addEventListener("error", () => opened.close())
+    }
+    const stop = () => {
+        disconnect()
+        canvas.hidden = true
+        idle.hidden = false
+        idle.textContent = "Off."
+        count.textContent = ""
+        if (viewer) {
+            viewer.setPaused(true)
+        }
+    }
+    const start = async () => {
+        if (!viewer) {
+            idle.textContent = "Loading the viewer..."
+            try {
+                viewer = await loadCloudViewer(canvas)
+            } catch (error) {
+                toast(`the 3D view needs internet access for three.js: ${error.message}`, true)
+                toggle.checked = false
+                idle.textContent = "Off."
+                return
+            }
+        }
+        viewer.setPaused(false)
+        idle.textContent = "Waiting for a scan..."
+        connect()
+    }
+
+    toggle.addEventListener("change", () => (toggle.checked ? start() : stop()))
+    document.addEventListener("visibilitychange", () => {
+        if (document.hidden) {
+            disconnect()
+            if (viewer) {
+                viewer.setPaused(true)
+            }
+        } else if (toggle.checked) {
+            if (viewer) {
+                viewer.setPaused(false)
+            }
+            connect()
+        }
+    })
+}
+
 // -- urdf viewer ----------------------------------------------------------
 
 /**
@@ -1480,6 +1663,26 @@ const openFileSheet = (file) => {
         download.append(make("span", "action-detail", "Save the .mcap to this device."))
         actions.append(download)
 
+        action("secondary", "Rename", "A new name in this folder. Instant; nothing is copied.")
+            .addEventListener("click", async () => {
+                // The marker a post-processed file carries is kept out of the
+                // prompt and put back after, so renaming one does not make it
+                // look unprocessed.
+                const suffix = isConverted(file.name) ? ".viewable.mcap" : ".mcap"
+                const current = file.name.endsWith(suffix) ? file.name.slice(0, -suffix.length) : file.name
+                const wanted = prompt("New name", current)
+                if (wanted === null || wanted.trim() === "" || wanted.trim() === current) {
+                    return
+                }
+                try {
+                    await postJson(`/api/recordings/${encodeURIComponent(file.name)}/rename`, { name: wanted.trim() + suffix })
+                    closeSheet()
+                    refreshRecordings()
+                } catch (error) {
+                    toast(error.message, true)
+                }
+            })
+
         if (!isConverted(file.name)) {
             const convert = action("secondary", "Post process", "Re-encode every image stream into something Foxglove and rerun can both draw: png colour and infrared, raw 16-bit depth. Lossless, and replaces this file in place — only if every frame decodes.")
             const start = (reclaim) =>
@@ -1757,6 +1960,7 @@ const start = async () => {
     }
     startMonitorSocket()
     startPreviewSocket()
+    startCloudView()
 }
 
 start()
