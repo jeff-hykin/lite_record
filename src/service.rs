@@ -13,6 +13,8 @@ const LINUX_AUTOMOUNT_UNIT: &str = "/etc/systemd/system/lite_record-usb-mount@.s
 const LINUX_AUTOMOUNT_RULE: &str = "/etc/udev/rules.d/99-lite_record-usb.rules";
 const LINUX_AUTOMOUNT_HELPER: &str = "/usr/local/lib/lite_record/usb_mount";
 const LINUX_GPIO_RULE: &str = "/etc/udev/rules.d/99-lite_record-gpio.rules";
+const LINUX_REALSENSE_RULE: &str = "/etc/udev/rules.d/99-realsense-libusb.rules";
+const LINUX_MOVIDIUS_RULE: &str = "/etc/udev/rules.d/80-movidius.rules";
 const MACOS_LABEL: &str = "com.jeffhykin.lite_record";
 
 pub fn install(arguments: &[String], working_directory: &Path) -> Result<()> {
@@ -101,6 +103,7 @@ fn install_systemd(binary: &Path, arguments: &[String], working_directory: &Path
     write_privileged(LINUX_UNIT, &unit)?;
     install_usb_automount(&current_user()?)?;
     install_gpio_access(&current_user()?)?;
+    install_sensor_access(&current_user()?)?;
     privileged("systemctl", &["daemon-reload"])?;
     // `enable --now` leaves an already-running service on its old flags, so a
     // rerun with new options would look installed and change nothing.
@@ -176,6 +179,30 @@ fn install_usb_automount(user: &str) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// Lets a plain user open the cameras. On a machine that never had the vendor
+/// SDK installed nothing has granted this, and the first symptom is a camera
+/// the page lists as present but cannot engage. The rule files are carried in
+/// the binary so a fresh Raspberry Pi needs nothing but this program.
+fn install_sensor_access(user: &str) -> Result<()> {
+    write_privileged(LINUX_REALSENSE_RULE, REALSENSE_RULES)?;
+    write_privileged(LINUX_MOVIDIUS_RULE, MOVIDIUS_RULES)?;
+    // plugdev and video are what raspios itself uses for USB and camera
+    // devices; harmless where the rules above already open them wide.
+    for group in ["plugdev", "video", "dialout"] {
+        privileged("groupadd", &["--force", group])?;
+        privileged("usermod", &["--append", "--groups", group, user])?;
+    }
+    privileged("udevadm", &["control", "--reload"])?;
+    privileged(
+        "udevadm",
+        &["trigger", "--subsystem-match=usb", "--action=add"],
+    )?;
+    Ok(())
+}
+
+const REALSENSE_RULES: &str = include_str!("rules/99-realsense-libusb.rules");
+const MOVIDIUS_RULES: &str = include_str!("rules/80-movidius.rules");
 
 /// Lets the service reach a record button and the board's LED (`--button`,
 /// `--led`) without running as root. The GPIO chips are already `gpio`-group
@@ -438,6 +465,16 @@ mod tests {
             .iter()
             .map(|value| (*value).to_owned())
             .collect()
+    }
+
+    #[test]
+    fn the_sensor_rules_depend_on_nothing_outside_the_base_system() {
+        // A rule that runs a helper from a store path works only on the one
+        // machine that has that exact store path.
+        assert!(!REALSENSE_RULES.contains("/nix/store"));
+        assert!(REALSENSE_RULES.contains("ATTRS{idVendor}==\"8086\""));
+        assert!(REALSENSE_RULES.contains("RUN+=\"/bin/sh -c '/bin/chmod -R 0777 /sys/%p'\""));
+        assert!(MOVIDIUS_RULES.contains("ATTRS{idVendor}==\"03e7\", MODE=\"0666\""));
     }
 
     #[test]
