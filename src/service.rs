@@ -12,6 +12,7 @@ const LINUX_UNIT: &str = "/etc/systemd/system/lite_record.service";
 const LINUX_AUTOMOUNT_UNIT: &str = "/etc/systemd/system/lite_record-usb-mount@.service";
 const LINUX_AUTOMOUNT_RULE: &str = "/etc/udev/rules.d/99-lite_record-usb.rules";
 const LINUX_AUTOMOUNT_HELPER: &str = "/usr/local/lib/lite_record/usb_mount";
+const LINUX_GPIO_RULE: &str = "/etc/udev/rules.d/99-lite_record-gpio.rules";
 const MACOS_LABEL: &str = "com.jeffhykin.lite_record";
 
 pub fn install(arguments: &[String], working_directory: &Path) -> Result<()> {
@@ -99,8 +100,12 @@ fn install_systemd(binary: &Path, arguments: &[String], working_directory: &Path
     let unit = systemd_unit(binary, arguments, working_directory, &current_user()?);
     write_privileged(LINUX_UNIT, &unit)?;
     install_usb_automount(&current_user()?)?;
+    install_gpio_access(&current_user()?)?;
     privileged("systemctl", &["daemon-reload"])?;
-    privileged("systemctl", &["enable", "--now", "lite_record"])?;
+    // `enable --now` leaves an already-running service on its old flags, so a
+    // rerun with new options would look installed and change nothing.
+    privileged("systemctl", &["enable", "lite_record"])?;
+    privileged("systemctl", &["restart", "lite_record"])?;
     println!("\nlite_record now starts on boot.");
     println!("  usb drives mount themselves under /media, where the page looks.");
     println!("  status:  systemctl status lite_record");
@@ -171,6 +176,35 @@ fn install_usb_automount(user: &str) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// Lets the service reach a record button and the board's LED (`--button`,
+/// `--led`) without running as root. The GPIO chips are already `gpio`-group
+/// writable on raspios; the LEDs under `/sys/class/leds` are root-only, so a
+/// rule hands them to the same group as they appear. Installed whether or not
+/// a button is configured: it costs nothing, and the flags can be added later
+/// without re-running this.
+fn install_gpio_access(user: &str) -> Result<()> {
+    privileged("groupadd", &["--force", "gpio"])?;
+    // Group changes reach a systemd service when it next starts, which
+    // `enable --now` does right after this.
+    privileged("usermod", &["--append", "--groups", "gpio", user])?;
+    write_privileged(LINUX_GPIO_RULE, GPIO_RULE)?;
+    privileged("udevadm", &["control", "--reload"])?;
+    // LEDs and chips that exist already get the rule applied now, not at the
+    // next boot.
+    privileged(
+        "udevadm",
+        &["trigger", "--subsystem-match=leds", "--subsystem-match=gpio", "--action=add"],
+    )?;
+    Ok(())
+}
+
+/// sysfs LEDs have no device node for udev to chmod, so the rule runs the
+/// commands over the attribute directory instead, the same way raspios
+/// grants its other hardware groups.
+const GPIO_RULE: &str = "SUBSYSTEM==\"gpio\", KERNEL==\"gpiochip*\", GROUP=\"gpio\", MODE=\"0660\"\n\
+     SUBSYSTEM==\"leds\", ACTION==\"add\", \
+     RUN+=\"/bin/chgrp -R gpio /sys%p\", RUN+=\"/bin/chmod -R g=u /sys%p\"\n";
 
 /// `BindsTo` on the device is what unmounts the drive when it is yanked, so a
 /// stale mount point never outlives the disk behind it.
@@ -404,6 +438,14 @@ mod tests {
             .iter()
             .map(|value| (*value).to_owned())
             .collect()
+    }
+
+    #[test]
+    fn the_gpio_rule_opens_the_chips_and_the_leds_to_the_group() {
+        assert!(GPIO_RULE.contains("KERNEL==\"gpiochip*\", GROUP=\"gpio\", MODE=\"0660\""));
+        assert!(GPIO_RULE.contains("SUBSYSTEM==\"leds\""));
+        assert!(GPIO_RULE.contains("/bin/chgrp -R gpio /sys%p"));
+        assert!(GPIO_RULE.contains("/bin/chmod -R g=u /sys%p"));
     }
 
     #[test]

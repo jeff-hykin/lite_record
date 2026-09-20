@@ -1064,6 +1064,10 @@ impl Hub {
         status
     }
 
+    pub fn is_recording(&self) -> bool {
+        self.recording_active.load(Ordering::Relaxed)
+    }
+
     pub fn recording_status(&self) -> RecordingStatus {
         let status = match self.recorder.lock().unwrap().as_ref() {
             Some(recorder) => recorder.status(),

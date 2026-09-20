@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use lite_record::hub::{Hub, Settings};
 use lite_record::sensors::SensorKind;
+use lite_record::button::{self, Led};
 use lite_record::{convert, heatmap, network, service, video, web};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -34,6 +35,16 @@ struct Args {
     /// Open these sensors at startup instead of waiting for a button press.
     #[arg(long, global = true, value_delimiter = ',')]
     engage: Vec<String>,
+
+    /// A push button between this GPIO (BCM number: 17 is header pin 11) and
+    /// ground: one press starts a recording, the next stops it. Linux only.
+    #[arg(long, global = true)]
+    button: Option<u32>,
+
+    /// A light that is on while recording: a kernel LED name such as ACT (the
+    /// Pi's green one) or gpio:<pin> for an LED wired to a header pin.
+    #[arg(long, global = true, requires = "button")]
+    led: Option<Led>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -223,6 +234,14 @@ impl Args {
         if !self.engage.is_empty() {
             arguments.push("--engage".into());
             arguments.push(self.engage.join(","));
+        }
+        if let Some(pin) = self.button {
+            arguments.push("--button".into());
+            arguments.push(pin.to_string());
+        }
+        if let Some(led) = &self.led {
+            arguments.push("--led".into());
+            arguments.push(led.to_string());
         }
         arguments
     }
@@ -738,6 +757,19 @@ async fn main() -> Result<()> {
         let kind = sensor_named(name)?;
         if let Err(error) = hub.engage(kind) {
             eprintln!("could not engage {}: {error:#}", kind.as_str());
+        }
+    }
+
+    // Not fatal: a wrong pin or a missing permission would otherwise make
+    // the service crash-loop and take the recorder down with it.
+    if let Some(pin) = args.button {
+        let config = button::ButtonConfig { pin, led: args.led.clone() };
+        match button::spawn(Arc::clone(&hub), &config) {
+            Ok(()) => println!(
+                "  record button on GPIO{pin}{}",
+                config.led.as_ref().map(|led| format!(", light on {led}")).unwrap_or_default()
+            ),
+            Err(error) => eprintln!("warning: no record button: {error:#}"),
         }
     }
 

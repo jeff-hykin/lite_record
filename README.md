@@ -102,6 +102,24 @@ inherit your shell's directory.
 Undo it with `sudo systemctl disable --now lite_record`, or on macOS
 `sudo launchctl bootout system/com.jeffhykin.lite_record`.
 
+### A record button
+
+A rig in a backpack needs no phone to start a recording. Wire a momentary button between a
+header GPIO and ground and pass its BCM number; the pin's internal pull-up does the rest.
+One press starts a recording, the next stops it, and the light is on while recording,
+whoever started it.
+
+```sh
+lite_record survive_reboot --button 17 --led ACT     # GPIO17 = header pin 11, GND = pin 9
+```
+
+`--led` takes a kernel LED name (`ACT` is the Pi's green light, `PWR` the red one; the
+kernel stops blinking it for disk activity) or `gpio:<pin>` for an LED of your own on a
+header pin through a resistor to ground. The installer puts the service's user in the
+`gpio` group and hands `/sys/class/leds` to that group, which is why the button is set up
+through `survive_reboot` rather than by editing the unit. Linux only; a permission or pin
+problem is printed at startup and the recorder carries on without the button.
+
 ## Network setup
 
 ```sh
