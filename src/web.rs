@@ -428,6 +428,16 @@ struct RenameRequest {
     name: String,
 }
 
+/// Whether two paths name one file, which is how a case-only rename is told apart
+/// from a rename onto something else.
+fn is_one_file(left: &std::path::Path, right: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(left), Ok(right)) = (std::fs::metadata(left), std::fs::metadata(right)) else {
+        return false;
+    };
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
 /// A new name in the same folder. Another folder is a move, which copies and
 /// verifies; this only touches the directory entry, so it is instant and the
 /// file is never at risk.
@@ -453,7 +463,10 @@ async fn rename_recording(
     }
     let renamed = target.file_name().unwrap_or_default().to_string_lossy().into_owned();
     if target != source {
-        if target.exists() {
+        // Where the filesystem folds case -- exFAT on the rig's USB stick, APFS on a mac --
+        // a change of case alone lands on the very file being renamed, so `exists` is true
+        // for it. Only a genuinely different file is a collision.
+        if target.exists() && !is_one_file(&source, &target) {
             return bad_request(format!("{renamed} already exists"));
         }
         if let Err(error) = std::fs::rename(&source, &target) {
@@ -1327,6 +1340,12 @@ mod tests {
         assert_eq!(rename("walk.mcap", "taken").await.status(), StatusCode::BAD_REQUEST);
         assert_eq!(std::fs::read(directory.join("taken.mcap")).unwrap(), b"two");
         assert!(directory.join("walk.mcap").exists());
+
+        // A change of case alone is not a collision, even where the filesystem folds case
+        // and the target therefore already "exists" -- it is the same file.
+        assert_eq!(rename("walk.mcap", "Walk").await.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(directory.join("Walk.mcap")).unwrap(), b"one");
+        assert_eq!(rename("Walk.mcap", "walk").await.status(), StatusCode::OK);
 
         assert_eq!(rename("walk.mcap", "../walk").await.status(), StatusCode::BAD_REQUEST);
         assert_eq!(rename("walk.mcap", "").await.status(), StatusCode::BAD_REQUEST);
