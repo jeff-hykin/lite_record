@@ -1167,9 +1167,12 @@ const renderGps = (latest) => {
         position.textContent = ""
         link.hidden = true
     }
-    element("gps-detail").textContent = [
+    const detail = element("gps-detail")
+    detail.textContent = [
         latest.altitude === null ? null : `altitude ${latest.altitude.toFixed(1)} m`,
         stale ? `last heard ${ageSeconds.toFixed(0)} s ago` : null,
+        `${gpsTrack.length} fixes in the track`,
+        detail.dataset.offline ? "no internet for map tiles, track only" : null,
     ].filter(Boolean).join(" · ")
 
     const newest = gpsTrack[gpsTrack.length - 1]
@@ -1182,64 +1185,70 @@ const renderGps = (latest) => {
     }
 }
 
-/**
- * The track in local metres around the newest fix: an equirectangular
- * projection, exact enough over a walk or a drive and needing no map tiles,
- * so it works on a rig with no internet.
- */
-const renderGpsTrack = () => {
-    const svg = element("gps-track")
-    const idle = element("gps-idle")
-    if (gpsTrack.length === 0) {
-        svg.hidden = true
-        idle.hidden = false
-        return
-    }
-    svg.hidden = false
-    idle.hidden = true
-    const origin = gpsTrack[gpsTrack.length - 1]
-    const metresPerDegreeLat = 110_540
-    const metresPerDegreeLon = 111_320 * Math.cos(origin.latitude * Math.PI / 180)
-    const points = gpsTrack.map((fix) => [
-        (fix.longitude - origin.longitude) * metresPerDegreeLon,
-        (fix.latitude - origin.latitude) * metresPerDegreeLat,
-    ])
-    const width = 320
-    const height = 240
-    const margin = 16
-    // At least 20 m across, so a stationary receiver's jitter is not blown up
-    // to fill the frame, and the accuracy circle always fits.
-    const accuracy = origin.accuracy_m ?? 0
-    let reach = Math.max(10, accuracy * 1.2)
-    for (const [x, y] of points) {
-        reach = Math.max(reach, Math.abs(x), Math.abs(y))
-    }
-    const scale = (Math.min(width, height) / 2 - margin) / reach
-    const toScreen = ([x, y]) => [width / 2 + x * scale, height / 2 - y * scale]
-    const path = points.map(toScreen).map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ")
+/** The Leaflet map, made on the first fix so an unused card costs nothing. */
+let gpsMap = null
+/** Follow the newest fix until the operator pans; Recenter turns it back on. */
+let gpsFollowing = true
 
-    const barMetres = niceLength(reach)
-    const barPixels = barMetres * scale
-    svg.innerHTML = `
-        <circle cx="${width / 2}" cy="${height / 2}" r="${(accuracy * scale).toFixed(1)}"
-            fill="rgba(10,132,255,0.15)" stroke="rgba(10,132,255,0.5)" stroke-width="1"/>
-        <polyline points="${path}" fill="none" stroke="#ffd60a" stroke-width="1.5"
-            stroke-linejoin="round" stroke-linecap="round"/>
-        <circle cx="${width / 2}" cy="${height / 2}" r="4" fill="#0a84ff" stroke="#fff" stroke-width="1.5"/>
-        <text x="${width / 2}" y="14" fill="rgba(235,235,245,0.62)" font-size="11" text-anchor="middle">N</text>
-        <line x1="${margin}" y1="${height - margin}" x2="${margin + barPixels}" y2="${height - margin}"
-            stroke="rgba(235,235,245,0.62)" stroke-width="2"/>
-        <text x="${margin}" y="${height - margin - 6}" fill="rgba(235,235,245,0.62)" font-size="11">${barMetres} m</text>
-        <text x="${width - margin}" y="${height - margin}" fill="rgba(235,235,245,0.34)" font-size="10"
-            text-anchor="end">${gpsTrack.length} fixes</text>`
+const ensureGpsMap = () => {
+    if (gpsMap || typeof L === "undefined") {
+        return gpsMap
+    }
+    const container = element("gps-map")
+    container.hidden = false
+    element("gps-idle").hidden = true
+    const map = L.map(container, { zoomControl: true, attributionControl: true })
+    const tiles = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19,
+        attribution: "© OpenStreetMap",
+    })
+    // In the field the phone has only the rig's hotspot: no tiles, but the
+    // track still draws, so say why the background is blank.
+    tiles.on("tileerror", () => {
+        element("gps-detail").dataset.offline = "yes"
+    })
+    tiles.on("tileload", () => {
+        delete element("gps-detail").dataset.offline
+    })
+    tiles.addTo(map)
+    const track = L.polyline([], { color: "#ffd60a", weight: 3 }).addTo(map)
+    const accuracy = L.circle([0, 0], { radius: 0, color: "#0a84ff", weight: 1, fillOpacity: 0.15 }).addTo(map)
+    const here = L.circleMarker([0, 0], { radius: 6, color: "#fff", weight: 2, fillColor: "#0a84ff", fillOpacity: 1 }).addTo(map)
+    map.on("dragstart", () => {
+        gpsFollowing = false
+        element("gps-recenter").hidden = false
+    })
+    element("gps-recenter").addEventListener("click", () => {
+        gpsFollowing = true
+        element("gps-recenter").hidden = true
+        renderGpsTrack()
+    })
+    gpsMap = { map, track, accuracy, here, zoomed: false }
+    return gpsMap
 }
 
-/** A 1, 2 or 5 times a power of ten, about half of `reach`. */
-const niceLength = (reach) => {
-    const target = reach / 2
-    const power = 10 ** Math.floor(Math.log10(target))
-    const step = [1, 2, 5, 10].find((multiple) => multiple * power >= target) ?? 10
-    return step * power
+const renderGpsTrack = () => {
+    if (gpsTrack.length === 0) {
+        return
+    }
+    const view = ensureGpsMap()
+    if (!view) {
+        return
+    }
+    const newest = gpsTrack[gpsTrack.length - 1]
+    const position = [newest.latitude, newest.longitude]
+    view.track.setLatLngs(gpsTrack.map((fix) => [fix.latitude, fix.longitude]))
+    view.here.setLatLng(position)
+    view.accuracy.setLatLng(position)
+    view.accuracy.setRadius(newest.accuracy_m ?? 0)
+    // The card may have been laid out while its tab was hidden.
+    view.map.invalidateSize()
+    if (!view.zoomed) {
+        view.map.setView(position, 18)
+        view.zoomed = true
+    } else if (gpsFollowing) {
+        view.map.panTo(position, { animate: false })
+    }
 }
 
 const startCloudView = () => {

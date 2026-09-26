@@ -713,13 +713,15 @@ button.path-button {
 }
 
 .gps-frame {
-    height: 240px;
+    height: 320px;
+    align-items: stretch;
+    justify-content: stretch;
 }
 
-.gps-frame svg {
-    width: 100%;
-    height: 100%;
+.gps-frame #gps-map {
+    flex: 1;
     display: block;
+    background: #1c1c1e;
 }
 
 .gps-position {

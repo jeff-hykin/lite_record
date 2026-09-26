@@ -5,7 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#000000">
     <title>lite_record</title>
-    <link rel="stylesheet" href="/style.css">
+    <link rel="stylesheet" href="/vendor/leaflet.css">
+<link rel="stylesheet" href="/style.css">
     <link rel="icon" href="data:,">
 </head>
 <body>
@@ -119,9 +120,10 @@
         <span id="gps-state" class="pill pill-idle">no gps</span>
         <span id="gps-position" class="gps-position"></span>
         <a id="gps-map-link" class="hint" target="_blank" rel="noopener" hidden>Open map</a>
+        <button id="gps-recenter" class="secondary" type="button" hidden>Recenter</button>
     </div>
     <div class="preview-frame gps-frame">
-        <svg id="gps-track" viewBox="0 0 320 240" preserveAspectRatio="xMidYMid meet" hidden></svg>
+        <div id="gps-map" hidden></div>
         <p id="gps-idle" class="preview-idle">No fix yet.</p>
     </div>
     <p id="gps-detail" class="hint"></p>
@@ -349,6 +351,7 @@
 
 <script type="importmap">{"imports":{"three":"/vendor/three.module.min.js","three/addons/":"/vendor/"}}</script>
 
+<script src="/vendor/leaflet.js"></script>
 <script type="module" src="/app.js"></script>
 </body>
 </html>

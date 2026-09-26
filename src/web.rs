@@ -132,6 +132,8 @@ pub fn router(state: AppState) -> Router {
         .route("/vendor/three.module.min.js", get(three_module))
         .route("/vendor/OrbitControls.js", get(orbit_controls))
         .route("/vendor/three.core.min.js", get(three_core))
+        .route("/vendor/leaflet.js", get(leaflet_script))
+        .route("/vendor/leaflet.css", get(leaflet_stylesheet))
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/status", get(status))
         .route("/api/settings", put(put_settings))
@@ -205,6 +207,25 @@ async fn orbit_controls() -> Response {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../web/vendor/OrbitControls.js"),
+    )
+        .into_response()
+}
+
+/// Leaflet for the GPS card, carried for the same reason as three.js. The map
+/// tiles themselves still need internet; without it the track draws on a blank
+/// background.
+async fn leaflet_script() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/vendor/leaflet.js"),
+    )
+        .into_response()
+}
+
+async fn leaflet_stylesheet() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../web/vendor/leaflet.css"),
     )
         .into_response()
 }
