@@ -413,7 +413,7 @@ const buildSensorSettings = () => {
     }
     host.dataset.built = "yes"
 
-    for (const kind of ["realsense", "orbbec", "oakd", "livox"]) {
+    for (const kind of ["realsense", "orbbec", "oakd", "livox", "gps"]) {
         const block = make("div", "config")
         block.dataset.kind = kind
 
@@ -433,7 +433,7 @@ const buildSensorSettings = () => {
 
         const body = make("div", "config-body")
         body.hidden = true
-        body.append(kind === "livox" ? livoxFields() : cameraFields(kind))
+        body.append(kind === "livox" ? livoxFields() : kind === "gps" ? gpsFields() : cameraFields(kind))
         block.append(body)
 
         const flip = () => {
@@ -458,6 +458,7 @@ const sensorTitles = {
     orbbec: "Orbbec",
     oakd: "OAK-D",
     livox: "Livox Mid-360",
+    gps: "GPS (NMEA serial)",
 }
 
 const cameraFields = (kind) => {
@@ -550,6 +551,29 @@ const livoxFields = () => {
     return host
 }
 
+const gpsFields = () => {
+    const host = document.createDocumentFragment()
+
+    const toggles = make("div", "row wrap")
+    toggles.append(checkbox("gps.nmea", "Raw NMEA sentences"))
+    host.append(toggles)
+
+    host.append(pair(
+        textField("gps.device", "Serial device", "auto-detect"),
+        numberField("gps.baud", "Baud"),
+    ))
+    host.append(make("p", "hint", "A BU-353N talks at 4800 baud, most u-blox pucks at 9600. Leave the device empty to probe every USB serial port."))
+
+    const advanced = make("details", "note")
+    advanced.append(make("summary", "", "Naming"))
+    advanced.append(pair(
+        textField("gps.naming.topic_prefix", "Topic prefix"),
+        textField("gps.naming.frame_prefix", "Frame prefix"),
+    ))
+    host.append(advanced)
+    return host
+}
+
 /**
  * The one-line state under each sensor's name. It exists so the collapsed list
  * still answers "what is this set to" without four taps.
@@ -565,6 +589,10 @@ const renderSensorSummaries = () => {
         }
         if (kind === "livox") {
             line.textContent = `${config.frame_hz} Hz${config.imu ? " · IMU" : ""}`
+            continue
+        }
+        if (kind === "gps") {
+            line.textContent = `${config.device || "auto"} @ ${config.baud}${config.nmea ? " · NMEA" : ""}`
             continue
         }
         const streams = cameraStreamFields

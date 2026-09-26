@@ -879,6 +879,7 @@ async fn sensor_action(
         "orbbec" => SensorKind::Orbbec,
         "oakd" => SensorKind::OakD,
         "livox" => SensorKind::Livox,
+        "gps" => SensorKind::Gps,
         other => return bad_request(format!("{other:?} is not a sensor")),
     };
     // Opening or releasing a device blocks for as long as the driver takes, so

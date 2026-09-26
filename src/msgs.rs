@@ -9,6 +9,8 @@ pub const POINT_CLOUD2_TYPE: &str = "sensor_msgs/msg/PointCloud2";
 pub const IMU_TYPE: &str = "sensor_msgs/msg/Imu";
 pub const CAMERA_INFO_TYPE: &str = "sensor_msgs/msg/CameraInfo";
 pub const ODOMETRY_TYPE: &str = "nav_msgs/msg/Odometry";
+pub const NAV_SAT_FIX_TYPE: &str = "sensor_msgs/msg/NavSatFix";
+pub const STRING_TYPE: &str = "std_msgs/msg/String";
 
 pub const NANOS_PER_SEC: u64 = 1_000_000_000;
 
@@ -179,6 +181,20 @@ pub struct PointCloud2 {
     pub row_step: u32,
     pub data: Vec<u8>,
     pub is_dense: bool,
+}
+
+/// `sensor_msgs/NavSatFix`, with `NavSatStatus` flattened into its two fields.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NavSatFix {
+    pub header: Header,
+    pub status: i8,
+    pub service: u16,
+    pub latitude: f64,
+    pub longitude: f64,
+    /// Above the WGS84 ellipsoid, not sea level.
+    pub altitude: f64,
+    pub position_covariance: [f64; 9],
+    pub position_covariance_type: u8,
 }
 
 #[derive(Clone, Debug)]

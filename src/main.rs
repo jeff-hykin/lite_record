@@ -314,6 +314,9 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
     let (recording, reclaim, no_odom, dry_run) = (recording.as_path(), *reclaim, *no_odom, *dry_run);
     let (lidar_topic, imu_topic) = (lidar_topic.as_deref(), imu_topic.as_deref());
     let deskew_only = *deskew_only;
+    // Only read by the loop-closure stage, which a build without GTSAM lacks.
+    #[cfg(not(feature = "loop-closure"))]
+    let _ = (tag_size, no_tags, no_icp);
     let urdf = load_urdf(urdf.as_deref())?;
 
     // Summary-only looks, so the step count is known before anything starts.
@@ -720,8 +723,9 @@ fn sensor_named(name: &str) -> Result<SensorKind> {
         "orbbec" => Ok(SensorKind::Orbbec),
         "oakd" | "oak-d" | "oak" => Ok(SensorKind::OakD),
         "livox" | "mid360" => Ok(SensorKind::Livox),
+        "gps" | "bu353" | "bu-353" => Ok(SensorKind::Gps),
         other => anyhow::bail!(
-            "{other:?} is not a sensor; expected realsense, orbbec, oakd or livox"
+            "{other:?} is not a sensor; expected realsense, orbbec, oakd, livox or gps"
         ),
     }
 }
@@ -861,6 +865,7 @@ mod tests {
         assert_eq!(sensor_named("realsense").unwrap(), SensorKind::Realsense);
         assert_eq!(sensor_named(" Livox ").unwrap(), SensorKind::Livox);
         assert_eq!(sensor_named("mid360").unwrap(), SensorKind::Livox);
+        assert_eq!(sensor_named("GPS").unwrap(), SensorKind::Gps);
         assert_eq!(sensor_named("OAK-D").unwrap(), SensorKind::OakD);
         assert!(sensor_named("velodyne").is_err());
     }

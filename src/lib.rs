@@ -23,6 +23,7 @@ pub mod livox_command;
 pub mod mcap_append;
 pub mod msgs;
 pub mod network;
+pub mod nmea;
 pub mod odometry;
 #[cfg(feature = "loop-closure")]
 pub mod loop_closure;

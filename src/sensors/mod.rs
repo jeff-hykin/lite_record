@@ -6,6 +6,7 @@
 //! intrinsics conversion — live here rather than inside the feature-gated
 //! modules, so they are covered on every build.
 
+pub mod gps;
 pub mod livox;
 pub mod oakd;
 pub mod orbbec;
@@ -13,7 +14,7 @@ pub mod realsense;
 
 use serde::{Deserialize, Serialize};
 
-use crate::msgs::{CameraInfo, Imu, PointCloud2, RawImage};
+use crate::msgs::{CameraInfo, Imu, NavSatFix, PointCloud2, RawImage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -22,6 +23,7 @@ pub enum SensorKind {
     Orbbec,
     OakD,
     Livox,
+    Gps,
 }
 
 impl SensorKind {
@@ -31,6 +33,7 @@ impl SensorKind {
             SensorKind::Orbbec => "orbbec",
             SensorKind::OakD => "oakd",
             SensorKind::Livox => "livox",
+            SensorKind::Gps => "gps",
         }
     }
 
@@ -40,6 +43,7 @@ impl SensorKind {
             SensorKind::Orbbec => "/orbbec",
             SensorKind::OakD => "/oakd",
             SensorKind::Livox => "/livox",
+            SensorKind::Gps => "/gps",
         }
     }
 
@@ -51,6 +55,7 @@ impl SensorKind {
             SensorKind::Orbbec => "orbbec",
             SensorKind::OakD => "oakd",
             SensorKind::Livox => "livox",
+            SensorKind::Gps => "gps",
         }
     }
 
@@ -63,6 +68,8 @@ impl SensorKind {
             // The lidar speaks plain UDP, so its receive path needs no SDK at
             // all; the feature only adds the SDK's configuration handshake.
             SensorKind::Livox => true,
+            // NMEA over a serial port: libc termios, nothing to link.
+            SensorKind::Gps => true,
         }
     }
 }
@@ -334,6 +341,55 @@ impl LivoxConfig {
     }
 }
 
+fn default_gps_baud() -> u32 {
+    4800
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// A serial NMEA receiver. The BU-353N's default is 4800 baud; most u-blox
+/// pucks are 9600.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GpsConfig {
+    pub enabled: bool,
+    pub naming: Naming,
+    /// Serial device. Empty means probe every USB serial port for NMEA.
+    #[serde(default)]
+    pub device: String,
+    #[serde(default = "default_gps_baud")]
+    pub baud: u32,
+    /// Also record every raw sentence, which keeps satellites, speed and
+    /// course that a NavSatFix has no field for.
+    #[serde(default = "default_true")]
+    pub nmea: bool,
+}
+
+impl Default for GpsConfig {
+    fn default() -> Self {
+        GpsConfig {
+            enabled: false,
+            naming: Naming::for_kind(SensorKind::Gps),
+            device: String::new(),
+            baud: default_gps_baud(),
+            nmea: true,
+        }
+    }
+}
+
+impl GpsConfig {
+    /// `/gps/fix`, the `sensor_msgs/NavSatFix` topic.
+    pub fn fix_topic(&self) -> String {
+        self.naming.topic("fix")
+    }
+
+    /// `/gps/nmea`, every raw sentence as a `std_msgs/String`.
+    pub fn nmea_topic(&self) -> String {
+        self.naming.topic("nmea")
+    }
+}
+
 /// What a backend produces. Encoding to CDR happens off the capture thread, so
 /// these are the decoded structs rather than bytes.
 pub enum Produced {
@@ -357,6 +413,15 @@ pub enum Produced {
         topic: String,
         cloud: PointCloud2,
     },
+    NavSatFix {
+        topic: String,
+        fix: Box<NavSatFix>,
+    },
+    /// One raw NMEA sentence, without its line ending.
+    Nmea {
+        topic: String,
+        sentence: String,
+    },
 }
 
 impl Produced {
@@ -365,7 +430,9 @@ impl Produced {
             Produced::Image { topic, .. }
             | Produced::CameraInfo { topic, .. }
             | Produced::Imu { topic, .. }
-            | Produced::Cloud { topic, .. } => topic,
+            | Produced::Cloud { topic, .. }
+            | Produced::NavSatFix { topic, .. }
+            | Produced::Nmea { topic, .. } => topic,
         }
     }
 }
@@ -489,6 +556,23 @@ mod tests {
         let lidar = LivoxConfig::default();
         let text = serde_json::to_string(&lidar).unwrap();
         assert_eq!(serde_json::from_str::<LivoxConfig>(&text).unwrap(), lidar);
+
+        let gps = GpsConfig::default();
+        let text = serde_json::to_string(&gps).unwrap();
+        assert_eq!(serde_json::from_str::<GpsConfig>(&text).unwrap(), gps);
+    }
+
+    #[test]
+    fn gps_topics_and_frame_follow_the_prefixes() {
+        let gps = GpsConfig::default();
+        assert_eq!(gps.fix_topic(), "/gps/fix");
+        assert_eq!(gps.nmea_topic(), "/gps/nmea");
+        assert_eq!(gps.naming.root_frame_id(), "gps_link");
+        assert_eq!(gps.baud, 4800);
+        // A settings file that only says it is on still loads with defaults.
+        let sparse: GpsConfig =
+            serde_json::from_str(r#"{"enabled":true,"naming":{"topic_prefix":"/gps","frame_prefix":"gps"}}"#).unwrap();
+        assert!(sparse.enabled && sparse.nmea && sparse.device.is_empty());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! opens directly in Foxglove or `ros2 bag` without a translation step.
 
 use crate::msgs::{
-    CameraInfo, CompressedImage, Header, Imu, Odometry, PointCloud2, RawImage, TransformStamped,
+    CameraInfo, CompressedImage, Header, Imu, NavSatFix, Odometry, PointCloud2, RawImage, TransformStamped,
 };
 
 /// Concatenated ros2msg text, which is what `message_encoding: "cdr"` readers
@@ -181,6 +181,59 @@ pub fn imu(imu: &Imu) -> Encoded {
     }
 }
 
+pub fn nav_sat_fix(fix: &NavSatFix) -> Encoded {
+    let mut writer = CdrWriter::with_capacity(160);
+    write_header(&mut writer, &fix.header);
+    writer.i8(fix.status);
+    writer.u16(fix.service);
+    writer.f64(fix.latitude);
+    writer.f64(fix.longitude);
+    writer.f64(fix.altitude);
+    writer.f64_array(&fix.position_covariance);
+    writer.u8(fix.position_covariance_type);
+    Encoded {
+        schema_name: crate::msgs::NAV_SAT_FIX_TYPE,
+        schema_text: format!(
+            "uint8 COVARIANCE_TYPE_UNKNOWN=0\n\
+             uint8 COVARIANCE_TYPE_APPROXIMATED=1\n\
+             uint8 COVARIANCE_TYPE_DIAGONAL_KNOWN=2\n\
+             uint8 COVARIANCE_TYPE_KNOWN=3\n\
+             std_msgs/Header header\n\
+             sensor_msgs/NavSatStatus status\n\
+             float64 latitude\n\
+             float64 longitude\n\
+             float64 altitude\n\
+             float64[9] position_covariance\n\
+             uint8 position_covariance_type\n\
+             ================================================================================\n\
+             MSG: sensor_msgs/NavSatStatus\n\
+             int8 STATUS_NO_FIX=-1\n\
+             int8 STATUS_FIX=0\n\
+             int8 STATUS_SBAS_FIX=1\n\
+             int8 STATUS_GBAS_FIX=2\n\
+             int8 status\n\
+             uint16 SERVICE_GPS=1\n\
+             uint16 SERVICE_GLONASS=2\n\
+             uint16 SERVICE_COMPASS=4\n\
+             uint16 SERVICE_GALILEO=8\n\
+             uint16 service\n\
+             {HEADER_MSG}\n{TIME_MSG}"
+        ),
+        data: writer.finish(),
+    }
+}
+
+/// `std_msgs/String`, used for the raw NMEA sentences.
+pub fn string(value: &str) -> Encoded {
+    let mut writer = CdrWriter::with_capacity(value.len() + 8);
+    writer.string(value);
+    Encoded {
+        schema_name: crate::msgs::STRING_TYPE,
+        schema_text: "string data\n".to_owned(),
+        data: writer.finish(),
+    }
+}
+
 pub fn camera_info(info: &CameraInfo) -> Encoded {
     let mut writer = CdrWriter::with_capacity(512);
     write_header(&mut writer, &info.header);
@@ -253,6 +306,15 @@ impl CdrWriter {
 
     fn u8(&mut self, value: u8) {
         self.buffer.push(value);
+    }
+
+    fn i8(&mut self, value: i8) {
+        self.buffer.push(value as u8);
+    }
+
+    fn u16(&mut self, value: u16) {
+        self.align(2);
+        self.buffer.extend_from_slice(&value.to_le_bytes());
     }
 
     fn u32(&mut self, value: u32) {
@@ -542,6 +604,41 @@ mod tests {
         assert_eq!(reader.f64_array::<9>(), [0.0; 9]);
         assert_eq!(reader.f64_array::<3>(), [0.1, 0.2, 9.81]);
         assert_eq!(reader.f64_array::<9>(), [0.0; 9]);
+        assert!(reader.at_end());
+    }
+
+    #[test]
+    fn a_nav_sat_fix_lays_out_status_then_aligned_doubles() {
+        let fix = NavSatFix {
+            header: Header::new(3_000_000_001, "gps_link"),
+            status: -1,
+            service: 1,
+            latitude: 37.76,
+            longitude: -122.49,
+            altitude: 30.4,
+            position_covariance: [1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0],
+            position_covariance_type: 1,
+        };
+        let encoded = nav_sat_fix(&fix);
+        let mut reader = CdrReader::new(&encoded.data);
+        assert_eq!(reader.header(), fix.header);
+        // The header ends at 21 ("gps_link\0" after three u32s): the int8 sits
+        // there, the uint16 pads to 22, and the first double lands on 24.
+        let body = &encoded.data[4..];
+        assert_eq!(body[21] as i8, -1);
+        assert_eq!(&body[22..24], &[1, 0]);
+        let read = |index: usize| f64::from_le_bytes(body[24 + index * 8..32 + index * 8].try_into().unwrap());
+        assert_eq!((read(0), read(1), read(2)), (37.76, -122.49, 30.4));
+        assert_eq!(read(3 + 8), 3.0);
+        assert_eq!(body.len(), 24 + 12 * 8 + 1);
+        assert_eq!(*body.last().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_string_is_one_cdr_string() {
+        let encoded = string("$GPGGA,1*00");
+        let mut reader = CdrReader::new(&encoded.data);
+        assert_eq!(reader.string(), "$GPGGA,1*00");
         assert!(reader.at_end());
     }
 

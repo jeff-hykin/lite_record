@@ -21,7 +21,7 @@ use crate::image::ImageFormat;
 use crate::msgs::{CameraInfo, TransformStamped};
 use crate::record::{self, Compression, Recorder, RecordingStatus};
 use crate::sensors::{
-    Backend, CameraConfig, LivoxConfig, Naming, Produced, SensorKind, Sink, StreamId,
+    Backend, CameraConfig, GpsConfig, LivoxConfig, Naming, Produced, SensorKind, Sink, StreamId,
 };
 use crate::sysmon;
 use crate::urdf::{self, TreeProblem};
@@ -70,6 +70,7 @@ pub struct Settings {
     pub orbbec: CameraConfig,
     pub oakd: CameraConfig,
     pub livox: LivoxConfig,
+    pub gps: GpsConfig,
     /// Whether the browser preview is running at all.
     pub preview_enabled: bool,
     /// Which image topic the preview shows.
@@ -93,6 +94,7 @@ impl Default for Settings {
             orbbec: CameraConfig::for_kind(SensorKind::Orbbec),
             oakd: CameraConfig::for_kind(SensorKind::OakD),
             livox: LivoxConfig::default(),
+            gps: GpsConfig::default(),
             preview_enabled: true,
             preview_topic: None,
             preview_quality: 60,
@@ -222,6 +224,8 @@ fn topic_settings(settings: &Settings) -> BTreeMap<String, String> {
         settings.livox.naming.points_topic(),
         "livox.enabled".to_owned(),
     );
+    paths.insert(settings.gps.fix_topic(), "gps.enabled".to_owned());
+    paths.insert(settings.gps.nmea_topic(), "gps.nmea".to_owned());
     paths
 }
 
@@ -253,6 +257,10 @@ fn sensors_needing_restart(
     // sockets are opened and the work-mode handshake is sent.
     if previous.livox != settings.livox && backends.contains_key(&SensorKind::Livox) {
         restart.push(SensorKind::Livox);
+    }
+    // The port and baud rate are set once, when the device is opened.
+    if previous.gps != settings.gps && backends.contains_key(&SensorKind::Gps) {
+        restart.push(SensorKind::Gps);
     }
     restart
 }
@@ -584,7 +592,13 @@ impl Hub {
             // the colour stream a third of its frames at 720p30: a 200 Hz imu
             // fills 128 slots faster than one 720p jpeg encode returns, and the
             // frame that then finds the queue full is the one that is shed.
-            if matches!(produced, Produced::Imu { .. } | Produced::CameraInfo { .. }) {
+            if matches!(
+                produced,
+                Produced::Imu { .. }
+                    | Produced::CameraInfo { .. }
+                    | Produced::NavSatFix { .. }
+                    | Produced::Nmea { .. }
+            ) {
                 hub.encode_and_store(produced);
                 return true;
             }
@@ -652,6 +666,12 @@ impl Hub {
                 if self.recording_active.load(Ordering::Relaxed) {
                     self.offer(&topic, crate::cdr::point_cloud2(&cloud));
                 }
+            }
+            Produced::NavSatFix { topic, fix } => {
+                self.offer(&topic, crate::cdr::nav_sat_fix(&fix));
+            }
+            Produced::Nmea { topic, sentence } => {
+                self.offer(&topic, crate::cdr::string(&sentence));
             }
         }
     }
@@ -791,6 +811,7 @@ impl Hub {
             SensorKind::Livox => Box::new(crate::sensors::livox::LivoxBackend::new(
                 settings.livox.clone(),
             )),
+            SensorKind::Gps => Box::new(crate::sensors::gps::GpsBackend::new(settings.gps.clone())),
         };
         backend.start(self.sink())?;
         self.backends.lock().unwrap().insert(kind, backend);
@@ -816,6 +837,7 @@ impl Hub {
             SensorKind::Orbbec,
             SensorKind::OakD,
             SensorKind::Livox,
+            SensorKind::Gps,
         ]
             .into_iter()
             .map(|kind| {
@@ -863,6 +885,9 @@ impl Hub {
                 StreamId::Imu => settings.livox.naming.imu_topic(),
                 _ => settings.livox.naming.points_topic(),
             }));
+        }
+        if settings.gps.enabled {
+            expected.push(settings.gps.fix_topic());
         }
         let rates = self.rates.lock().unwrap();
         expected.retain(|topic| rates.get(topic).is_none_or(|counter| counter.hz() <= 0.0));
@@ -1192,6 +1217,7 @@ impl Hub {
             SensorKind::Orbbec,
             SensorKind::OakD,
             SensorKind::Livox,
+            SensorKind::Gps,
         ] {
             self.disengage(kind);
         }
@@ -1260,6 +1286,7 @@ fn naming_for(settings: &Settings, kind: SensorKind) -> &str {
         SensorKind::Orbbec => &settings.orbbec.naming.topic_prefix,
         SensorKind::OakD => &settings.oakd.naming.topic_prefix,
         SensorKind::Livox => &settings.livox.naming.topic_prefix,
+        SensorKind::Gps => &settings.gps.naming.topic_prefix,
     }
 }
 
@@ -2474,8 +2501,9 @@ mod tests {
     fn a_backend_with_no_sdk_reports_its_absence_rather_than_appearing_idle() {
         let hub = scratch_hub();
         let status = hub.sensor_status();
-        assert_eq!(status.len(), 4);
+        assert_eq!(status.len(), 5);
         assert!(!status["livox"].running);
+        assert!(!status["gps"].running);
         if !cfg!(feature = "realsense") {
             assert_eq!(status["realsense"].detail, "not compiled in");
             assert!(hub.engage(SensorKind::Realsense).is_err());
