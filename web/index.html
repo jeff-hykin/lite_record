@@ -114,6 +114,20 @@
 </section>
 
 <section class="card">
+    <h2>GPS</h2>
+    <div class="row wrap">
+        <span id="gps-state" class="pill pill-idle">no gps</span>
+        <span id="gps-position" class="gps-position"></span>
+        <a id="gps-map-link" class="hint" target="_blank" rel="noopener" hidden>Open map</a>
+    </div>
+    <div class="preview-frame gps-frame">
+        <svg id="gps-track" viewBox="0 0 320 240" preserveAspectRatio="xMidYMid meet" hidden></svg>
+        <p id="gps-idle" class="preview-idle">No fix yet.</p>
+    </div>
+    <p id="gps-detail" class="hint"></p>
+</section>
+
+<section class="card">
     <h2>Sensors</h2>
     <!-- Engage/disengage exists so another process can borrow a camera or the
          lidar without restarting the recorder. -->

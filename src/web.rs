@@ -161,6 +161,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ws/monitor", get(monitor_socket))
         .route("/ws/preview", get(preview_socket))
         .route("/ws/cloud", get(cloud_socket))
+        .route("/api/gps/track", get(gps_track))
         .with_state(state)
 }
 
@@ -1144,6 +1145,7 @@ async fn run_monitor_socket(socket: WebSocket, state: AppState) {
                 "streams": writer_state.hub.stream_stats(),
                 "recording": writer_state.hub.recording_status(),
                 "sensors": writer_state.hub.sensor_status(),
+                "gps": writer_state.hub.gps_latest(),
             })
             .to_string();
             if sink.send(Message::Text(payload.into())).await.is_err() {
@@ -1193,6 +1195,12 @@ async fn run_preview_socket(mut socket: WebSocket, state: AppState) {
 /// How often a watching browser is offered the newest thinned scan. The lidar
 /// delivers ten a second; this only has to be quicker than that.
 const CLOUD_POLL: Duration = Duration::from_millis(50);
+
+/// The recent fixes, so a page opened mid-drive draws the track so far; after
+/// that the monitor socket's `gps` field extends it.
+async fn gps_track(State(state): State<AppState>) -> Response {
+    axum::Json(state.hub.gps_track()).into_response()
+}
 
 async fn cloud_socket(upgrade: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     upgrade.on_upgrade(move |socket| run_cloud_socket(socket, state))

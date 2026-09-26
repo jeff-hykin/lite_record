@@ -403,6 +403,11 @@ pub struct Hub {
     cloud_preview: Mutex<Option<bytes::Bytes>>,
     /// Open `/ws/cloud` sockets. Zero means the scans are never touched here.
     cloud_watchers: AtomicUsize,
+    /// The newest GPS reading, fix or not, for the page's GPS card.
+    gps_latest: Mutex<Option<GpsPoint>>,
+    /// Recent fixes for the page's track. Kept whether or not anything records,
+    /// since a GPS is one small message a second.
+    gps_track: Mutex<std::collections::VecDeque<GpsPoint>>,
     /// Counts preview encodes so switching the preview off can be shown to
     /// actually stop the work rather than just hide the result.
     preview_encodes: AtomicU64,
@@ -462,6 +467,8 @@ impl Hub {
             preview: Mutex::new(None),
             cloud_preview: Mutex::new(None),
             cloud_watchers: AtomicUsize::new(0),
+            gps_latest: Mutex::new(None),
+            gps_track: Mutex::new(std::collections::VecDeque::new()),
             preview_encodes: AtomicU64::new(0),
             record_encodes: AtomicU64::new(0),
             monitor: Mutex::new(sysmon::Monitor::default()),
@@ -576,6 +583,9 @@ impl Hub {
             // is not a drop: nothing was going to keep it. Intrinsics are the
             // exception — the hub remembers those to replay into a recording
             // that has not started yet, so they are never shed.
+            if let Produced::NavSatFix { fix, .. } = &produced {
+                hub.note_gps(fix);
+            }
             let announcement = matches!(produced, Produced::CameraInfo { .. });
             let watched_scan = matches!(produced, Produced::Cloud { .. })
                 && hub.cloud_watchers.load(Ordering::Relaxed) > 0;
@@ -738,6 +748,26 @@ impl Hub {
         self.cloud_preview.lock().unwrap().take()
     }
 
+    fn note_gps(&self, fix: &crate::msgs::NavSatFix) {
+        let point = GpsPoint::from(fix);
+        if point.has_fix() {
+            let mut track = self.gps_track.lock().unwrap();
+            if track.len() >= GPS_TRACK_POINTS {
+                track.pop_front();
+            }
+            track.push_back(point.clone());
+        }
+        *self.gps_latest.lock().unwrap() = Some(point);
+    }
+
+    pub fn gps_latest(&self) -> Option<GpsPoint> {
+        self.gps_latest.lock().unwrap().clone()
+    }
+
+    pub fn gps_track(&self) -> Vec<GpsPoint> {
+        self.gps_track.lock().unwrap().iter().cloned().collect()
+    }
+
     fn offer(&self, topic: &str, encoded: crate::cdr::Encoded) {
         if let Some(recorder) = self.recorder.lock().unwrap().as_ref() {
             recorder.offer(topic, encoded);
@@ -886,9 +916,8 @@ impl Hub {
                 _ => settings.livox.naming.points_topic(),
             }));
         }
-        if settings.gps.enabled {
-            expected.push(settings.gps.fix_topic());
-        }
+        // The GPS is left out on purpose: indoors or unplugged it is missing
+        // often, and a light flashing for that would drown out a dead camera.
         let rates = self.rates.lock().unwrap();
         expected.retain(|topic| rates.get(topic).is_none_or(|counter| counter.hz() <= 0.0));
         expected
@@ -1272,6 +1301,44 @@ impl UrdfReport {
             ));
         }
         None
+    }
+}
+
+/// An hour of 1 Hz fixes.
+const GPS_TRACK_POINTS: usize = 3600;
+
+/// One GPS reading as the page draws it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GpsPoint {
+    pub stamp_nanos: u64,
+    /// `NavSatStatus`: -1 no fix, 0 fix, 1 SBAS, 2 ground-based augmentation.
+    pub status: i8,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub altitude: Option<f64>,
+    /// 1-sigma horizontal error in metres, when the receiver gave an HDOP.
+    pub accuracy_m: Option<f64>,
+}
+
+impl GpsPoint {
+    pub fn has_fix(&self) -> bool {
+        self.status >= 0 && self.latitude.is_some() && self.longitude.is_some()
+    }
+}
+
+impl From<&crate::msgs::NavSatFix> for GpsPoint {
+    fn from(fix: &crate::msgs::NavSatFix) -> Self {
+        let finite = |value: f64| value.is_finite().then_some(value);
+        GpsPoint {
+            stamp_nanos: fix.header.stamp_nanos(),
+            status: fix.status,
+            latitude: finite(fix.latitude),
+            longitude: finite(fix.longitude),
+            altitude: finite(fix.altitude),
+            accuracy_m: (fix.position_covariance_type != 0)
+                .then(|| fix.position_covariance[0].sqrt())
+                .and_then(finite),
+        }
     }
 }
 
@@ -2495,6 +2562,50 @@ mod tests {
         assert!(!directory.join("second.mcap").exists());
         std::fs::remove_dir_all(&directory).ok();
         std::fs::remove_file(hub.settings_file()).ok();
+    }
+
+    #[test]
+    fn a_silent_gps_never_counts_as_missing() {
+        // The record light flashes for missing streams; a GPS indoors is
+        // missing most of the time and must not set it off.
+        let hub = scratch_hub();
+        let mut settings = hub.settings();
+        settings.gps.enabled = true;
+        settings.livox.enabled = true;
+        hub.update_settings(settings).unwrap();
+        let missing = hub.missing_streams();
+        assert!(missing.iter().any(|topic| topic.starts_with("/livox")));
+        assert!(!missing.iter().any(|topic| topic.starts_with("/gps")));
+        std::fs::remove_file(hub.settings_file()).ok();
+    }
+
+    #[test]
+    fn gps_fixes_build_a_track_even_with_nothing_recording() {
+        let hub = scratch_hub();
+        let sink = hub.sink();
+        let fix = |stamp: u64, status: i8, latitude: f64| crate::msgs::NavSatFix {
+            header: crate::msgs::Header::new(stamp, "gps_link"),
+            status,
+            service: 1,
+            latitude,
+            longitude: -122.49,
+            altitude: 30.0,
+            position_covariance: [4.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 16.0],
+            position_covariance_type: 1,
+        };
+        for (stamp, status, latitude) in [(1, 0, 37.76), (2, -1, f64::NAN), (3, 1, 37.77)] {
+            sink(Produced::NavSatFix { topic: "/gps/fix".into(), fix: Box::new(fix(stamp, status, latitude)) });
+        }
+        let track = hub.gps_track();
+        assert_eq!(track.iter().map(|point| point.stamp_nanos).collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(track[0].accuracy_m, Some(2.0));
+        let latest = hub.gps_latest().unwrap();
+        assert_eq!(latest.stamp_nanos, 3);
+        // A no-fix reading still becomes the latest, with no position.
+        sink(Produced::NavSatFix { topic: "/gps/fix".into(), fix: Box::new(fix(4, -1, f64::NAN)) });
+        let latest = hub.gps_latest().unwrap();
+        assert!(!latest.has_fix() && latest.latitude.is_none());
+        assert_eq!(hub.gps_track().len(), 2);
     }
 
     #[test]

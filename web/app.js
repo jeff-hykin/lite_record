@@ -997,6 +997,7 @@ const startMonitorSocket = () => {
             renderStreams(payload.streams)
             renderRecording(payload.recording)
             renderSensors(payload.sensors)
+            renderGps(payload.gps ?? null)
         },
         (open) => {
             element("connection-dot").classList.toggle("dot-good", open)
@@ -1124,6 +1125,123 @@ const loadCloudViewer = async (canvas) => {
  * Off by default and off whenever the page is hidden: the socket is what
  * makes the Pi thin scans, so closing it is what saves the work.
  */
+// -- gps ------------------------------------------------------------------
+
+/** Recent fixes, oldest first: seeded from /api/gps/track, extended by the monitor socket. */
+const gpsTrack = []
+const GPS_TRACK_POINTS = 3600
+const gpsStatusNames = { "-1": "no fix", "0": "fix", "1": "SBAS fix", "2": "RTK fix" }
+
+const startGpsView = async () => {
+    try {
+        gpsTrack.push(...await request("/api/gps/track"))
+    } catch (error) {
+        // An older binary has no track endpoint; the live readout still works.
+    }
+    renderGpsTrack()
+}
+
+/** Called on every monitor tick with the newest reading, or null with no gps. */
+const renderGps = (latest) => {
+    const pill = element("gps-state")
+    const position = element("gps-position")
+    const link = element("gps-map-link")
+    if (!latest) {
+        pill.textContent = "no gps"
+        pill.className = "pill pill-idle"
+        position.textContent = ""
+        link.hidden = true
+        return
+    }
+    const ageSeconds = Math.max(0, Date.now() / 1000 - latest.stamp_nanos / 1e9)
+    const stale = ageSeconds > 5
+    const hasFix = latest.status >= 0 && latest.latitude !== null && latest.longitude !== null
+    pill.textContent = stale ? "silent" : (gpsStatusNames[latest.status] ?? "fix")
+    pill.className = `pill ${hasFix && !stale ? "pill-good" : "pill-idle"}`
+    if (hasFix) {
+        const accuracy = latest.accuracy_m === null ? "" : ` ±${latest.accuracy_m.toFixed(0)} m`
+        position.textContent = `${latest.latitude.toFixed(6)}, ${latest.longitude.toFixed(6)}${accuracy}`
+        link.href = `https://www.openstreetmap.org/?mlat=${latest.latitude}&mlon=${latest.longitude}#map=18/${latest.latitude}/${latest.longitude}`
+        link.hidden = false
+    } else {
+        position.textContent = ""
+        link.hidden = true
+    }
+    element("gps-detail").textContent = [
+        latest.altitude === null ? null : `altitude ${latest.altitude.toFixed(1)} m`,
+        stale ? `last heard ${ageSeconds.toFixed(0)} s ago` : null,
+    ].filter(Boolean).join(" · ")
+
+    const newest = gpsTrack[gpsTrack.length - 1]
+    if (hasFix && (!newest || latest.stamp_nanos > newest.stamp_nanos)) {
+        gpsTrack.push(latest)
+        if (gpsTrack.length > GPS_TRACK_POINTS) {
+            gpsTrack.shift()
+        }
+        renderGpsTrack()
+    }
+}
+
+/**
+ * The track in local metres around the newest fix: an equirectangular
+ * projection, exact enough over a walk or a drive and needing no map tiles,
+ * so it works on a rig with no internet.
+ */
+const renderGpsTrack = () => {
+    const svg = element("gps-track")
+    const idle = element("gps-idle")
+    if (gpsTrack.length === 0) {
+        svg.hidden = true
+        idle.hidden = false
+        return
+    }
+    svg.hidden = false
+    idle.hidden = true
+    const origin = gpsTrack[gpsTrack.length - 1]
+    const metresPerDegreeLat = 110_540
+    const metresPerDegreeLon = 111_320 * Math.cos(origin.latitude * Math.PI / 180)
+    const points = gpsTrack.map((fix) => [
+        (fix.longitude - origin.longitude) * metresPerDegreeLon,
+        (fix.latitude - origin.latitude) * metresPerDegreeLat,
+    ])
+    const width = 320
+    const height = 240
+    const margin = 16
+    // At least 20 m across, so a stationary receiver's jitter is not blown up
+    // to fill the frame, and the accuracy circle always fits.
+    const accuracy = origin.accuracy_m ?? 0
+    let reach = Math.max(10, accuracy * 1.2)
+    for (const [x, y] of points) {
+        reach = Math.max(reach, Math.abs(x), Math.abs(y))
+    }
+    const scale = (Math.min(width, height) / 2 - margin) / reach
+    const toScreen = ([x, y]) => [width / 2 + x * scale, height / 2 - y * scale]
+    const path = points.map(toScreen).map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ")
+
+    const barMetres = niceLength(reach)
+    const barPixels = barMetres * scale
+    svg.innerHTML = `
+        <circle cx="${width / 2}" cy="${height / 2}" r="${(accuracy * scale).toFixed(1)}"
+            fill="rgba(10,132,255,0.15)" stroke="rgba(10,132,255,0.5)" stroke-width="1"/>
+        <polyline points="${path}" fill="none" stroke="#ffd60a" stroke-width="1.5"
+            stroke-linejoin="round" stroke-linecap="round"/>
+        <circle cx="${width / 2}" cy="${height / 2}" r="4" fill="#0a84ff" stroke="#fff" stroke-width="1.5"/>
+        <text x="${width / 2}" y="14" fill="rgba(235,235,245,0.62)" font-size="11" text-anchor="middle">N</text>
+        <line x1="${margin}" y1="${height - margin}" x2="${margin + barPixels}" y2="${height - margin}"
+            stroke="rgba(235,235,245,0.62)" stroke-width="2"/>
+        <text x="${margin}" y="${height - margin - 6}" fill="rgba(235,235,245,0.62)" font-size="11">${barMetres} m</text>
+        <text x="${width - margin}" y="${height - margin}" fill="rgba(235,235,245,0.34)" font-size="10"
+            text-anchor="end">${gpsTrack.length} fixes</text>`
+}
+
+/** A 1, 2 or 5 times a power of ten, about half of `reach`. */
+const niceLength = (reach) => {
+    const target = reach / 2
+    const power = 10 ** Math.floor(Math.log10(target))
+    const step = [1, 2, 5, 10].find((multiple) => multiple * power >= target) ?? 10
+    return step * power
+}
+
 const startCloudView = () => {
     const toggle = element("cloud-enabled")
     const canvas = element("cloud-canvas")
@@ -1990,6 +2108,7 @@ const start = async () => {
     startMonitorSocket()
     startPreviewSocket()
     startCloudView()
+    startGpsView()
 }
 
 start()

@@ -712,6 +712,20 @@ button.path-button {
     display: block;
 }
 
+.gps-frame {
+    height: 240px;
+}
+
+.gps-frame svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+.gps-position {
+    font-variant-numeric: tabular-nums;
+}
+
 .preview-idle {
     color: var(--faint);
     font-size: 0.85rem;
