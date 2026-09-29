@@ -30,6 +30,8 @@ use crate::tf::{Pose, StaticTree};
 
 pub const ODOMETRY_TOPIC: &str = "/pointlio_odometry";
 pub const ODOM_FRAME: &str = "odom";
+/// The whole trajectory as one `nav_msgs/Path`, written once after the odometry.
+pub const PATH_TOPIC: &str = "/pointlio_path";
 /// Channel metadata naming the geometry the odometry was computed under: the
 /// frame it describes, and where the lidar sat in that frame. A later run whose
 /// URDF disagrees is reading poses estimated for a different rig.
@@ -311,6 +313,7 @@ pub fn append(appender: &mut Appender, estimate: &Estimate, tree: &StaticTree) -
     let tf_channel = appender.channel(TF_TOPIC, tf_schema, "cdr", &channel_metadata(TF_TOPIC));
 
     let mut odometry_messages = 0;
+    let mut accumulated = Vec::with_capacity(estimate.poses.len());
     for sample in &estimate.poses {
         let stamp = estimate.stamp_nanos(sample);
         let root_in_odom = estimate.lidar_pose(sample).then(&root_in_lidar);
@@ -329,7 +332,21 @@ pub fn append(appender: &mut Appender, estimate: &Estimate, tree: &StaticTree) -
         appender.write(odometry_channel, stamp, crate::cdr::odometry(&odometry).data)?;
         let edge = root_in_odom.stamped(stamp, ODOM_FRAME, &child_frame);
         appender.write(tf_channel, stamp, crate::cdr::tf_message(&[edge]).data)?;
+        accumulated.push(crate::cdr::Pose {
+            header: Header::new(stamp, ODOM_FRAME),
+            position: root_in_odom.translation,
+            orientation: root_in_odom.rotation,
+        });
         odometry_messages += 1;
+    }
+    // One message at the last pose's time, so it lands in the final chunk: a
+    // reader after the whole path (a floor plan, say) seeks there and is done.
+    if let Some(last) = accumulated.last() {
+        let stamp = last.header.stamp_nanos();
+        let encoded = crate::cdr::path(&Header::new(stamp, ODOM_FRAME), &accumulated);
+        let path_schema = appender.schema(encoded.schema_name, "ros2msg", encoded.schema_text.as_bytes());
+        let path_channel = appender.channel(PATH_TOPIC, path_schema, "cdr", &channel_metadata(PATH_TOPIC));
+        appender.write(path_channel, stamp, encoded.data)?;
     }
     Ok(Appended {
         odometry_messages,

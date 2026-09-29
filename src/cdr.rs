@@ -962,6 +962,57 @@ pub fn pose_stamped(pose: &Pose) -> Encoded {
     }
 }
 
+/// A `nav_msgs/Path`: every pose in one message, so a reader wanting the whole
+/// trajectory opens one chunk rather than every one the odometry is spread over.
+pub fn path(header: &Header, poses: &[Pose]) -> Encoded {
+    let mut writer = CdrWriter::with_capacity(32 + poses.len() * 80);
+    write_header(&mut writer, header);
+    writer.u32(poses.len() as u32);
+    for pose in poses {
+        write_header(&mut writer, &pose.header);
+        writer.f64_array(&pose.position);
+        writer.f64_array(&pose.orientation);
+    }
+    Encoded {
+        schema_name: "nav_msgs/msg/Path",
+        schema_text: format!(
+            "std_msgs/Header header\n\
+             geometry_msgs/PoseStamped[] poses\n\n\
+             ================================================================================\n\
+             MSG: geometry_msgs/PoseStamped\n\
+             std_msgs/Header header\n\
+             geometry_msgs/Pose pose\n\n\
+             ================================================================================\n\
+             MSG: geometry_msgs/Pose\n\
+             geometry_msgs/Point position\n\
+             geometry_msgs/Quaternion orientation\n\n\
+             ================================================================================\n\
+             MSG: geometry_msgs/Point\n\
+             float64 x\n\
+             float64 y\n\
+             float64 z\n\
+             {QUATERNION_MSG}{HEADER_MSG}\n{TIME_MSG}"
+        ),
+        data: writer.finish(),
+    }
+}
+
+pub fn decode_path(data: &[u8]) -> anyhow::Result<(Header, Vec<Pose>)> {
+    let mut reader = CdrReader::little_endian(data)?;
+    let short = || truncated("Path");
+    let header = reader.try_header().ok_or_else(short)?;
+    let count = reader.try_u32().ok_or_else(short)?;
+    let mut poses = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        poses.push(Pose {
+            header: reader.try_header().ok_or_else(short)?,
+            position: reader.try_f64_array().ok_or_else(short)?,
+            orientation: reader.try_f64_array().ok_or_else(short)?,
+        });
+    }
+    Ok((header, poses))
+}
+
 #[cfg(test)]
 mod decode_tests {
     use super::*;
@@ -982,6 +1033,18 @@ mod decode_tests {
         // padded to 40; then 7 + 36 + 6 + 36 doubles.
         assert_eq!(encoded.data.len(), 4 + 40 + 85 * 8);
         assert_eq!(decode_odometry(&encoded.data).unwrap(), a_pose());
+    }
+
+    #[test]
+    fn a_path_decodes_every_pose_it_was_written_with() {
+        let mut second = a_pose();
+        second.header = Header::new(9_100_000_000, "odom");
+        second.position = [3.0, 4.0, -1.0];
+        let encoded = path(&Header::new(9_100_000_000, "odom"), &[a_pose(), second.clone()]);
+        assert_eq!(encoded.schema_name, "nav_msgs/msg/Path");
+        let (header, poses) = decode_path(&encoded.data).unwrap();
+        assert_eq!(header.frame_id, "odom");
+        assert_eq!(poses, vec![a_pose(), second]);
     }
 
     #[test]
