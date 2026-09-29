@@ -32,11 +32,13 @@ pub const GLOBAL_MAP_TOPIC: &str = "/global_map";
 const MIN_RANGE_M: f32 = 1.0;
 
 /// dimos' own defaults for this mapper, from
-/// `dimos/mapping/ray_tracing/module.py`. Only the frame is ours: dimos takes it
-/// from a blueprint, and here it is whatever the recording's odometry is in.
+/// `dimos/mapping/ray_tracing/module.py`, except the voxel: 4 cm rather than
+/// 8 cm, since the map is what floor plans are drawn from. The frame is ours
+/// too: dimos takes it from a blueprint, and here it is whatever the
+/// recording's odometry is in.
 pub fn default_config(world_frame: &str) -> Config {
     Config {
-        voxel_size: 0.08,
+        voxel_size: 0.04,
         fine_divisor: 3,
         emit_fine: false,
         max_range: 30.0,
