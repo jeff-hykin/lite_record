@@ -255,6 +255,9 @@ fn axes(fields: &[crate::msgs::PointField]) -> Option<(usize, usize, usize)> {
 /// in afterwards. The estimator's pass over a 58 GB recording takes half an
 /// hour; walking it a second time to avoid a spool would cost another one, and
 /// the spool is a few GB written once and read once.
+/// Channel metadata naming the topic a derived stream was made from (`/pointlio_lidar` -> the raw lidar topic).
+pub const DERIVED_FROM_KEY: &str = "derived_from";
+
 pub struct Spool {
     path: PathBuf,
     file: BufWriter<std::fs::File>,
@@ -335,7 +338,9 @@ impl Spool {
     /// Copies the spool into the recording and removes it. `frame` is the
     /// lidar's frame, recorded on the channel so a reader knows the clouds are
     /// placed by the same tf edge as the originals.
-    pub fn drain_into(self, appender: &mut Appender, frame: &str, gauge: Option<&crate::progress::Gauge>) -> Result<u64> {
+    /// `source` is the lidar topic the clouds were corrected from: the channel says so in its metadata
+    /// ([`DERIVED_FROM_KEY`]), so a consumer can prefer the corrected copy without knowing this topic's name.
+    pub fn drain_into(self, appender: &mut Appender, frame: &str, source: &str, gauge: Option<&crate::progress::Gauge>) -> Result<u64> {
         let sample = crate::cdr::point_cloud2(&PointCloud2 {
             header: crate::msgs::Header::new(0, frame),
             height: 1,
@@ -348,7 +353,9 @@ impl Spool {
             is_dense: true,
         });
         let schema = appender.schema(sample.schema_name, "ros2msg", sample.schema_text.as_bytes());
-        let channel = appender.channel(DESKEWED_TOPIC, schema, "cdr", &channel_metadata(DESKEWED_TOPIC));
+        let mut metadata = channel_metadata(DESKEWED_TOPIC);
+        metadata.insert(DERIVED_FROM_KEY.to_string(), source.to_string());
+        let channel = appender.channel(DESKEWED_TOPIC, schema, "cdr", &metadata);
         self.drain(|log_time, data| {
             if let Some(gauge) = gauge {
                 gauge.at(log_time);

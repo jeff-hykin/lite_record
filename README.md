@@ -446,7 +446,9 @@ new is put back, so a 63 GB recording grows by the megabytes added and is never 
   update already propagates the state to each point-group's time, so those poses
   are kept and every return is rewritten into where it would have been seen from
   the scan's own header stamp. Same stamp, same frame, same fields, same
-  `point_step` — a consumer that read `/livox/lidar` reads this instead. Measured
+  `point_step` — a consumer that read `/livox/lidar` reads this instead, and the channel's
+  `derived_from` metadata names the topic it was corrected from, so a consumer can prefer it
+  without knowing its name. Measured
   on the grocery recording at a 0.6 m/s walk, the correction grows through the
   sweep from 2 cm at the start to 26 cm at the end; accumulating 120 scans of the
   fastest-turning stretch (32 deg/s) into `odom` and counting occupied voxels,

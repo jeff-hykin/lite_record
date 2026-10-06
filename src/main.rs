@@ -439,6 +439,8 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
     // Filled by the estimator's walk when a corrected lidar was asked for, and
     // emptied into the file after the appender is open.
     let mut spool = None;
+    // the lidar topic the corrected clouds come from, named in their channel's metadata
+    let mut lidar_source = String::new();
     let estimate = if !will_estimate {
         if let Some(existing) = existing_odometry.as_ref() {
             display.note(format!(
@@ -489,6 +491,7 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
                 None
             }
             Some((lidar, imu)) => {
+                lidar_source = lidar.clone();
                 if wants_deskew {
                     spool = Some(lite_record::deskew::Spool::beside(recording)?);
                 }
@@ -602,7 +605,7 @@ fn post_process(args: &PostProcessArgs) -> Result<()> {
             let deskewed = match (spool, &estimate) {
                 (Some(spool), Some(estimate)) => {
                     gauge.detail(format!("{} corrected clouds", spool.clouds()));
-                    spool.drain_into(&mut appender, &estimate.lidar_frame, Some(&gauge))?
+                    spool.drain_into(&mut appender, &estimate.lidar_frame, &lidar_source, Some(&gauge))?
                 }
                 (Some(spool), None) => {
                     spool.discard();
