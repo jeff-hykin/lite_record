@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use super::{Backend, BackendStatus, GpsConfig, Produced, Sink};
+use super::{pl2303, Backend, BackendStatus, GpsConfig, Produced, Sink};
 use crate::msgs::Header;
 use crate::nmea::{self, Sentence};
 use crate::record::now_nanos;
@@ -73,12 +73,13 @@ impl Backend for GpsBackend {
                     let mut last_reported: Option<String> = None;
                     while running.load(Ordering::SeqCst) {
                         let outcome = match open_receiver(&config, &running) {
-                            Ok((path, port)) => {
+                            Ok(receiver) => {
                                 *error.lock().unwrap() = None;
-                                eprintln!("gps: reading {} at {} baud", path.display(), config.baud);
+                                eprintln!("gps: reading {} at {} baud", receiver.name, config.baud);
                                 last_reported = None;
-                                let reason = stream(&config, &path, port, &running, &sink, &dropped, &error, &detail);
-                                format!("{}: {reason}", path.display())
+                                let name = receiver.name.clone();
+                                let reason = stream(&config, receiver, &running, &sink, &dropped, &error, &detail);
+                                format!("{name}: {reason}")
                             }
                             Err(failure) => format!("{failure:#}"),
                         };
@@ -120,25 +121,26 @@ impl Backend for GpsBackend {
 #[allow(clippy::too_many_arguments)]
 fn stream(
     config: &GpsConfig,
-    path: &Path,
-    mut port: File,
+    receiver: Receiver,
     running: &AtomicBool,
     sink: &Sink,
     dropped: &AtomicU64,
     error: &Mutex<Option<String>>,
     detail: &Mutex<String>,
 ) -> String {
+    let Receiver { name, mut port, present } = receiver;
     let fix_topic = config.fix_topic();
     let nmea_topic = config.nmea_topic();
     let frame = config.naming.root_frame_id();
     let mut lines = LineSplitter::default();
     let mut buffer = [0u8; 512];
     let mut last_sentence = Instant::now();
-    *detail.lock().unwrap() = format!("{} @ {} baud, waiting for a sentence", path.display(), config.baud);
+    *detail.lock().unwrap() = format!("{name} @ {} baud, waiting for a sentence", config.baud);
     while running.load(Ordering::SeqCst) {
         let count = match port.read(&mut buffer) {
             Ok(count) => count,
             Err(failure) if failure.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(failure) if failure.kind() == std::io::ErrorKind::TimedOut => 0,
             Err(failure) => return format!("read failed: {failure}"),
         };
         for line in lines.push(&buffer[..count]) {
@@ -155,7 +157,7 @@ fn stream(
                 dropped.fetch_add(1, Ordering::Relaxed);
             }
             if let Sentence::Gga(gga) = sentence {
-                *detail.lock().unwrap() = describe(path, config.baud, &gga);
+                *detail.lock().unwrap() = describe(&name, config.baud, &gga);
                 let fix = gga.to_nav_sat_fix(Header::new(now_nanos(), frame.clone()));
                 if !sink(Produced::NavSatFix {
                     topic: fix_topic.clone(),
@@ -168,12 +170,11 @@ fn stream(
         if last_sentence.elapsed() >= SILENCE_BEFORE_ERROR {
             // An unplugged usb-serial bridge on Linux reads as endless zero-byte
             // timeouts rather than an error, so the node vanishing is the tell.
-            if !path.exists() {
+            if !present() {
                 return "device went away".into();
             }
             *error.lock().unwrap() = Some(format!(
-                "{}: no NMEA for {}s (wrong baud rate?)",
-                path.display(),
+                "{name}: no NMEA for {}s (wrong baud rate?)",
                 last_sentence.elapsed().as_secs()
             ));
         } else {
@@ -183,7 +184,7 @@ fn stream(
     "stopped".into()
 }
 
-fn describe(path: &Path, baud: u32, gga: &nmea::Gga) -> String {
+fn describe(name: &str, baud: u32, gga: &nmea::Gga) -> String {
     let fix = match (gga.has_fix(), gga.latitude, gga.longitude) {
         (true, Some(latitude), Some(longitude)) => format!(
             "fix {latitude:.5}, {longitude:.5}, hdop {}",
@@ -191,19 +192,48 @@ fn describe(path: &Path, baud: u32, gga: &nmea::Gga) -> String {
         ),
         _ => "no fix".into(),
     };
-    format!("{} @ {baud} baud · {fix} · {} sats", path.display(), gga.satellites)
+    format!("{name} @ {baud} baud · {fix} · {} sats", gga.satellites)
 }
 
-/// The configured device, or the first serial port that answers in NMEA.
-fn open_receiver(config: &GpsConfig, running: &AtomicBool) -> Result<(PathBuf, File)> {
+/// An open source of NMEA: a serial node, or a PL2303 bridge driven over USB
+/// directly because the OS has no driver for it.
+struct Receiver {
+    name: String,
+    port: Box<dyn Read + Send>,
+    /// Whether the device is still attached, for telling unplugged from quiet.
+    present: Box<dyn Fn() -> bool + Send>,
+}
+
+impl Receiver {
+    fn serial(path: PathBuf, port: File) -> Self {
+        Receiver {
+            name: path.display().to_string(),
+            port: Box::new(port),
+            present: Box::new(move || path.exists()),
+        }
+    }
+}
+
+/// The configured device, or the first serial port that answers in NMEA,
+/// or failing those a PL2303 with no driver bound.
+fn open_receiver(config: &GpsConfig, running: &AtomicBool) -> Result<Receiver> {
     let device = config.device.trim();
     if !device.is_empty() {
         let path = PathBuf::from(device);
         let port = open_serial(&path, config.baud).with_context(|| format!("opening {device}"))?;
-        return Ok((path, port));
+        return Ok(Receiver::serial(path, port));
     }
     let candidates = candidate_ports();
     if candidates.is_empty() {
+        if let Some(device) = pl2303::find() {
+            let (name, port) = pl2303::open(&device, config.baud)?;
+            let (vendor, product) = (device.vendor_id(), device.product_id());
+            return Ok(Receiver {
+                name,
+                port: Box::new(port),
+                present: Box::new(move || pl2303::attached(vendor, product)),
+            });
+        }
         anyhow::bail!("no usb serial port found; is the gps plugged in?");
     }
     for path in &candidates {
@@ -214,7 +244,7 @@ fn open_receiver(config: &GpsConfig, running: &AtomicBool) -> Result<(PathBuf, F
             continue;
         };
         if speaks_nmea(&mut port) {
-            return Ok((path.clone(), port));
+            return Ok(Receiver::serial(path.clone(), port));
         }
     }
     anyhow::bail!(

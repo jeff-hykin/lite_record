@@ -100,6 +100,7 @@ lerc-rs = "0.5"
 pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }
 sha2 = { version = "0.11.0", default-features = false }
 subtle = { version = "2.6.1", default-features = false }
+nusb = "0.2.8"
 
 [build-dependencies]
 # Compiles the depthai shim. Optional so a build without the `oakd` feature does

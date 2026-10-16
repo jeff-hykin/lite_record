@@ -10,6 +10,7 @@ pub mod gps;
 pub mod livox;
 pub mod oakd;
 pub mod orbbec;
+pub mod pl2303;
 pub mod realsense;
 
 use serde::{Deserialize, Serialize};
