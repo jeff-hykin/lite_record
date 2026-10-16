@@ -297,6 +297,12 @@ pub fn mid360_network_plan(interface: &str, host_address: &str) -> Result<Vec<Pl
     validate_ipv4(host_address)?;
     let multicast_route = format!("{LIDAR_MULTICAST_GROUP}/32");
 
+    if cfg!(target_os = "macos") {
+        let listing = networksetup(&["-listallhardwareports"])?;
+        let hardware_port = hardware_port_for(&listing, interface)
+            .with_context(|| format!("{interface} is not a network port this mac knows about"))?;
+        return Ok(macos_plan(interface, &hardware_port, host_address));
+    }
     if network_manager_runs_here() {
         return Ok(network_manager_plan(interface, &host_cidr, &multicast_route));
     }
@@ -381,6 +387,89 @@ fn network_manager_plan(interface: &str, host_cidr: &str, multicast_route: &str)
         Planned::user(
             "a leftover process still holding the 561xx ports makes the next start fail with address-already-in-use, or cross-feeds two readers garbage",
             &["ss", "-ulnp"],
+        )
+        .optional(),
+    ]
+}
+
+/// The macOS network service the lidar address lives in. Its own service on the
+/// adapter, beside the one macOS made, so a router on the same cable still gets
+/// DHCP; re-running replaces it by name.
+pub const MID360_MAC_SERVICE: &str = "lite_record mid360";
+
+fn networksetup(arguments: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("networksetup")
+        .args(arguments)
+        .output()
+        .context("could not run networksetup")?;
+    if !output.status.success() {
+        bail!(
+            "networksetup {} failed: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// `networksetup -listallhardwareports` as (hardware port, device) pairs.
+pub fn parse_hardware_ports(listing: &str) -> Vec<(String, String)> {
+    let mut ports = Vec::new();
+    let mut port_name = None;
+    for line in listing.lines() {
+        if let Some(name) = line.strip_prefix("Hardware Port: ") {
+            port_name = Some(name.trim().to_string());
+        } else if let Some(device) = line.strip_prefix("Device: ") {
+            if let Some(name) = port_name.take() {
+                ports.push((name, device.trim().to_string()));
+            }
+        }
+    }
+    ports
+}
+
+/// `networksetup -createnetworkservice` takes the hardware port's name, not the device.
+pub fn hardware_port_for(listing: &str, device: &str) -> Option<String> {
+    parse_hardware_ports(listing)
+        .into_iter()
+        .find(|(_, port_device)| port_device == device)
+        .map(|(name, _)| name)
+}
+
+/// The macOS counterpart of the NetworkManager profile: a saved network service,
+/// which macOS reapplies by itself on every replug and reboot. It is given no
+/// router, so it never takes the default route from wifi. The routes are not
+/// saved by macOS and only help this session; the SDK joins the multicast group
+/// on the host address and talks to a configured lidar by unicast, so neither
+/// is needed once the address is up.
+fn macos_plan(interface: &str, hardware_port: &str, host_address: &str) -> Vec<Planned> {
+    vec![
+        Planned::root(
+            "an older service of the same name would keep its old address and fight this one",
+            &["networksetup", "-removenetworkservice", MID360_MAC_SERVICE],
+        )
+        .optional(),
+        Planned::root(
+            "a second service on the adapter holds the lidar address, leaving macOS's own dhcp service on it untouched",
+            &["networksetup", "-createnetworkservice", MID360_MAC_SERVICE, hardware_port],
+        ),
+        Planned::root(
+            "the mid360 is not a dhcp server, so the host needs a static address on its /24; no router, so wifi keeps the default route",
+            &["networksetup", "-setmanual", MID360_MAC_SERVICE, host_address, "255.255.255.0"],
+        ),
+        Planned::root(
+            "the lidar link has no ipv6 to offer, and leaving it on only adds a link-local address to the list",
+            &["networksetup", "-setv6off", MID360_MAC_SERVICE],
+        )
+        .optional(),
+        Planned::root(
+            "the sdk's discovery broadcast otherwise leaves through wifi on a mac with several networks up",
+            &["route", "-n", "add", "-host", "255.255.255.255", "-interface", interface],
+        )
+        .optional(),
+        Planned::user(
+            "a leftover process still holding the 561xx ports makes the next start fail with address-already-in-use, or cross-feeds two readers garbage",
+            &["lsof", "-nP", "-iUDP:56100-56501"],
         )
         .optional(),
     ]
@@ -636,7 +725,29 @@ mod tests {
         // wrong is a bug worth failing on rather than passing to `ip`.
         assert!(mid360_network_plan("eth0; rm -rf /", "192.168.1.50").is_err());
         assert!(mid360_network_plan("", "192.168.1.50").is_err());
+        // A mac has no eth0, so there the name fails the hardware port lookup instead.
+        #[cfg(not(target_os = "macos"))]
         assert!(mid360_network_plan("eth0", "192.168.1.50").is_ok());
+    }
+
+    const HARDWARE_PORTS: &str = "\nHardware Port: USB 10/100/1000 LAN\nDevice: en7\nEthernet Address: 00:e0:4c:68:01:02\n\nHardware Port: Wi-Fi\nDevice: en0\nEthernet Address: fc:b2:14:9f:e1:00\n\nVLAN Configurations\n===================\n";
+
+    #[test]
+    fn the_mac_plan_names_the_hardware_port_not_the_device() {
+        assert_eq!(hardware_port_for(HARDWARE_PORTS, "en7").as_deref(), Some("USB 10/100/1000 LAN"));
+        assert_eq!(hardware_port_for(HARDWARE_PORTS, "en9"), None);
+        let plan = macos_plan("en7", "USB 10/100/1000 LAN", "192.168.1.50");
+        let commands: Vec<String> = plan.iter().map(Planned::display).collect();
+        assert!(commands.contains(
+            &"sudo networksetup -createnetworkservice lite_record mid360 USB 10/100/1000 LAN".to_string()
+        ));
+        // No router argument, or the lidar link would take the default route from wifi.
+        let manual = plan.iter().find(|planned| planned.argv[1] == "-setmanual").unwrap();
+        assert_eq!(manual.argv[3..], ["192.168.1.50", "255.255.255.0"]);
+        let remove = plan.iter().position(|planned| planned.argv[1] == "-removenetworkservice");
+        let create = plan.iter().position(|planned| planned.argv[1] == "-createnetworkservice");
+        assert!(remove < create);
+        assert!(plan[remove.unwrap()].optional);
     }
 
     #[test]

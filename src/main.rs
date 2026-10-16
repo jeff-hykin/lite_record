@@ -86,7 +86,8 @@ enum Command {
 
     /// Set up the wifi and ethernet a headless rig needs to come back on its
     /// own, and report what is wrong with what it has. Interactive with no
-    /// argument. Needs root, because it writes NetworkManager's profiles.
+    /// argument. Needs root, because it writes NetworkManager's profiles. On
+    /// macOS, with no argument, it sets up the lidar's ethernet address.
     Network {
         #[command(subcommand)]
         what: Option<NetworkCommand>,
@@ -116,10 +117,12 @@ enum NetworkCommand {
     },
 
     /// Add the ethernet profile that tries DHCP first and falls back to the
-    /// lidar's static address when no DHCP server answers.
+    /// lidar's static address when no DHCP server answers. On macOS, add the
+    /// lidar's address as a second service on the adapter instead.
     Ethernet {
-        #[arg(long, default_value = "eth0")]
-        interface: String,
+        /// Defaults to eth0 on Linux, and on macOS to the one wired adapter with a link.
+        #[arg(long)]
+        interface: Option<String>,
     },
 }
 
@@ -765,7 +768,7 @@ async fn main() -> Result<()> {
                 Some(NetworkCommand::WifiAdd { ssid, priority }) => {
                     network::wifi_add(&ssid, priority)
                 }
-                Some(NetworkCommand::Ethernet { interface }) => network::ethernet(&interface),
+                Some(NetworkCommand::Ethernet { interface }) => network::ethernet(interface.as_deref()),
             };
         }
         None => {}

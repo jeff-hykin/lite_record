@@ -813,6 +813,9 @@ fn require_root() -> Result<()> {
     if is_root() {
         return Ok(());
     }
+    if cfg!(target_os = "macos") {
+        bail!("network setup adds a macOS network service, so it needs root: re-run with sudo");
+    }
     bail!("network setup writes to {KEYFILE_DIR}, so it needs root: re-run with sudo")
 }
 
@@ -983,6 +986,10 @@ fn set_up_ethernet(survey: &Survey) -> Result<()> {
 
 /// `lite_record network`, the menu.
 pub fn interactive() -> Result<()> {
+    // A mac has no NetworkManager and no headless wifi to recover, so the lidar link is all there is to set up.
+    if cfg!(target_os = "macos") {
+        return ethernet(None);
+    }
     require_root()?;
     let mut rescan = true;
     loop {
@@ -1026,9 +1033,60 @@ pub fn status() -> Result<()> {
 }
 
 /// `lite_record network ethernet`, without the menu.
-pub fn ethernet(interface: &str) -> Result<()> {
+pub fn ethernet(interface: Option<&str>) -> Result<()> {
     require_root()?;
-    run_plan(&ethernet_dhcp_plan(interface)?)
+    if cfg!(target_os = "macos") {
+        let interface = match interface {
+            Some(interface) => interface.to_string(),
+            None => mac_wired_interface()?,
+        };
+        let host_address = crate::privileged::suggest_host_address(None);
+        println!(
+            "  adding \"{}\" on {interface}: {host_address}/24, no router, beside the adapter's own dhcp service",
+            crate::privileged::MID360_MAC_SERVICE
+        );
+        return run_plan(&crate::privileged::mid360_network_plan(&interface, &host_address)?);
+    }
+    run_plan(&ethernet_dhcp_plan(interface.unwrap_or("eth0"))?)
+}
+
+/// The one wired adapter with a cable in. Wi-Fi, Thunderbolt and Bluetooth ports are
+/// skipped, and so are the always-present internal "Ethernet Adapter" ports, by
+/// requiring a link: a lidar on the cable gives one even with no address.
+fn mac_wired_interface() -> Result<String> {
+    let listing = std::process::Command::new("networksetup")
+        .arg("-listallhardwareports")
+        .output()
+        .context("could not run networksetup")?;
+    let wired: Vec<(String, String)> =
+        crate::privileged::parse_hardware_ports(&String::from_utf8_lossy(&listing.stdout))
+            .into_iter()
+            .filter(|(name, _)| {
+                !["Wi-Fi", "Thunderbolt", "Bluetooth", "iPhone"]
+                    .iter()
+                    .any(|skipped| name.starts_with(skipped))
+            })
+            .collect();
+    let active: Vec<&(String, String)> = wired
+        .iter()
+        .filter(|(_, device)| {
+            std::process::Command::new("ifconfig")
+                .arg(device)
+                .output()
+                .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("status: active"))
+        })
+        .collect();
+    match active.as_slice() {
+        [(_, device)] => Ok(device.clone()),
+        [] => bail!(
+            "no wired adapter has a link; plug the lidar in and power it, or pass --interface. Wired ports: {}",
+            wired.iter().map(|(name, device)| format!("{device} ({name})")).collect::<Vec<_>>().join(", ")
+        ),
+        several => bail!(
+            "more than one wired adapter has a link, pass --interface: {}",
+            several.iter().map(|(name, device)| format!("{device} ({name})")).collect::<Vec<_>>().join(", ")
+        ),
+    }
 }
 
 /// `lite_record network wifi-add --ssid X`, for scripting a fleet.
