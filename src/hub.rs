@@ -78,8 +78,9 @@ pub struct Settings {
     pub preview_quality: u8,
     pub preview_max_width: u32,
     /// The uploaded URDF, kept verbatim so the browser's three.js viewer and
-    /// the tf_static writer see exactly the same bytes.
-    #[serde(default)]
+    /// the tf_static writer see exactly the same bytes. Defaults to the
+    /// handheld rig's, so a fresh install records a complete tf tree.
+    #[serde(default = "default_urdf_xml")]
     pub urdf_xml: Option<String>,
 }
 
@@ -99,9 +100,13 @@ impl Default for Settings {
             preview_topic: None,
             preview_quality: 60,
             preview_max_width: 640,
-            urdf_xml: None,
+            urdf_xml: default_urdf_xml(),
         }
     }
+}
+
+fn default_urdf_xml() -> Option<String> {
+    Some(include_str!("../assets/handheld_recorder.urdf").to_string())
 }
 
 impl Settings {
@@ -2414,6 +2419,8 @@ mod tests {
     fn an_engaged_sensor_gets_transforms_even_with_its_setting_off() {
         let hub = scratch_hub();
         assert!(!hub.settings().livox.enabled);
+        // Without the default urdf, so every frame here comes from engaging.
+        hub.set_urdf(None).unwrap();
 
         assert!(hub.static_transforms(1).is_empty());
         hub.engage(SensorKind::Livox).unwrap();

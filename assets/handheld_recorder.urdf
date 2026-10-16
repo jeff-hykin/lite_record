@@ -1,0 +1,260 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Handheld recorder rig, generated from HandHelf_Recorder.step (Fusion export,
+  2026-09-02). Lengths are metres; the CAD is millimetres, so every mesh is
+  scaled 1:1 after cascadio's mm->m conversion.
+
+  base_link sits at the CAD origin: centred in XY on the base plate, with z=0 at
+  the plate's top face.
+
+  camera_link and livox_link are named to match what lite_record publishes, so
+  uploading this URDF joins the recorded sensor frames to the rig.
+-->
+<robot name="handheld_recorder">
+
+    <link name="base_link">
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0"/>
+            <geometry><mesh filename="meshes/base_plate.stl"/></geometry>
+            <material name="plate_grey"><color rgba="0.35 0.37 0.40 1.0"/></material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0"/>
+            <geometry><mesh filename="meshes/base_plate.stl"/></geometry>
+        </collision>
+        <inertial>
+            <origin xyz="0 0 -0.0025" rpy="0 0 0"/>
+            <mass value="0.0728"/>
+            <inertia ixx="1.277e-4" ixy="0" ixz="0" iyy="4.398e-5" iyz="0" izz="1.714e-4"/>
+        </inertial>
+    </link>
+
+    <link name="handle_bar_link">
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0"/>
+            <geometry><mesh filename="meshes/handle_bar.stl"/></geometry>
+            <material name="bar_grey"><color rgba="0.25 0.27 0.30 1.0"/></material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0"/>
+            <geometry><mesh filename="meshes/handle_bar.stl"/></geometry>
+        </collision>
+        <inertial>
+            <origin xyz="0 -0.06 0.015" rpy="0 0 0"/>
+            <mass value="0.0210"/>
+            <inertia ixx="2.669e-6" ixy="0" ixz="0" iyy="2.896e-5" iyz="0" izz="2.844e-5"/>
+        </inertial>
+    </link>
+
+    <link name="sensor_mount_link">
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0"/>
+            <geometry><mesh filename="meshes/sensor_mount.stl"/></geometry>
+            <material name="mount_orange"><color rgba="0.85 0.45 0.15 1.0"/></material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0"/>
+            <geometry><mesh filename="meshes/sensor_mount.stl"/></geometry>
+        </collision>
+        <inertial>
+            <origin xyz="0 -0.0053 -0.0237" rpy="0 0 0"/>
+            <mass value="0.0362"/>
+            <inertia ixx="3.121e-5" ixy="0" ixz="0" iyy="1.837e-5" iyz="0" izz="3.603e-5"/>
+        </inertial>
+    </link>
+
+    <link name="livox_link"/>
+    <link name="camera_link"/>
+
+    <!-- The Mid-360's own frames. lite_record publishes these as identity
+         because the lidar reports no extrinsics of its own, so they have to be
+         stated here or every point sits 47 mm low. -->
+    <link name="livox_frame"/>
+    <link name="livox_imu_frame"/>
+
+    <!-- The four devices, as boxes at their catalogue sizes. The CAD has no
+         solids for them, so these are outlines: enough to see what occupies the
+         rig and what would collide with what, not a model of any part. Sizes and
+         colours match the 2026-09-08 rig view. -->
+
+    <link name="livox_body_link">
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0"/>
+            <geometry><box size="0.065 0.065 0.06"/></geometry>
+            <material name="device_grey"><color rgba="0.72 0.74 0.76 0.75"/></material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0"/>
+            <geometry><box size="0.065 0.065 0.06"/></geometry>
+        </collision>
+    </link>
+
+    <link name="camera_body_link">
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0"/>
+            <geometry><box size="0.124 0.026 0.029"/></geometry>
+            <material name="device_grey"/>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0"/>
+            <geometry><box size="0.124 0.026 0.029"/></geometry>
+        </collision>
+    </link>
+
+    <link name="pi_link">
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0"/>
+            <geometry><box size="0.03 0.09 0.062"/></geometry>
+            <material name="pi_green"><color rgba="0.1 0.45 0.3 0.9"/></material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0"/>
+            <geometry><box size="0.03 0.09 0.062"/></geometry>
+        </collision>
+    </link>
+
+    <!-- BU-353N puck, 53 mm across and 19.5 mm tall. lite_record stamps its
+         fixes in gps_link. -->
+    <link name="gps_link">
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0"/>
+            <geometry><cylinder radius="0.0265" length="0.0195"/></geometry>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0"/>
+            <geometry><cylinder radius="0.0265" length="0.0195"/></geometry>
+        </collision>
+    </link>
+
+    <link name="battery_link">
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0"/>
+            <geometry><box size="0.065 0.1 0.022"/></geometry>
+            <material name="battery_black"><color rgba="0.12 0.12 0.14 1.0"/></material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0"/>
+            <geometry><box size="0.065 0.1 0.022"/></geometry>
+        </collision>
+    </link>
+
+    <joint name="handle_bar_joint" type="fixed">
+        <parent link="base_link"/>
+        <child link="handle_bar_link"/>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+    </joint>
+
+    <!-- The plate is pitched back 25 degrees about X; this is the one non-identity
+         transform in the CAD assembly. -->
+    <joint name="sensor_mount_joint" type="fixed">
+        <parent link="base_link"/>
+        <child link="sensor_mount_link"/>
+        <origin xyz="0 0.029003 0.035565" rpy="0.436332 0 0"/>
+    </joint>
+
+    <!-- Centre of the 4x M3 bolt pattern (36 x 48 mm) on the mount's 62x62 mm
+         tilted face. This is the seat the lidar bolts onto, NOT the Mid-360's
+         internal point-cloud origin — that is livox_frame, 47 mm up the body's
+         axis (Livox manual, and the same number dimos uses in
+         mid360_realsense_30.urdf; it agrees with the 65x65x60 body, whose
+         centre then sits 17 mm below the origin).
+
+         The yaw about the face normal was UNVERIFIED and identity was wrong.
+         The bolt rectangle is 36 x 48 mm, so the lidar can only sit one of two
+         ways and the CAD does not say which; identity put the lidar's +X along
+         the rig's +X, i.e. 90 deg away from where the camera looks (-Y).
+
+         MEASURED 2026-09-11 against grocery.mcap: lidar points were projected
+         into the D455 depth image through this chain and compared with the
+         depth the camera itself reports, over 6 scans spread through the
+         recording (71k points). At rpy 0 0 0 only 6.9% of the points that
+         landed in the image agreed with the depth image to within 15 cm, with
+         a median error of +48 cm. At rpy 0 0 -1.570796 it is 57.7% with a
+         median error of -4.5 cm, and every other yaw is far worse. An
+         unconstrained 3-DOF search over the whole rotation agreed: the
+         correction it found was a rotation of -90.8 deg about an axis of
+         [0.01 0.02 1.00] — the lidar's own Z, to within the fit noise.
+         The fine sweep peaks at -91.5 deg (59.0%); the extra 1.5 deg is left
+         out because it is inside the noise of a handheld rig in motion and a
+         bolted mount can only be a right angle. -->
+    <joint name="livox_joint" type="fixed">
+        <parent link="sensor_mount_link"/>
+        <child link="livox_link"/>
+        <origin xyz="0.0001 0.00734 0" rpy="0 0 -1.570796"/>
+    </joint>
+
+    <!-- The upright bar at the front of the plate has one device-mounting
+         feature: two M3 holes 95 mm apart, half way up its outward face. The
+         camera does not sit centred on that pair: it hangs 2 mm below it
+         (Jeff, 2026-09-10), so z is 0.015 - 0.002. The lens itself is forward
+         of here by the camera's own depth.
+
+         The rpy is optical convention (+Z out of the lens, +Y down) because
+         lite_record publishes camera_link -> camera_depth_optical_frame as
+         identity, which makes camera_link an optical frame, not a body frame. -->
+    <joint name="camera_joint" type="fixed">
+        <parent link="handle_bar_link"/>
+        <child link="camera_link"/>
+        <origin xyz="0 -0.0725 -0.017269" rpy="-1.570796 0 3.141593"/>
+    </joint>
+
+    <!-- The Mid-360 stands on the bolt seat, so its centre is half its 60 mm
+         height along the seat's normal — which is 17 mm below the point-cloud
+         origin, exactly as the 47 mm and the 60 mm body height require. -->
+    <joint name="livox_body_joint" type="fixed">
+        <parent link="livox_link"/>
+        <child link="livox_body_link"/>
+        <origin xyz="0 0 0.03" rpy="0 0 0"/>
+    </joint>
+
+    <!-- Hung off camera_link so it follows the camera rather than having to be
+         moved twice. camera_link is optical (+Z out of the lens, +Y down), so
+         the body's centre is half its 26 mm depth straight ahead, and the box's
+         own axes are width x height x depth in that order. -->
+    <joint name="camera_body_joint" type="fixed">
+        <parent link="camera_link"/>
+        <child link="camera_body_link"/>
+        <origin xyz="0 0 0.013" rpy="-1.570796 0 3.141593"/>
+    </joint>
+
+    <!-- The point-cloud origin, on the body's central axis 47 mm above the
+         seat. Every livox point is measured from here. -->
+    <joint name="livox_origin_joint" type="fixed">
+        <parent link="livox_link"/>
+        <child link="livox_frame"/>
+        <origin xyz="0 0 0.047" rpy="0 0 0"/>
+    </joint>
+
+    <!-- The IMU chip, which is not on the axis: the manual gives its position in
+         point-cloud coordinates as x 11.0, y 23.29, z -44.12 mm. Point-LIO
+         carries the same numbers as its lidar-to-IMU extrinsic. -->
+    <joint name="livox_imu_joint" type="fixed">
+        <parent link="livox_frame"/>
+        <child link="livox_imu_frame"/>
+        <origin xyz="0.011 0.02329 -0.04412" rpy="0 0 0"/>
+    </joint>
+
+    <joint name="pi_joint" type="fixed">
+        <parent link="base_link"/>
+        <child link="pi_link"/>
+        <origin xyz="0.026 0.02 0.031" rpy="0 0 0"/>
+    </joint>
+
+    <!-- Slung under the plate, which is why z is negative. -->
+    <joint name="battery_joint" type="fixed">
+        <parent link="base_link"/>
+        <child link="battery_link"/>
+        <origin xyz="0 0.01 -0.016" rpy="0 0 0"/>
+    </joint>
+
+    <!-- Sitting on top of the camera, centred over its body: the body's centre
+         is at y -0.0855, z -0.0173 in this frame and it is 29 mm tall, so its
+         top is z -0.0028 and the puck's centre is half its height above that.
+         Placed by description, not measured. -->
+    <joint name="gps_joint" type="fixed">
+        <parent link="handle_bar_link"/>
+        <child link="gps_link"/>
+        <origin xyz="0 -0.0855 0.00695" rpy="0 0 0"/>
+    </joint>
+
+</robot>

@@ -40,7 +40,7 @@
                     # Listed rather than taken as `./.`, because a plain path copies
                     # the multi-gigabyte `target/` into the store on every build and
                     # a git-filtered path silently drops anything not yet committed.
-                    # Both `tests/` and `web/` are here because `src/` reaches into
+                    # `tests/`, `web/` and `assets/` are here because `src/` reaches into
                     # them with `include_bytes!` / `include_str!`.
                     source = pkgs.lib.fileset.toSource {
                         root = ./.;
@@ -51,6 +51,7 @@
                             ./src
                             ./tests
                             ./web
+                            ./assets
                             ./examples
                             ./vendor
                         ];
