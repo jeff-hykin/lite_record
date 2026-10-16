@@ -52,8 +52,7 @@ const SILENCE_BEFORE_RECONFIGURE: Duration = Duration::from_secs(2);
 /// Also the longest `stop()` can be delayed, so it is kept well under a second.
 const SUPERVISOR_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Used when no lidar address is configured. `privileged::mid360_network_plan`
-/// installs the host route that makes this deliverable.
+/// The last resort when no interface has a subnet broadcast to try.
 const BROADCAST: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 255);
 
 pub struct LivoxBackend {
@@ -196,10 +195,68 @@ fn send_command(
 fn configure_lidar(config: &LivoxConfig, host_address: Option<Ipv4Addr>) -> Result<Ipv4Addr> {
     let lidar = match config.lidar_address.as_deref().map(str::trim) {
         Some(text) if !text.is_empty() => text
-            .parse()
+            .parse::<Ipv4Addr>()
             .with_context(|| format!("{text:?} is not a lidar address"))?,
-        _ => BROADCAST,
+        _ => return configure_lidar_by_broadcast(config, host_address),
     };
+    configure_lidar_at(config, lidar, host_address)
+}
+
+/// With no lidar address, each interface's own subnet broadcast is tried in
+/// turn. A plain 255.255.255.255 is no good on macOS: it always leaves by the
+/// primary interface (usually Wi-Fi), whatever host route points elsewhere.
+fn configure_lidar_by_broadcast(config: &LivoxConfig, host_address: Option<Ipv4Addr>) -> Result<Ipv4Addr> {
+    let subnets: Vec<(Ipv4Addr, Ipv4Addr)> = subnet_broadcasts()
+        .into_iter()
+        .filter(|(local, _)| host_address.is_none_or(|host| host == *local))
+        .collect();
+    if subnets.is_empty() {
+        return configure_lidar_at(config, BROADCAST, host_address);
+    }
+    let mut failures = Vec::new();
+    for (local, broadcast) in subnets {
+        match configure_lidar_at(config, broadcast, Some(local)) {
+            Ok(host) => return Ok(host),
+            Err(failure) => failures.push(format!("{failure:#}")),
+        }
+    }
+    bail!("{}", failures.join("; "))
+}
+
+/// (address, subnet broadcast) for every up, non-loopback, broadcast-capable
+/// IPv4 interface.
+fn subnet_broadcasts() -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    let mut found = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return found;
+    }
+    let mut cursor = head;
+    while !cursor.is_null() {
+        let entry = unsafe { &*cursor };
+        cursor = entry.ifa_next;
+        let flags = entry.ifa_flags as libc::c_int;
+        let wanted = libc::IFF_UP | libc::IFF_BROADCAST;
+        if flags & wanted != wanted || flags & libc::IFF_LOOPBACK != 0 {
+            continue;
+        }
+        if entry.ifa_addr.is_null() || entry.ifa_netmask.is_null() {
+            continue;
+        }
+        if unsafe { (*entry.ifa_addr).sa_family } as libc::c_int != libc::AF_INET {
+            continue;
+        }
+        let address = unsafe { &*(entry.ifa_addr as *const libc::sockaddr_in) };
+        let netmask = unsafe { &*(entry.ifa_netmask as *const libc::sockaddr_in) };
+        let local = u32::from_be(address.sin_addr.s_addr);
+        let mask = u32::from_be(netmask.sin_addr.s_addr);
+        found.push((Ipv4Addr::from(local), Ipv4Addr::from(local | !mask)));
+    }
+    unsafe { libc::freeifaddrs(head) };
+    found
+}
+
+fn configure_lidar_at(config: &LivoxConfig, lidar: Ipv4Addr, host_address: Option<Ipv4Addr>) -> Result<Ipv4Addr> {
     let target = SocketAddrV4::new(lidar, livox_command::LIDAR_CMD_PORT);
 
     let host = match host_address {
