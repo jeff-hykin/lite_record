@@ -34,7 +34,8 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     echo "  -> $DIST/lite_record-$(uname -m)-apple-darwin"
 fi
 
-build linux-x86 lite_record-x86_64-linux-musl
+build linux-x86 lite_record-x86_64-linux-gnu
+build linux-x86-musl lite_record-x86_64-linux-musl
 build linux-arm64 lite_record-aarch64-linux-gnu
 
 echo ""

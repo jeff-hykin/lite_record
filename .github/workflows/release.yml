@@ -19,7 +19,7 @@ jobs:
             - uses: actions/checkout@v4
             - uses: DeterminateSystems/nix-installer-action@main
             - uses: DeterminateSystems/magic-nix-cache-action@main
-            # musl, no camera SDKs; the lidar works without one
+            # RealSense (RSUSB, no kernel patches) + livox
             - run: nix build .#linux-x86 --print-build-logs
             - name: take the binary and the store paths it needs at runtime
               run: |

@@ -143,8 +143,18 @@
                         crateOverrides = commonCrateOverrides pkgs;
                     };
 
-                    # musl, x86_64. No camera SDK, so nothing here needs a per-crate
-                    # override beyond the shared jpegxl and libc++ ones.
+                    # x86_64 with RealSense and the lidar, shipped like the Pi's binary: glibc
+                    # plus a runtime closure tarball. Native, not cross, on an x86_64-linux builder.
+                    linuxX86C2N = crate2nixFor {
+                        targetPkgs = x86_64Gnu;
+                        rootFeatures = [ "default" "realsense" "livox" ];
+                        crateOverrides = (crossCrateOverrides x86_64Gnu) // {
+                            realsense-sys = realsenseSysOverride x86_64Gnu;
+                        };
+                    };
+
+                    # musl, x86_64, fully static. No camera SDK, so nothing here needs a
+                    # per-crate override beyond the shared jpegxl and libc++ ones.
                     #
                     # NOT `isStatic = true`. Rust's musl target already links crt-static, so
                     # the binary comes out static either way, and asking nixpkgs for a static
@@ -154,7 +164,7 @@
                     #   when making a PIE object
                     # and libstdc++ is unavoidable here because gamut-jxl-sys pulls it in.
                     x86MuslPkgs = crossPkgsFor "x86_64-unknown-linux-musl";
-                    linuxX86C2N = crate2nixFor {
+                    linuxX86MuslC2N = crate2nixFor {
                         targetPkgs = x86MuslPkgs;
                         crateOverrides = crossCrateOverrides x86MuslPkgs;
                     };
@@ -171,16 +181,17 @@
                     #   lite_record    -- depthai, whose public headers include their dependencies'
                     #                     headers directly and whose build script stdenv adds no
                     #                     target include paths to, so each one has to be named.
+                    realsenseSysOverride = targetPkgs: attrs: {
+                        nativeBuildInputs = (attrs.nativeBuildInputs or [ ]) ++ [ pkgs.pkg-config ];
+                        buildInputs = (attrs.buildInputs or [ ]) ++ [ targetPkgs.librealsense ];
+                        PKG_CONFIG_ALLOW_CROSS = 1;
+                        extraLinkFlags = [ "-L${pkgs.lib.getLib targetPkgs.librealsense}/lib" ];
+                    };
                     linuxArm64C2N = crate2nixFor {
                         targetPkgs = aarch64Gnu;
                         rootFeatures = [ "default" "realsense" "oakd" "livox" ];
                         crateOverrides = (crossCrateOverrides aarch64Gnu) // {
-                            realsense-sys = attrs: {
-                                nativeBuildInputs = (attrs.nativeBuildInputs or [ ]) ++ [ pkgs.pkg-config ];
-                                buildInputs = (attrs.buildInputs or [ ]) ++ [ aarch64Gnu.librealsense ];
-                                PKG_CONFIG_ALLOW_CROSS = 1;
-                                extraLinkFlags = [ "-L${pkgs.lib.getLib aarch64Gnu.librealsense}/lib" ];
-                            };
+                            realsense-sys = realsenseSysOverride aarch64Gnu;
                             lite_record = attrs: {
                                 LR_GIT_HASH = gitHash;
                                 extraRustcOpts = (attrs.extraRustcOpts or [ ])
@@ -391,7 +402,8 @@
                             crateOverrides = crossCrateOverrides musl;
                         };
 
-                    aarch64Gnu = (crossPkgsFor "aarch64-unknown-linux-gnu").extend
+                    # glibc wherever a camera SDK goes in; shared by the Pi and x86 builds.
+                    linuxGnuFor = config: (crossPkgsFor config).extend
                         (final: previous: {
                             v4l-utils = previous.v4l-utils.override { withGUI = false; };
 
@@ -483,6 +495,8 @@
                                     ++ [ "-DFORCE_RSUSB_BACKEND=ON" ];
                             });
                         });
+                    aarch64Gnu = linuxGnuFor "aarch64-unknown-linux-gnu";
+                    x86_64Gnu = linuxGnuFor "x86_64-unknown-linux-gnu";
 
                     # depthai ships no .pc file, only a CMake config, so it is
                     # found through `DEPTHAI_DIR` rather than the `sdkLibraries`
@@ -493,6 +507,7 @@
                     default = nativeC2N;
 
                     linux-x86 = linuxX86C2N;
+                    linux-x86-musl = linuxX86MuslC2N;
 
                     # The desktop post-processing build: `post_process --loop-closure`
                     # needs GTSAM, so this is the native package plus the feature, with
@@ -577,7 +592,8 @@
                             echo ""
                             echo "  ./run/build                        -- every target into dist/"
                             echo "  nix build .#linux-arm64            -- aarch64 gnu, every camera + livox"
-                            echo "  nix build .#linux-x86              -- x86_64 musl, static, no camera SDK"
+                            echo "  nix build .#linux-x86              -- x86_64 gnu, realsense + livox"
+                            echo "  nix build .#linux-x86-musl         -- x86_64 musl, static, no camera SDK"
                             echo "  nix develop .#cameras              -- the SDKs, for --features realsense,oakd,livox"
                             echo ""
                         '';

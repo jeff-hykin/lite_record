@@ -77,12 +77,13 @@ cargo build --release --features realsense,livox   # needs librealsense2 via pkg
 
 ```sh
 nix build .#linux-arm64      # aarch64 gnu, every camera SDK + livox; what the Pi runs
-nix build .#linux-x86        # x86_64, static musl, no camera SDKs; lidar still works
+nix build .#linux-x86        # x86_64 gnu, RealSense + livox; what install.sh ships for x86
+nix build .#linux-x86-musl   # x86_64, static musl, no camera SDKs; lidar still works
 ```
 
-The arm64 build is what the release ships and what `install.sh` installs: the binary
+Both gnu builds are what the release ships and what `install.sh` installs: the binary
 plus a tarball of the `/nix/store` paths it loads (`.github/export-closure.sh`), which
-unpack at `/` on a Pi that has no nix. A build **with a camera SDK** cannot be static,
+unpack at `/` on a machine that has no nix. A build **with a camera SDK** cannot be static,
 because the vendor `.so` is dynamically linked (and Orbbec's is closed source), so it
 targets `aarch64-unknown-linux-gnu`; done by hand rather than through the flake it needs
 the target's own `librealsense2.so` plus a `realsense2.pc` describing it:
@@ -394,7 +395,7 @@ The Pi's cross-built binary and the plain release binaries do not have it, and s
 
 Everything the Post process button does, plus what it cannot, is one command that runs
 on any Mac or Linux box with the recording (`cargo build --release`, or a static
-`nix build .#linux-x86`):
+`nix build .#linux-x86-musl`):
 
 ```
 lite_record post_process <file.mcap> [--urdf rig.urdf] [--no-odom] [--no-deskew]
