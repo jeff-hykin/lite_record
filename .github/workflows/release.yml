@@ -58,7 +58,22 @@ jobs:
             - uses: dtolnay/rust-toolchain@stable
             # nix would work here too, but a nix-built mac binary links against
             # /nix/store dylibs and will not run on a Mac without nix.
-            - run: cargo build --release --locked
+            - uses: actions/cache@v4
+              id: librealsense
+              with:
+                  path: ${{ runner.temp }}/librealsense
+                  key: librealsense-static-2.57.7-macos-14-v1
+            - if: steps.librealsense.outputs.cache-hit != 'true'
+              run: ./.github/static-librealsense-macos.sh 2.57.7 "$RUNNER_TEMP/librealsense"
+            # librealsense linked in statically, so the binary still needs nothing installed
+            - run: cargo build --release --locked --features realsense
+              env:
+                  PKG_CONFIG_PATH: ${{ runner.temp }}/librealsense/lib/pkgconfig
+                  PKG_CONFIG_ALL_STATIC: "1"
+            - name: refuse a binary that links anything outside the OS
+              run: |
+                  otool -L target/release/lite_record
+                  ! otool -L target/release/lite_record | tail -n +2 | grep -v -E '^\s*(/usr/lib/|/System/Library/)'
             - run: install -m755 target/release/lite_record lite_record-aarch64-macos
             - uses: actions/upload-artifact@v4
               with:
