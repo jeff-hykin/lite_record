@@ -509,6 +509,11 @@
                     linux-x86 = linuxX86C2N;
                     linux-x86-musl = linuxX86MuslC2N;
 
+                    # The libusb the macOS release links in statically. Nix's build, because the
+                    # one librealsense bundles (and a plain autotools build of 1.0.30) left the
+                    # D455 stalling after a few frames on macOS while this one streams.
+                    libusb-static = pkgs.libusb1.overrideAttrs { dontDisableStatic = true; };
+
                     # The desktop post-processing build: `post_process --loop-closure`
                     # needs GTSAM, so this is the native package plus the feature, with
                     # gtsam_shim's build script pointed at nix's GTSAM/Eigen/Boost/TBB.

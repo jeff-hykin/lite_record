@@ -62,9 +62,13 @@ jobs:
               id: librealsense
               with:
                   path: ${{ runner.temp }}/librealsense
-                  key: librealsense-static-2.57.7-macos-14-v1
+                  key: librealsense-static-2.57.7-nix-libusb-1.0.30-macos-14-v3
             - if: steps.librealsense.outputs.cache-hit != 'true'
-              run: ./.github/static-librealsense-macos.sh 2.57.7 "$RUNNER_TEMP/librealsense"
+              uses: DeterminateSystems/nix-installer-action@main
+            - if: steps.librealsense.outputs.cache-hit != 'true'
+              run: |
+                  nix build '.#libusb-static^out,dev' --out-link libusb
+                  ./.github/static-librealsense-macos.sh 2.57.7 "$RUNNER_TEMP/librealsense" "$PWD/libusb" "$PWD/libusb-dev"
             # librealsense linked in statically, so the binary still needs nothing installed
             - run: cargo build --release --locked --features realsense
               env:
