@@ -59,6 +59,29 @@ fn stream_enum(value: i32) -> sys::rs2_stream {
     value as sys::rs2_stream
 }
 
+/// librealsense's own log, which says why a device opened but delivers nothing.
+/// `LITE_RECORD_RS_LOG` picks the level: debug, info, warn (default) or error.
+pub const LIBREALSENSE_LOG: &str = "/tmp/lite_record_realsense.log";
+
+fn log_librealsense_to_file() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let severity = match std::env::var("LITE_RECORD_RS_LOG").unwrap_or_default().as_str() {
+            "debug" => sys::rs2_log_severity_RS2_LOG_SEVERITY_DEBUG,
+            "info" => sys::rs2_log_severity_RS2_LOG_SEVERITY_INFO,
+            "error" => sys::rs2_log_severity_RS2_LOG_SEVERITY_ERROR,
+            _ => sys::rs2_log_severity_RS2_LOG_SEVERITY_WARN,
+        };
+        let path = std::ffi::CString::new(LIBREALSENSE_LOG).unwrap();
+        let mut error: *mut sys::rs2_error = ptr::null_mut();
+        unsafe { sys::rs2_log_to_file(severity, path.as_ptr(), &mut error) };
+        match unsafe { check(error, "opening its log file") } {
+            Ok(()) => eprintln!("realsense: librealsense log -> {LIBREALSENSE_LOG}"),
+            Err(failure) => eprintln!("realsense: {failure:#}"),
+        }
+    });
+}
+
 // -- error and handle plumbing ------------------------------------------------
 
 /// Turns librealsense's out-param error into a Rust one, freeing it either way.
@@ -161,6 +184,8 @@ struct Session {
     /// The factory extrinsics, read once at start because they cannot change
     /// while the device streams.
     body_transforms: Vec<crate::msgs::TransformStamped>,
+    /// Set by the worker while the camera is engaged but delivering nothing.
+    stalled: Arc<Mutex<Option<String>>>,
 }
 
 pub struct RealsenseBackend {
@@ -524,7 +549,11 @@ impl Backend for RealsenseBackend {
         BackendStatus {
             running: self.session.is_some(),
             detail: self.detail.clone(),
-            error: self.error.clone(),
+            error: self
+                .session
+                .as_ref()
+                .and_then(|session| session.stalled.lock().unwrap().clone())
+                .or_else(|| self.error.clone()),
         }
     }
 
@@ -643,6 +672,7 @@ impl RealsenseBackend {
     /// `Owned` or moved onto the worker thread, so none outlive this function
     /// uncontrolled.
     unsafe fn open(&mut self, sink: Sink) -> Result<()> {
+        log_librealsense_to_file();
         let context = Owned::new(
             rs!(
                 "creating the context",
@@ -751,8 +781,10 @@ impl RealsenseBackend {
             })
             .transpose()?;
 
+        let stalled = Arc::new(Mutex::new(None));
         let worker = {
             let running = Arc::clone(&running);
+            let stalled = Arc::clone(&stalled);
             let naming = self.config.naming.clone();
             // Held for the thread's lifetime so the device is not released early.
             let held = (context, device, config, profile, depth_sensor.clone());
@@ -763,10 +795,25 @@ impl RealsenseBackend {
                     // The IMU has its own thread now, so no motion frame ever
                     // reaches this one.
                     let mut pump = Pump::new(naming, sink, false);
+                    let mut last_frame = std::time::Instant::now();
                     while running.load(Ordering::SeqCst) {
                         unsafe {
                             if let Err(error) = pump.step(pipeline.pointer(), aligner.as_ref()) {
                                 eprintln!("realsense: {error:#}");
+                            }
+                        }
+                        match &pump.wait_failure {
+                            None => {
+                                last_frame = std::time::Instant::now();
+                                *stalled.lock().unwrap() = None;
+                            }
+                            Some(reason) => {
+                                let report = format!(
+                                    "no frames for {}s: {reason}",
+                                    last_frame.elapsed().as_secs()
+                                );
+                                eprintln!("realsense: {report}");
+                                *stalled.lock().unwrap() = Some(report);
                             }
                         }
                     }
@@ -782,13 +829,11 @@ impl RealsenseBackend {
             motion_worker,
             depth_sensor,
             body_transforms: transforms,
+            stalled,
         });
         Ok(())
     }
 }
-
-/// How far back to look for the smallest device-to-host offset seen.
-
 
 // -- the frame pump -----------------------------------------------------------
 
@@ -819,6 +864,8 @@ struct Pump {
     /// header stamp that goes backwards is a fault to a ROS reader, so stamps
     /// are kept strictly increasing per stream.
     last_stamp: std::collections::BTreeMap<(StreamId, bool), u64>,
+    /// Why the last wait for frames came back empty, cleared by the next frame.
+    wait_failure: Option<String>,
 }
 
 impl Pump {
@@ -831,6 +878,7 @@ impl Pump {
             latest_acceleration: [0.0; 3],
             clock: HostClock::default(),
             last_stamp: Default::default(),
+            wait_failure: None,
         }
     }
 
@@ -855,11 +903,18 @@ impl Pump {
         let composite =
             sys::rs2_pipeline_wait_for_frames(pipeline, FRAME_TIMEOUT_MS, &mut error);
         if !error.is_null() {
-            sys::rs2_free_error(error);
             // A timeout is how a disengaged or unplugged camera looks, and the
-            // caller's loop re-checks the stop flag, so it is not fatal here.
+            // caller's loop re-checks the stop flag, so it is not fatal here;
+            // the reason is kept so a camera that never delivers can say why.
+            self.wait_failure = Some(
+                CStr::from_ptr(sys::rs2_get_error_message(error))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            sys::rs2_free_error(error);
             return Ok(());
         }
+        self.wait_failure = None;
         let composite = Owned::new(composite, sys::rs2_release_frame)?;
 
         let count = rs!(
