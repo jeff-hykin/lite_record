@@ -62,6 +62,8 @@ fn stream_enum(value: i32) -> sys::rs2_stream {
 /// librealsense's own log, which says why a device opened but delivers nothing.
 /// `LITE_RECORD_RS_LOG` picks the level: debug, info, warn (default) or error.
 pub const LIBREALSENSE_LOG: &str = "/tmp/lite_record_realsense.log";
+/// The log and its rolled `.old` copy together stay under this many megabytes.
+const LIBREALSENSE_LOG_MAX_MB: u32 = 100;
 
 fn log_librealsense_to_file() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -75,6 +77,10 @@ fn log_librealsense_to_file() {
         let path = std::ffi::CString::new(LIBREALSENSE_LOG).unwrap();
         let mut error: *mut sys::rs2_error = ptr::null_mut();
         unsafe { sys::rs2_log_to_file(severity, path.as_ptr(), &mut error) };
+        // A USB fault repeats its warning every few ms; uncapped, this file reached 79 GB.
+        if error.is_null() {
+            unsafe { sys::rs2_enable_rolling_log_file(LIBREALSENSE_LOG_MAX_MB, &mut error) };
+        }
         match unsafe { check(error, "opening its log file") } {
             Ok(()) => eprintln!("realsense: librealsense log -> {LIBREALSENSE_LOG}"),
             Err(failure) => eprintln!("realsense: {failure:#}"),
