@@ -480,7 +480,8 @@ pub fn list(directory: &Path) -> Vec<RecordingFile> {
             let metadata = entry.metadata().ok()?;
             Some(RecordingFile {
                 name: entry.file_name().to_string_lossy().into_owned(),
-                path: entry.path().display().to_string(),
+                // Absolute, so the browser's Copy path is usable from a terminal anywhere.
+                path: std::fs::canonicalize(entry.path()).unwrap_or_else(|_| entry.path()).display().to_string(),
                 bytes: metadata.len(),
                 modified: metadata
                     .modified()

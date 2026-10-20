@@ -1029,6 +1029,7 @@ a.button.action {
     font-size: 0.76rem;
     font-weight: 400;
     white-space: normal;
+    overflow-wrap: anywhere;
 }
 
 .action.danger .action-detail {

@@ -67,6 +67,29 @@ const secondsToText = (seconds) => {
     return `${minutes}m ${(seconds - minutes * 60).toFixed(0)}s`
 }
 
+/**
+ * Puts text on the clipboard. `navigator.clipboard` only exists on https or
+ * localhost, and this page is usually plain http on a LAN address, so the old
+ * selected-textarea route is the fallback.
+ */
+const copyText = async (text) => {
+    try {
+        await navigator.clipboard.writeText(text)
+        return true
+    } catch {
+        const area = document.createElement("textarea")
+        area.value = text
+        area.setAttribute("readonly", "")
+        area.style.position = "fixed"
+        area.style.opacity = "0"
+        document.body.append(area)
+        area.select()
+        const copied = document.execCommand("copy")
+        area.remove()
+        return copied
+    }
+}
+
 const toast = (message, bad) => {
     const box = element("toast")
     box.textContent = message
@@ -1818,6 +1841,12 @@ const openFileSheet = (file) => {
         download.append(make("span", "", "Download"))
         download.append(make("span", "action-detail", "Save the .mcap to this device."))
         actions.append(download)
+
+        action("secondary", "Copy path", file.path)
+            .addEventListener("click", async () => {
+                const copied = await copyText(file.path)
+                toast(copied ? "path copied" : "could not copy; select the path above instead", !copied)
+            })
 
         action("secondary", "Rename", "A new name in this folder. Instant; nothing is copied.")
             .addEventListener("click", async () => {
