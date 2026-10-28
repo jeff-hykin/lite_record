@@ -9,8 +9,14 @@
 
   camera_link and livox_link are named to match what lite_record publishes, so
   uploading this URDF joins the recorded sensor frames to the rig.
+
+  The tree's root is mid360_link, the Mid-360's point-cloud origin, so the
+  recorded odometry is odom -> mid360_link (what dimos's pointlio calls the
+  sensor frame) and base_link hangs below it.
 -->
 <robot name="handheld_recorder">
+
+    <link name="mid360_link"/>
 
     <link name="base_link">
         <visual>
@@ -137,6 +143,15 @@
             <geometry><box size="0.065 0.1 0.022"/></geometry>
         </collision>
     </link>
+
+    <!-- The inverse of base_link -> sensor_mount_link -> livox_link -> livox_frame
+         below, so mid360_link lands exactly on livox_frame. Recompute it if any of
+         those three joints change (a test checks they still agree). -->
+    <joint name="mid360_base_joint" type="fixed">
+        <parent link="mid360_link"/>
+        <child link="base_link"/>
+        <origin xyz="0.048656 -0.0001 -0.066976" rpy="-0.436332 0 1.570796"/>
+    </joint>
 
     <joint name="handle_bar_joint" type="fixed">
         <parent link="base_link"/>

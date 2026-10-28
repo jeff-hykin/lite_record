@@ -3,10 +3,9 @@
 //! Runs Point-LIO (the pure-Rust port under `vendor/`) over the recording's
 //! lidar and IMU streams, then appends the trajectory as `/pointlio_odometry`
 //! and as `odom -> <root>` edges on `/tf`, where `<root>` is the top of the
-//! static tree the lidar hangs from — `base_link` once a URDF has been applied,
-//! the lidar's own link otherwise. The odometry is therefore the pose of the
-//! rig, not of the lidar, and composes with the static edges to place every
-//! sensor.
+//! static tree the lidar hangs from — the URDF's root (`mid360_link` for the handheld rig),
+//! the lidar's own link otherwise. The odometry therefore composes with the
+//! static edges to place every sensor.
 //!
 //! Point-LIO estimates on the sensors' own clock, which in these recordings can
 //! sit a long way from the clock the messages were logged on (the Pi's clock

@@ -2383,6 +2383,20 @@ mod tests {
     /// 47 mm above the seat it bolts to, and publishing both would give
     /// livox_frame two parents in a single message.
     #[test]
+    fn the_default_urdf_roots_at_mid360_link_which_sits_on_the_point_cloud_origin() {
+        let mut tree = crate::tf::StaticTree::new();
+        for edge in crate::urdf::parse(&default_urdf_xml().unwrap()).unwrap().static_transforms(0) {
+            tree.insert_transform(&edge);
+        }
+        assert_eq!(tree.root_of("livox_frame").as_deref(), Some("mid360_link"));
+        assert_eq!(tree.root_of("camera_link").as_deref(), Some("mid360_link"));
+        let lidar = tree.pose_in("mid360_link", "livox_frame").unwrap();
+        let offset = lidar.translation.iter().map(|value| value * value).sum::<f64>().sqrt();
+        assert!(offset < 1e-6, "mid360_link is {offset} m off livox_frame");
+        assert!(lidar.rotation[3].abs() > 1.0 - 1e-9, "mid360_link is rotated off livox_frame: {:?}", lidar.rotation);
+    }
+
+    #[test]
     fn a_frame_the_urdf_places_does_not_also_get_an_identity_placeholder() {
         let hub = scratch_hub();
         let mut settings = hub.settings();
