@@ -780,14 +780,16 @@ impl Hub {
     }
 
     pub fn stream_stats(&self) -> Vec<StreamStats> {
-        let rates = self.rates.lock().unwrap();
-        let pipeline_dropped = self.pipeline_dropped.lock().unwrap();
+        // Recorder first and released before the counters: start_recording holds
+        // the recorder while it reads pipeline_dropped, so the reverse deadlocked.
         let written = self
             .recorder
             .lock()
             .unwrap()
             .as_ref()
             .map(Recorder::status);
+        let rates = self.rates.lock().unwrap();
+        let pipeline_dropped = self.pipeline_dropped.lock().unwrap();
         rates
             .iter()
             .map(|(topic, counter)| {
@@ -1149,6 +1151,7 @@ impl Hub {
             .iter()
             .map(|(topic, info)| (topic.clone(), info.clone()))
             .collect();
+        let shed_baseline = self.pipeline_dropped.lock().unwrap().clone();
 
         let mut slot = self.recorder.lock().unwrap();
         if slot.is_some() {
@@ -1181,7 +1184,7 @@ impl Hub {
             }
             recorder.offer(topic, encoded);
         }
-        *self.shed_baseline.lock().unwrap() = self.pipeline_dropped.lock().unwrap().clone();
+        *self.shed_baseline.lock().unwrap() = shed_baseline;
         let status = recorder.status();
         *slot = Some(recorder);
         self.recording_active.store(true, Ordering::Relaxed);
