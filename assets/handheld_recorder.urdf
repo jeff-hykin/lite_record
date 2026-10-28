@@ -179,19 +179,17 @@
          ways and the CAD does not say which; identity put the lidar's +X along
          the rig's +X, i.e. 90 deg away from where the camera looks (-Y).
 
-         MEASURED 2026-09-11 against grocery.mcap: lidar points were projected
-         into the D455 depth image through this chain and compared with the
-         depth the camera itself reports, over 6 scans spread through the
-         recording (71k points). At rpy 0 0 0 only 6.9% of the points that
-         landed in the image agreed with the depth image to within 15 cm, with
-         a median error of +48 cm. At rpy 0 0 -1.570796 it is 57.7% with a
-         median error of -4.5 cm, and every other yaw is far worse. An
-         unconstrained 3-DOF search over the whole rotation agreed: the
-         correction it found was a rotation of -90.8 deg about an axis of
-         [0.01 0.02 1.00] — the lidar's own Z, to within the fit noise.
-         The fine sweep peaks at -91.5 deg (59.0%); the extra 1.5 deg is left
-         out because it is inside the noise of a handheld rig in motion and a
-         bolted mount can only be a right angle. -->
+         The -90 deg is settled by a gyro fit (98,630 samples, lidar IMU
+         against camera IMU: 0.88 deg residual with it, 90.25 deg without) and
+         an accelerometer cross-check; a depth-image comparison cannot measure
+         this rotation, so do not re-derive it from one.
+
+         The translation was checked 2026-10-28 on sf_555_office_1.mcap: raw
+         lidar scans at 12 still moments projected into the D455 depth image.
+         The height (incl. the 47 mm to livox_frame) fits to within 0.6 cm in
+         both halves of the data, and dropping the 47 mm scores worse (28% vs
+         34% of points within 3 cm). Sideways the fit hints at 3-4.6 cm toward
+         -x but is too shallow to act on. -->
     <joint name="livox_joint" type="fixed">
         <parent link="sensor_mount_link"/>
         <child link="livox_link"/>
