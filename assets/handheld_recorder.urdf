@@ -13,10 +13,30 @@
   The tree's root is mid360_link, the Mid-360's point-cloud origin, so the
   recorded odometry is odom -> mid360_link (what dimos's pointlio calls the
   sensor frame) and base_link hangs below it.
+
+  This copy adds world -> odom: the rig is carried with the base plate (and
+  so the camera) level, and odom starts at the lidar, which is tilted 25 deg
+  on its mount. world -> odom is the lidar's pose in base_link, so at t=0
+  base_link sits level at the world origin. odom -> mid360_link is floating:
+  the recorded odometry fills it in, so it is not a static transform.
 -->
 <robot name="handheld_recorder">
 
+    <link name="world"/>
+    <link name="odom"/>
     <link name="mid360_link"/>
+
+    <joint name="world_odom_joint" type="fixed">
+        <parent link="world"/>
+        <child link="odom"/>
+        <origin xyz="0.0001 0.015792 0.081263" rpy="0 0.436332 -1.570796"/>
+    </joint>
+
+    <joint name="odom_mid360_joint" type="floating">
+        <parent link="odom"/>
+        <child link="mid360_link"/>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+    </joint>
 
     <link name="base_link">
         <visual>

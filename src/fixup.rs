@@ -211,7 +211,7 @@ pub fn plan(recording: &Recording, urdf: Option<&crate::urdf::Urdf>) -> Plan {
     let mut tree = recording.tree.clone();
     let mut overridden = Vec::new();
     if let Some(urdf) = urdf {
-        for joint in &urdf.joints {
+        for joint in urdf.joints.iter().filter(|joint| !joint.floating) {
             let pose = Pose::new(
                 joint.translation,
                 crate::msgs::quaternion_from_rpy(

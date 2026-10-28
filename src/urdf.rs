@@ -20,6 +20,9 @@ pub struct Joint {
     pub child: String,
     pub translation: [f64; 3],
     pub rotation_rpy: [f64; 3],
+    /// A `type="floating"` joint is placed by something live (odometry), so it
+    /// counts toward the tree but is never published as a static transform.
+    pub floating: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -116,6 +119,7 @@ pub fn parse(xml: &str) -> Result<Urdf> {
                             child: String::new(),
                             translation: [0.0; 3],
                             rotation_rpy: [0.0; 3],
+                            floating: attributes.get("type").map(String::as_str) == Some("floating"),
                         });
                     }
                     "parent" => {
@@ -308,9 +312,15 @@ impl Urdf {
         None
     }
 
+    /// Links whose parent edge is a floating joint, which a live source supplies.
+    pub fn floating_children(&self) -> BTreeSet<String> {
+        self.joints.iter().filter(|joint| joint.floating).map(|joint| joint.child.clone()).collect()
+    }
+
     pub fn static_transforms(&self, stamp_nanos: u64) -> Vec<TransformStamped> {
         self.joints
             .iter()
+            .filter(|joint| !joint.floating)
             .map(|joint| TransformStamped {
                 header: Header::new(stamp_nanos, joint.parent.clone()),
                 child_frame_id: joint.child.clone(),

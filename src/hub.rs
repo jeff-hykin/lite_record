@@ -1103,7 +1103,9 @@ impl Hub {
         if transforms.is_empty() {
             return problems;
         }
-        let roots = tree.roots();
+        // A floating joint's child is a static root on purpose: odometry hangs it under its parent.
+        let floating = urdf_xml.and_then(|xml| urdf::parse(xml).ok()).map(|parsed| parsed.floating_children()).unwrap_or_default();
+        let roots: Vec<String> = tree.roots().into_iter().filter(|root| !floating.contains(root)).collect();
         if roots.len() > 1 {
             problems.push(TreeProblem::MultipleRoots { roots });
         }
@@ -2397,6 +2399,29 @@ mod tests {
         let offset = lidar.translation.iter().map(|value| value * value).sum::<f64>().sqrt();
         assert!(offset < 1e-6, "mid360_link is {offset} m off livox_frame");
         assert!(lidar.rotation[3].abs() > 1.0 - 1e-9, "mid360_link is rotated off livox_frame: {:?}", lidar.rotation);
+    }
+
+    /// The rig is carried with the plate level and the lidar tilted on its mount, and odometry
+    /// starts at the lidar. world -> odom undoes that tilt; odom -> mid360_link is floating so the
+    /// odometry, not /tf_static, supplies it.
+    #[test]
+    fn the_default_urdf_levels_base_link_in_world_and_leaves_odom_to_mid360_to_odometry() {
+        let parsed = crate::urdf::parse(&default_urdf_xml().unwrap()).unwrap();
+        let edges = parsed.static_transforms(0);
+        assert!(edges.iter().any(|edge| edge.header.frame_id == "world" && edge.child_frame_id == "odom"));
+        assert!(!edges.iter().any(|edge| edge.child_frame_id == "mid360_link"), "odom -> mid360_link was published as static");
+        let mut tree = crate::tf::StaticTree::new();
+        for edge in &edges {
+            tree.insert_transform(edge);
+        }
+        tree.insert("odom", "mid360_link", crate::tf::Pose::new([0.0; 3], [0.0, 0.0, 0.0, 1.0]));
+        let base = tree.pose_in("world", "base_link").unwrap();
+        assert!(base.rotation[3].abs() > 1.0 - 1e-9, "base_link starts tilted in world: {:?}", base.rotation);
+        assert!(base.translation.iter().all(|value| value.abs() < 1e-5), "base_link starts off the world origin: {:?}", base.translation);
+
+        let hub = scratch_hub();
+        assert_eq!(hub.tree_problems(Some(&default_urdf_xml().unwrap())), vec![]);
+        std::fs::remove_file(hub.settings_file()).ok();
     }
 
     #[test]
