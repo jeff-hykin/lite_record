@@ -37,6 +37,11 @@ const FRAMESET_TIMEOUT_MS: u32 = 2_000;
 
 /// `ob_property_id::OB_PROP_LASER_BOOL` — the IR projector.
 const OB_PROP_LASER_BOOL: c_int = 3;
+/// `ob_property_id::OB_PROP_LASER_CONTROL_INT` — the projector on the Gemini 330
+/// series, which reports the bool as read-only (0 off, 1 on).
+const OB_PROP_LASER_CONTROL_INT: c_int = 182;
+/// `ob_permission_type::OB_PERMISSION_WRITE`.
+const OB_PERMISSION_WRITE: c_int = 2;
 
 /// `ob_accel_full_scale_range::OB_ACCEL_FS_4g` and
 /// `ob_gyro_full_scale_range::OB_GYRO_FS_1000dps`. Wide enough for a handheld
@@ -146,6 +151,18 @@ extern "C" {
         value: bool,
         error: *mut *mut ob_error,
     );
+    fn ob_device_set_int_property(
+        device: *mut ob_device,
+        property_id: c_int,
+        value: i32,
+        error: *mut *mut ob_error,
+    );
+    fn ob_device_is_property_supported(
+        device: *const ob_device,
+        property_id: c_int,
+        permission: c_int,
+        error: *mut *mut ob_error,
+    ) -> bool;
 
     fn ob_create_pipeline_with_device(
         device: *mut ob_device,
@@ -431,10 +448,19 @@ unsafe fn find_device(
 
 /// Toggles the IR projector.
 unsafe fn set_emitter(device: *mut ob_device, on: bool) -> Result<()> {
-    ob!(
-        "setting the emitter",
-        ob_device_set_bool_property(device, OB_PROP_LASER_BOOL, on)
-    );
+    if ob_ignoring_errors!(ob_device_is_property_supported(device, OB_PROP_LASER_BOOL, OB_PERMISSION_WRITE)) {
+        ob!(
+            "setting the emitter",
+            ob_device_set_bool_property(device, OB_PROP_LASER_BOOL, on)
+        );
+    } else if ob_ignoring_errors!(ob_device_is_property_supported(device, OB_PROP_LASER_CONTROL_INT, OB_PERMISSION_WRITE)) {
+        ob!(
+            "setting the emitter",
+            ob_device_set_int_property(device, OB_PROP_LASER_CONTROL_INT, on as i32)
+        );
+    } else {
+        anyhow::bail!("this Orbbec has no writable emitter property");
+    }
     Ok(())
 }
 
@@ -589,7 +615,10 @@ impl OrbbecBackend {
         let context = Owned::new(ob!("creating the context", ob_create_context()), ob_delete_context)?;
         let (_list, device, serial) = find_device(context.pointer(), self.config.serial.as_deref())
             .context("selecting an Orbbec")?;
-        set_emitter(device.pointer(), self.config.emitter)?;
+        // A projector we cannot switch still leaves depth worth recording.
+        if let Err(error) = set_emitter(device.pointer(), self.config.emitter) {
+            eprintln!("warning: orbbec emitter left as is: {error:#}");
+        }
 
         // Same reasoning as the RealSense backend: losing every image stream
         // because the host cannot reach the IMU is a worse outcome than

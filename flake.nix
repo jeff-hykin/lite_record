@@ -187,13 +187,31 @@
                         PKG_CONFIG_ALLOW_CROSS = 1;
                         extraLinkFlags = [ "-L${pkgs.lib.getLib targetPkgs.librealsense}/lib" ];
                     };
+                    # The Orbbec SDK is only shipped prebuilt, so it is patched onto nix's glibc
+                    # and libstdc++. The CUDA and EGL extensions are dlopen'd optional extras.
+                    orbbecSdkArm64 = aarch64Gnu.stdenv.mkDerivation {
+                        pname = "orbbec-sdk";
+                        version = "2.9.3";
+                        src = pkgs.fetchurl {
+                            url = "https://github.com/orbbec/OrbbecSDK_v2/releases/download/v2.9.3/OrbbecSDK_v2.9.3_202607151523_2f6561c_linux_arm64.tar.gz";
+                            hash = "sha256-zixHbCg7kyGBsE2vRN663/nkp0M0S9ae7PNPjBgAmsE=";
+                        };
+                        nativeBuildInputs = [ aarch64Gnu.buildPackages.autoPatchelfHook ];
+                        buildInputs = [ aarch64Gnu.stdenv.cc.cc.lib ];
+                        autoPatchelfIgnoreMissingDeps = [ "libcudart.so.12" "libnvinfer.so.10" "libEGL.so.1" ];
+                        installPhase = ''
+                            mkdir -p $out
+                            cp -r lib include $out/
+                        '';
+                    };
                     linuxArm64C2N = crate2nixFor {
                         targetPkgs = aarch64Gnu;
-                        rootFeatures = [ "default" "realsense" "oakd" "livox" ];
+                        rootFeatures = [ "default" "realsense" "oakd" "livox" "orbbec" ];
                         crateOverrides = (crossCrateOverrides aarch64Gnu) // {
                             realsense-sys = realsenseSysOverride aarch64Gnu;
                             lite_record = attrs: {
                                 LR_GIT_HASH = gitHash;
+                                ORBBEC_SDK_DIR = orbbecSdkArm64;
                                 extraRustcOpts = (attrs.extraRustcOpts or [ ])
                                     ++ [ "-L native=${cxxRuntimeShim}/lib" ];
                                 DEPTHAI_DIR = depthaiCoreFor aarch64Gnu;
